@@ -1,8 +1,6 @@
 [workspace]
-resolver = "2"
-members = ["cachalot",
-    "main",
-]
+resolver = "3"
+members = ["cachalot", "main", "sia-io"]
 
 [workspace.dependencies]
 anyhow = "1.0"
