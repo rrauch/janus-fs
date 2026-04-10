@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-renterd = ["dep:chrono", "dep:reqwest", "dep:serde", "dep:serde_json"]
+renterd = ["dep:chrono", "dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 bon = "3.9"
@@ -15,7 +15,7 @@ futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 mime = "0.3"
 reqwest = { version = "0.13", features = ["stream", "json", "query"], optional = true }
-serde = { version = "1.0", features = ["derive"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", optional = true }
 thiserror = "2.0"
 typed-path = "0.12"

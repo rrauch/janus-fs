@@ -186,6 +186,16 @@ impl Object {
     }
 
     #[inline]
+    pub fn name(&self) -> &str {
+        self.id.key.filename()
+    }
+
+    #[inline]
+    pub fn mime_type(&self) -> &MimeType {
+        &self.mime_type
+    }
+
+    #[inline]
     pub fn etag(&self) -> Option<&ETag> {
         self.etag.as_ref()
     }
@@ -198,6 +208,11 @@ impl Object {
     #[inline]
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    #[inline]
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
     }
 
     #[inline]
@@ -279,13 +294,17 @@ impl Client {
                 let this = this.clone();
                 let prefix = prefix.clone();
                 async move {
-                    let mut objects = state.0;
+                    let mut objects: VecDeque<Object> = state.0;
                     let mut has_more = state.1;
                     let mut next_marker: Option<String> = state.2;
 
                     loop {
                         if let Some(object) = objects.pop_front() {
-                            return Ok(Some((object, (objects, has_more, next_marker))));
+                            // filter out root object
+                            if object.id.key.as_unix_path() != this.root().as_path() {
+                                return Ok(Some((object, (objects, has_more, next_marker))));
+                            }
+                            continue;
                         }
 
                         if !has_more {
@@ -356,8 +375,9 @@ impl Client {
         self.check_object_id(object_id)?;
         let _ = self
             .send_api_request(delete_req(
-                object_id.key().as_relative_path(),
+                object_id.key(),
                 object_id.bucket(),
+                object_id.key().is_folder(),
             ))
             .await?;
         Ok(())
@@ -374,8 +394,9 @@ impl Client {
     }
 
     pub fn try_to_object_key(&self, path: impl AsRef<str>) -> Result<ObjectKey, ObjectKeyError> {
-        let owned_path;
+        let mut owned_path;
         let mut path = path.as_ref();
+        let end_with_slash = path.ends_with("/");
         if path.starts_with("/") {
             // make relative to root
             owned_path = format!(".{}", path);
@@ -387,7 +408,14 @@ impl Client {
             .map_err(|e| ObjectKeyError::Other(e.to_string()))?
             .normalize();
 
-        ObjectKey::from_str(path.as_ref()).map_err(|e| match e {
+        let path = if end_with_slash && !path.as_str().ends_with("/") {
+            owned_path = format!("{}/", path.as_str());
+            owned_path.as_str()
+        } else {
+            path.as_str()
+        };
+
+        ObjectKey::from_str(path).map_err(|e| match e {
             FromStrError::InnerError(e) => e,
             FromStrError::StrError(_) => unreachable!("infallible str conversion"),
         })
@@ -423,7 +451,14 @@ impl Client {
         if !parent_id.key.is_folder() {
             Err(CreateDirectoryError::ParentNotDirectory(parent_id.clone()))?;
         }
-        let path = format!("{}{}/", parent_id.key, name.as_ref());
+        let path = format!(
+            "{}{}/",
+            parent_id
+                .key
+                .strip_prefix(self.root().as_str())
+                .unwrap_or("/"),
+            name.as_ref()
+        );
         let object_id = self.object_id(path)?;
         self.check_object_id(&object_id)?;
         assert!(object_id.key.is_folder());
@@ -474,21 +509,55 @@ fn rename_req<'a>(
 ) -> ApiRequest<'a> {
     let mode = if is_folder { "multi" } else { "single" };
 
-    let params = vec![
-        ("bucket", bucket),
-        ("mode", mode),
-        ("from", old_key),
-        ("to", new_key),
-    ];
+    let content = RequestContent::Json(
+        serde_json::to_value(RenameReq {
+            bucket,
+            force: false,
+            from: old_key,
+            mode,
+            to: new_key,
+        })
+        .expect("RenameReq serialization to never fail"),
+    );
+
     ApiRequestBuilder::post("./bus/objects/rename")
-        .params(Some(params))
+        .content(Some(content))
         .build()
 }
 
-fn delete_req<'a>(key: &str, bucket: &'a str) -> ApiRequest<'a> {
-    let path = encode_object_path(key, "./bus/object");
-    let params = vec![("bucket", bucket)];
-    ApiRequestBuilder::delete(path).params(Some(params)).build()
+#[derive(Serialize)]
+struct RenameReq<'a> {
+    bucket: &'a str,
+    force: bool,
+    from: &'a str,
+    mode: &'a str,
+    to: &'a str,
+}
+
+fn delete_req<'a>(key: &'a str, bucket: &'a str, is_folder: bool) -> ApiRequest<'a> {
+    if is_folder {
+        let content = RequestContent::Json(
+            serde_json::to_value(BatchDeleteReq {
+                bucket,
+                prefix: key,
+            })
+            .expect("BatchDeleteReq serialization to never fail"),
+        );
+
+        ApiRequestBuilder::post("./worker/objects/remove")
+            .content(Some(content))
+            .build()
+    } else {
+        let path = encode_object_path(key, "./worker/object");
+        let params = vec![("bucket", bucket)];
+        ApiRequestBuilder::delete(path).params(Some(params)).build()
+    }
+}
+
+#[derive(Serialize)]
+struct BatchDeleteReq<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
 }
 
 fn get_req<'a>(key: &str, bucket: &'a str) -> ApiRequest<'a> {
