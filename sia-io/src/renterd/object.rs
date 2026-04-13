@@ -2,24 +2,29 @@ use crate::confidential::Protected;
 use crate::renterd::client::{ApiRequest, ApiRequestBuilder, Client, ClientError, RequestContent};
 use crate::renterd::{BucketName, EncryptionKey, encode_object_path};
 use crate::tagged::{FromStrError, TaggedValue, TryFromInner, WithFromStr, WithSerde};
-use crate::{ETag, MimeType};
+use crate::{ETag, FileKind, FolderKind, MimeType};
 use chrono::{DateTime, Utc};
+use derive_where::derive_where;
 use futures_io::AsyncRead;
 use futures_util::{StreamExt, TryStream};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{Display, Formatter};
+use std::marker::PhantomData;
 use std::str::FromStr;
 use thiserror::Error;
 use typed_path::{Utf8UnixPath, Utf8UnixPathBuf};
 
 const MAX_OBJECT_KEY_LENGTH: usize = 1024;
 
-pub struct ObjectKeyKind;
-pub type ObjectKey = TaggedValue<ObjectKeyKind, String>;
+#[repr(transparent)]
+pub struct ObjectKeyKind<T>(PhantomData<T>);
+pub type ObjectKey<T> = TaggedValue<ObjectKeyKind<T>, String>;
+pub type FileKey = ObjectKey<FileKind>;
+pub type FolderKey = ObjectKey<FolderKind>;
 
-impl ObjectKey {
+impl ObjectKey<FolderKind> {
     pub(crate) fn new_root(path: impl AsRef<str>) -> Result<Self, ObjectKeyError> {
         let owned_path;
         let path = path.as_ref();
@@ -38,8 +43,10 @@ impl ObjectKey {
             FromStrError::StrError(_) => unreachable!("infallible str conversion"),
         })?)
     }
+}
 
-    pub(crate) fn new(root: &ObjectKey, path: impl AsRef<str>) -> Result<Self, ObjectKeyError> {
+impl<T: SupportedObjectKind> ObjectKey<T> {
+    pub(crate) fn new(root: &FolderKey, path: impl AsRef<str>) -> Result<Self, ObjectKeyError> {
         let mut owned_path;
         let mut path = path.as_ref();
         let end_with_slash = path.ends_with("/");
@@ -80,7 +87,7 @@ impl ObjectKey {
             .and_then(|s| if s.is_empty() { None } else { Some(s) })
     }
 
-    pub fn filename(&self) -> &str {
+    pub fn name(&self) -> &str {
         let mut s = self.as_str();
         if s.ends_with("/") {
             s = &s[..s.len() - 1];
@@ -88,11 +95,7 @@ impl ObjectKey {
         s.rfind('/').map(|idx| &s[idx + 1..]).unwrap_or(s)
     }
 
-    pub fn is_folder(&self) -> bool {
-        self.as_str().ends_with("/")
-    }
-
-    pub(crate) fn check_root(&self, expected_root: &ObjectKey) -> Result<(), ObjectKeyError> {
+    pub(crate) fn check_root(&self, expected_root: &FolderKey) -> Result<(), ObjectKeyError> {
         let path = self.as_unix_path();
         let root = expected_root.as_unix_path();
         if !path.starts_with(root) {
@@ -114,8 +117,8 @@ impl ObjectKey {
     }
 }
 
-impl WithFromStr for ObjectKey {}
-impl WithSerde for ObjectKey {}
+impl<T> WithFromStr for ObjectKey<T> {}
+impl<T> WithSerde for ObjectKey<T> {}
 
 #[derive(Debug, Error)]
 pub enum ObjectKeyError {
@@ -178,7 +181,7 @@ fn validate_object_key(key: &str) -> Result<(), ObjectKeyError> {
     Ok(())
 }
 
-impl TryFromInner<String> for ObjectKey {
+impl<T> TryFromInner<String> for ObjectKey<T> {
     type Err = ObjectKeyError;
 
     fn try_from_inner(inner: String) -> Result<Self, Self::Err>
@@ -190,19 +193,22 @@ impl TryFromInner<String> for ObjectKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ObjectId {
+#[derive_where(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectId<T> {
     bucket: BucketName,
-    key: ObjectKey,
+    key: ObjectKey<T>,
 }
 
-impl Display for ObjectId {
+pub type FileId = ObjectId<FileKind>;
+pub type FolderId = ObjectId<FolderKind>;
+
+impl<T> Display for ObjectId<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}]{}", self.bucket, self.key)
     }
 }
 
-impl ObjectId {
+impl FolderId {
     pub(super) fn new_root(
         bucket: BucketName,
         prefix: impl AsRef<str>,
@@ -210,10 +216,12 @@ impl ObjectId {
         let key = ObjectKey::new_root(prefix)?;
         Ok(Self { bucket, key })
     }
+}
 
+impl<T: SupportedObjectKind> ObjectId<T> {
     pub(super) fn new(
         bucket: BucketName,
-        root: &ObjectKey,
+        root: &FolderKey,
         key: impl AsRef<str>,
     ) -> Result<Self, ObjectKeyError> {
         Ok(ObjectId {
@@ -228,7 +236,7 @@ impl ObjectId {
     }
 
     #[inline]
-    pub fn key(&self) -> &ObjectKey {
+    pub fn key(&self) -> &ObjectKey<T> {
         &self.key
     }
 }
@@ -247,11 +255,118 @@ impl TryFromInner<EncryptionKey> for TaggedValue<ObjectEncryptionKeyKind, Encryp
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub trait SupportedObjectKind {
+    fn is_folder() -> bool;
+}
+
+impl SupportedObjectKind for FileKind {
+    fn is_folder() -> bool {
+        false
+    }
+}
+
+impl SupportedObjectKind for FolderKind {
+    fn is_folder() -> bool {
+        true
+    }
+}
+
+struct Unknown;
+
+#[derive(Debug)]
+pub enum AnyObject {
+    File(File),
+    Folder(Folder),
+}
+
+impl From<File> for AnyObject {
+    fn from(value: File) -> Self {
+        AnyObject::File(value)
+    }
+}
+
+impl From<Folder> for AnyObject {
+    fn from(value: Folder) -> Self {
+        AnyObject::Folder(value)
+    }
+}
+
+impl From<Object<Unknown>> for AnyObject {
+    fn from(value: Object<Unknown>) -> Self {
+        if value.id.key.ends_with("/") {
+            AnyObject::Folder(value.cast())
+        } else {
+            AnyObject::File(value.cast())
+        }
+    }
+}
+
+impl AnyObject {
+    #[inline]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+
+    #[inline]
+    pub fn as_file(&self) -> Option<&File> {
+        match self {
+            Self::File(file) => Some(file),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn into_file(self) -> Option<File> {
+        match self {
+            Self::File(file) => Some(file),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_folder(&self) -> bool {
+        matches!(self, Self::Folder(_))
+    }
+
+    #[inline]
+    pub fn as_folder(&self) -> Option<&Folder> {
+        match self {
+            Self::Folder(folder) => Some(folder),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn into_folder(self) -> Option<Folder> {
+        match self {
+            Self::Folder(folder) => Some(folder),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn key_prefix(&self) -> Option<&str> {
+        match self {
+            Self::File(file) => file.id.key.prefix(),
+            Self::Folder(folder) => folder.id.key.prefix(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AnyObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Object::<Unknown>::deserialize(deserializer)?.into())
+    }
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Object {
+pub struct Object<T> {
     #[serde(flatten)]
-    id: ObjectId,
+    id: ObjectId<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     etag: Option<ETag>,
     health: f64,
@@ -266,15 +381,31 @@ pub struct Object {
     metadata: HashMap<String, String>,
 }
 
-impl Object {
+impl Object<Unknown> {
+    fn cast<U>(self) -> Object<U> {
+        // SAFETY: Type only appears in PhantomData inside ObjectKeyKind<T>,
+        // which is #[repr(transparent)] and zero-sized.
+        // Object<Unknown> and Object<U> have identical layouts.
+        unsafe {
+            let result = std::ptr::read(&self as *const Object<Unknown> as *const Object<U>);
+            std::mem::forget(self);
+            result
+        }
+    }
+}
+
+pub type File = Object<FileKind>;
+pub type Folder = Object<FolderKind>;
+
+impl<T: SupportedObjectKind> Object<T> {
     #[inline]
-    pub fn id(&self) -> &ObjectId {
+    pub fn id(&self) -> &ObjectId<T> {
         &self.id
     }
 
     #[inline]
     pub fn name(&self) -> &str {
-        self.id.key.filename()
+        self.id.key.name()
     }
 
     #[inline]
@@ -300,11 +431,6 @@ impl Object {
     #[inline]
     pub fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
-    }
-
-    #[inline]
-    pub fn is_folder(&self) -> bool {
-        self.id.key.is_folder()
     }
 }
 
@@ -350,17 +476,7 @@ pub enum ListError {
 }
 
 #[derive(Debug, Error)]
-pub enum RenameError {
-    #[error("type differs: expected_file: {expected_file}, is_file: {is_file}")]
-    TypeDiffers { expected_file: bool, is_file: bool },
-    #[error(transparent)]
-    ClientError(#[from] ClientError),
-}
-
-#[derive(Debug, Error)]
 pub enum CreateDirectoryError {
-    #[error("'{0}' is not a directory")]
-    NotDirectory(ObjectId),
     #[error(transparent)]
     ObjectKeyError(#[from] ObjectKeyError),
     #[error(transparent)]
@@ -371,8 +487,8 @@ impl Client {
     pub fn list_objects(
         &self,
         prefix: impl AsRef<str>,
-    ) -> Result<impl TryStream<Ok = Object, Error = ClientError> + Send + Unpin, ListError> {
-        let prefix = ObjectKey::new(self.root().key(), prefix)?;
+    ) -> Result<impl TryStream<Ok = AnyObject, Error = ClientError> + Send + Unpin, ListError> {
+        let prefix: FolderKey = ObjectKey::new(self.root().key(), prefix)?;
         let this = self.clone();
         let initial_state = (VecDeque::new(), true, None);
         Ok(
@@ -380,17 +496,19 @@ impl Client {
                 let this = this.clone();
                 let prefix = prefix.clone();
                 async move {
-                    let mut objects: VecDeque<Object> = state.0;
+                    let mut objects: VecDeque<AnyObject> = state.0;
                     let mut has_more = state.1;
                     let mut next_marker: Option<String> = state.2;
 
                     loop {
                         if let Some(object) = objects.pop_front() {
                             // filter out root object
-                            if object.id.key != this.root().key {
-                                return Ok(Some((object, (objects, has_more, next_marker))));
+                            if let Some(folder) = object.as_folder() {
+                                if folder.id.key == this.root().key {
+                                    continue; // skip root object
+                                }
                             }
-                            continue;
+                            return Ok(Some((object, (objects, has_more, next_marker))));
                         }
 
                         if !has_more {
@@ -413,7 +531,7 @@ impl Client {
                             has_more = true;
                             next_marker = objects
                                 .back()
-                                .and_then(|o| o.id.key.prefix().map(|s| s.to_string()));
+                                .and_then(|o| o.key_prefix().map(|s| s.to_string()));
                         } else {
                             has_more = false;
                             next_marker = None;
@@ -425,7 +543,10 @@ impl Client {
         )
     }
 
-    pub async fn object(&self, object_id: &ObjectId) -> Result<Object, ClientError> {
+    pub async fn object<T: SupportedObjectKind>(
+        &self,
+        object_id: &ObjectId<T>,
+    ) -> Result<Object<T>, ClientError> {
         self.check_object_id(object_id)?;
         Ok(self
             .send_api_request(get_req(
@@ -437,56 +558,49 @@ impl Client {
             .await?)
     }
 
-    pub async fn rename_object(&self, from: &ObjectId, to: &ObjectKey) -> Result<(), RenameError> {
+    pub async fn rename_object<T: SupportedObjectKind>(
+        &self,
+        from: &ObjectId<T>,
+        to: &ObjectKey<T>,
+    ) -> Result<(), ClientError> {
         self.check_object_id(from)?;
         to.check_root(self.root().key())
             .map_err(ClientError::ObjectKeyError)?;
 
-        let is_folder = from.key.is_folder();
-
-        if is_folder != to.is_folder() {
-            Err(RenameError::TypeDiffers {
-                expected_file: !is_folder,
-                is_file: !to.is_folder(),
-            })?
-        }
-
         let _ = self
-            .send_api_request(rename_req(from.key(), to, from.bucket(), is_folder))
+            .send_api_request(rename_req(from.key(), to, from.bucket(), T::is_folder()))
             .await?;
 
         Ok(())
     }
 
-    pub async fn delete_object(&self, object_id: &ObjectId) -> Result<(), ClientError> {
+    pub async fn delete_object<T: SupportedObjectKind>(
+        &self,
+        object_id: &ObjectId<T>,
+    ) -> Result<(), ClientError> {
         self.check_object_id(object_id)?;
         let _ = self
             .send_api_request(delete_req(
                 object_id.key(),
                 object_id.bucket(),
-                object_id.key().is_folder(),
+                T::is_folder(),
             ))
             .await?;
         Ok(())
     }
 
-    pub fn object_id(
+    pub fn object_id<'a, T: SupportedObjectKind>(
         &self,
-        parent: &ObjectId,
+        parent: impl Into<Option<&'a FolderId>>,
         name: impl AsRef<str>,
-        is_folder: bool,
-    ) -> Result<ObjectId, ObjectKeyError> {
+    ) -> Result<ObjectId<T>, ObjectKeyError> {
+        let parent = parent.into().unwrap_or_else(|| self.root());
         self.check_object_id(parent)
             .map_err(|e| ObjectKeyError::Other(e.to_string()))?;
-        if !parent.key.is_folder() {
-            Err(ObjectKeyError::Other(
-                "parent needs to be a folder".to_string(),
-            ))?;
-        }
 
         let owned_name;
         let mut name = name.as_ref();
-        if is_folder && !name.ends_with("/") {
+        if T::is_folder() && !name.ends_with("/") {
             owned_name = format!("{}/", name);
             name = owned_name.as_str();
         }
@@ -499,7 +613,7 @@ impl Client {
 
     pub async fn upload<'a, U: AsyncRead + Send + Unpin + 'static>(
         &self,
-        object_id: &'a ObjectId,
+        object_id: &'a ObjectId<FileKind>,
         mime_type: Option<&'a MimeType>,
         metadata: Option<impl IntoIterator<Item = (&'a str, &'a str)>>,
         content: U,
@@ -519,12 +633,11 @@ impl Client {
         Ok(())
     }
 
-    pub async fn create_directory(&self, new_dir: &ObjectId) -> Result<(), CreateDirectoryError> {
+    pub async fn create_directory(
+        &self,
+        new_dir: &ObjectId<FolderKind>,
+    ) -> Result<(), CreateDirectoryError> {
         self.check_object_id(new_dir)?;
-        if !new_dir.key.is_folder() {
-            Err(CreateDirectoryError::NotDirectory(new_dir.clone()))?;
-        }
-
         let _ = self
             .send_api_request(mkdir_req(new_dir.key(), new_dir.bucket()))
             .await?;
@@ -643,19 +756,19 @@ fn list_req<'a>(prefix: &str, bucket: &'a str, marker: Option<&'a str>) -> ApiRe
 struct ListResponse {
     has_more: bool,
     #[serde(deserialize_with = "crate::deserialize_null_default")]
-    objects: Vec<Object>,
+    objects: Vec<AnyObject>,
 }
 
 #[cfg(test)]
 mod tests {
     use crate::confidential::RevealExt;
     use crate::renterd::EncryptionKey;
-    use crate::renterd::object::Object;
+    use crate::renterd::object::AnyObject;
     use chrono::{DateTime, Utc};
 
     #[test]
     fn object_serde() -> anyhow::Result<()> {
-        let object: Object = serde_json::from_str(
+        let object: AnyObject = serde_json::from_str(
             r#"
         {
   "metadata": {
@@ -684,40 +797,39 @@ mod tests {
         "#,
         )?;
 
-        assert_eq!(object.id.bucket, "bucket-name".parse()?);
-        assert_eq!(object.id.key.as_str(), "key_value");
-        assert_eq!(object.id.key.prefix(), None);
-        assert_eq!(object.id.key.filename(), "key_value");
-        assert_eq!(object.etag, None);
-        assert_eq!(object.health, 1f64);
+        let file = object.into_file().unwrap();
+
+        assert_eq!(file.id.bucket, "bucket-name".parse()?);
+        assert_eq!(file.id.key.as_str(), "key_value");
+        assert_eq!(file.id.key.prefix(), None);
+        assert_eq!(file.id.key.name(), "key_value");
+        assert_eq!(file.etag, None);
+        assert_eq!(file.health, 1f64);
         assert_eq!(
-            object.mod_time,
+            file.mod_time,
             "2026-04-03T13:51:40.623Z".parse::<DateTime<Utc>>()?
         );
-        assert_eq!(object.size, 2);
-        assert_eq!(object.mime_type.as_str(), "mime/value");
+        assert_eq!(file.size, 2);
+        assert_eq!(file.mime_type.as_str(), "mime/value");
         assert_eq!(
-            object.encryption_key.as_ref().unwrap().reveal().as_ref(),
+            file.encryption_key.as_ref().unwrap().reveal().as_ref(),
             &EncryptionKey::Salted(vec![
                 0x8c, 0x97, 0x96, 0x28, 0x69, 0x18, 0xfd, 0x38, 0xa6, 0x2b, 0x2d, 0x4e, 0xf0, 0x41,
                 0x88, 0x89, 0xff, 0xd2, 0x0a, 0xb0, 0x1b, 0x2e, 0x9c, 0x70, 0x91, 0x96, 0x3e, 0x04,
                 0x36, 0x69, 0xbc, 0x07
             ])
         );
-        assert_eq!(object.metadata.len(), 1);
+        assert_eq!(file.metadata.len(), 1);
         assert_eq!(
-            object
-                .metadata
-                .get("additionalProperty")
-                .map(|s| s.as_str()),
+            file.metadata.get("additionalProperty").map(|s| s.as_str()),
             Some("add_prop")
         );
-        assert_eq!(object.slabs.len(), 1);
-        assert_eq!(object.slabs.first().unwrap().offset, Some(4));
-        assert_eq!(object.slabs.first().unwrap().limit, Some(5));
-        assert_eq!(object.slabs.first().unwrap().slab.health, 3f64);
-        assert_eq!(object.slabs.first().unwrap().slab.encryption_key, None);
-        assert_eq!(object.slabs.first().unwrap().slab.min_shards, Some(2));
+        assert_eq!(file.slabs.len(), 1);
+        assert_eq!(file.slabs.first().unwrap().offset, Some(4));
+        assert_eq!(file.slabs.first().unwrap().limit, Some(5));
+        assert_eq!(file.slabs.first().unwrap().slab.health, 3f64);
+        assert_eq!(file.slabs.first().unwrap().slab.encryption_key, None);
+        assert_eq!(file.slabs.first().unwrap().slab.min_shards, Some(2));
 
         Ok(())
     }

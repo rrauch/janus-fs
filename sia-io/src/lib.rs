@@ -111,3 +111,6 @@ where
     let opt = Option::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
 }
+
+pub struct FileKind;
+pub struct FolderKind;

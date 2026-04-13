@@ -1,7 +1,7 @@
 use crate::Password;
 use crate::confidential::RevealExt;
 use crate::renterd::BucketName;
-use crate::renterd::object::{ObjectId, ObjectKeyError};
+use crate::renterd::object::{FolderId, ObjectId, ObjectKeyError, SupportedObjectKind};
 use bon::bon;
 use futures_io::AsyncRead;
 use futures_util::{AsyncReadExt, stream};
@@ -46,7 +46,7 @@ pub struct Client(pub(crate) Arc<Inner>);
 struct Inner {
     api_endpoint: Url,
     api_password: Option<ApiPassword>,
-    root: ObjectId,
+    root: FolderId,
     reqwest_client: ReqwestClient,
 }
 
@@ -174,7 +174,7 @@ impl Client {
     }
 
     #[inline]
-    pub fn root(&self) -> &ObjectId {
+    pub fn root(&self) -> &FolderId {
         &self.0.root
     }
 
@@ -183,7 +183,10 @@ impl Client {
         self.0.root.bucket()
     }
 
-    pub(crate) fn check_object_id(&self, object_id: &ObjectId) -> Result<(), ClientError> {
+    pub(crate) fn check_object_id<T: SupportedObjectKind>(
+        &self,
+        object_id: &ObjectId<T>,
+    ) -> Result<(), ClientError> {
         if object_id.bucket() != self.root().bucket() {
             Err(ClientError::WrongBucket {
                 expected: self.root().bucket().clone(),

@@ -226,22 +226,22 @@ mod tests {
 
         let root = client.root();
 
-        let dir1 = client.object_id(&root, "dir1", true)?;
+        let dir1 = client.object_id(root, "dir1")?;
         assert_eq!(dir1.key().as_str(), format!("{}dir1/", renterd_root));
         client.create_directory(&dir1).await?;
 
-        let subdir1 = client.object_id(&dir1, "subdir1", true)?;
+        let subdir1 = client.object_id(&dir1, "subdir1")?;
         assert_eq!(
             subdir1.key().as_str(),
             format!("{}dir1/subdir1/", renterd_root)
         );
         client.create_directory(&subdir1).await?;
 
-        let dir2 = client.object_id(&root, "dir2", true)?;
+        let dir2 = client.object_id(root, "dir2")?;
         assert_eq!(dir2.key().as_str(), format!("{}dir2/", renterd_root));
         client.create_directory(&dir2).await?;
 
-        let subdir2 = client.object_id(&dir2, "subdir2", true)?;
+        let subdir2 = client.object_id(&dir2, "subdir2")?;
         assert_eq!(
             subdir2.key().as_str(),
             format!("{}dir2/subdir2/", renterd_root)
@@ -250,7 +250,7 @@ mod tests {
 
         assert_eq!(count_entries(&client, "").await?, 4);
 
-        let file1 = client.object_id(&root, "/dir1/subdir1/file1", false)?;
+        let file1 = client.object_id(root, "/dir1/subdir1/file1")?;
         client
             .upload(
                 &file1,
@@ -261,13 +261,12 @@ mod tests {
             .await?;
 
         let dl1 = client.download(&file1).await?;
-        assert!(!dl1.object().is_folder());
-        assert_eq!(dl1.object().name(), "file1");
-        assert_eq!(dl1.object().size(), ONE_MB.len() as u64);
-        assert_eq!(dl1.object().mime_type().as_str(), "foo/bar");
-        assert_eq!(dl1.object().metadata().len(), 1);
+        assert_eq!(dl1.file().name(), "file1");
+        assert_eq!(dl1.file().size(), ONE_MB.len() as u64);
+        assert_eq!(dl1.file().mime_type().as_str(), "foo/bar");
+        assert_eq!(dl1.file().metadata().len(), 1);
         assert_eq!(
-            dl1.object().metadata().get("Foo").map(|s| s.as_str()),
+            dl1.file().metadata().get("Foo").map(|s| s.as_str()),
             Some("bar")
         );
 
@@ -277,7 +276,7 @@ mod tests {
         assert_eq!(read, ONE_MB.len());
         assert_eq!(&buf, ONE_MB);
 
-        let file2 = client.object_id(&root, "/dir2/subdir2/file2", false)?;
+        let file2 = client.object_id(None, "/dir2/subdir2/file2")?;
         client.rename_object(&file1, file2.key()).await?;
         assert!(client.object(&file1).await.is_err());
         assert!(client.object(&file2).await.is_ok());
