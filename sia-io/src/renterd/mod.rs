@@ -224,27 +224,33 @@ mod tests {
             bail!("bucket/directory not empty");
         }
 
-        let root = client.object_id("/")?;
+        let root = client.root();
 
-        let dir1 = client.create_directory(&root, "dir1").await?;
+        let dir1 = client.object_id(&root, "dir1", true)?;
         assert_eq!(dir1.key().as_str(), format!("{}dir1/", renterd_root));
-        let subdir1 = client.create_directory(&dir1, "subdir1").await?;
+        client.create_directory(&dir1).await?;
+
+        let subdir1 = client.object_id(&dir1, "subdir1", true)?;
         assert_eq!(
             subdir1.key().as_str(),
             format!("{}dir1/subdir1/", renterd_root)
         );
+        client.create_directory(&subdir1).await?;
 
-        let dir2 = client.create_directory(&root, "dir2").await?;
+        let dir2 = client.object_id(&root, "dir2", true)?;
         assert_eq!(dir2.key().as_str(), format!("{}dir2/", renterd_root));
-        let subdir2 = client.create_directory(&dir2, "subdir2").await?;
+        client.create_directory(&dir2).await?;
+
+        let subdir2 = client.object_id(&dir2, "subdir2", true)?;
         assert_eq!(
             subdir2.key().as_str(),
             format!("{}dir2/subdir2/", renterd_root)
         );
+        client.create_directory(&subdir2).await?;
 
         assert_eq!(count_entries(&client, "").await?, 4);
 
-        let file1 = client.object_id("/dir1/subdir1/file1")?;
+        let file1 = client.object_id(&root, "/dir1/subdir1/file1", false)?;
         client
             .upload(
                 &file1,
@@ -271,7 +277,7 @@ mod tests {
         assert_eq!(read, ONE_MB.len());
         assert_eq!(&buf, ONE_MB);
 
-        let file2 = client.object_id("/dir2/subdir2/file2")?;
+        let file2 = client.object_id(&root, "/dir2/subdir2/file2", false)?;
         client.rename_object(&file1, file2.key()).await?;
         assert!(client.object(&file1).await.is_err());
         assert!(client.object(&file2).await.is_ok());

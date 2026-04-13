@@ -12,7 +12,7 @@ use std::convert::Infallible;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use thiserror::Error;
-use typed_path::Utf8UnixPath;
+use typed_path::{Utf8UnixPath, Utf8UnixPathBuf};
 
 const MAX_OBJECT_KEY_LENGTH: usize = 1024;
 
@@ -20,6 +20,56 @@ pub struct ObjectKeyKind;
 pub type ObjectKey = TaggedValue<ObjectKeyKind, String>;
 
 impl ObjectKey {
+    pub(crate) fn new_root(path: impl AsRef<str>) -> Result<Self, ObjectKeyError> {
+        let owned_path;
+        let path = path.as_ref();
+        let end_with_slash = path.ends_with("/");
+        let path = Utf8UnixPathBuf::from_str(path)
+            .expect("path conversion to be infallible")
+            .normalize();
+        let path = if end_with_slash && !path.as_str().ends_with("/") {
+            owned_path = format!("{}/", path.as_str());
+            owned_path.as_str()
+        } else {
+            path.as_str()
+        };
+        Ok(ObjectKey::from_str(path).map_err(|e| match e {
+            FromStrError::InnerError(e) => e,
+            FromStrError::StrError(_) => unreachable!("infallible str conversion"),
+        })?)
+    }
+
+    pub(crate) fn new(root: &ObjectKey, path: impl AsRef<str>) -> Result<Self, ObjectKeyError> {
+        let mut owned_path;
+        let mut path = path.as_ref();
+        let end_with_slash = path.ends_with("/");
+        if path.starts_with("/") {
+            // make relative to root
+            owned_path = format!(".{}", path);
+            path = owned_path.as_str();
+        }
+        let path = root
+            .as_unix_path()
+            .join_checked(path)
+            .map_err(|e| ObjectKeyError::Other(e.to_string()))?
+            .normalize();
+
+        let path = if end_with_slash && !path.as_str().ends_with("/") {
+            owned_path = format!("{}/", path.as_str());
+            owned_path.as_str()
+        } else {
+            path.as_str()
+        };
+
+        let this = ObjectKey::from_str(path).map_err(|e| match e {
+            FromStrError::InnerError(e) => e,
+            FromStrError::StrError(_) => unreachable!("infallible str conversion"),
+        })?;
+
+        this.check_root(root)?;
+        Ok(this)
+    }
+
     pub fn prefix(&self) -> Option<&str> {
         let mut s = self.as_str();
         if s.ends_with("/") {
@@ -40,6 +90,18 @@ impl ObjectKey {
 
     pub fn is_folder(&self) -> bool {
         self.as_str().ends_with("/")
+    }
+
+    pub(crate) fn check_root(&self, expected_root: &ObjectKey) -> Result<(), ObjectKeyError> {
+        let path = self.as_unix_path();
+        let root = expected_root.as_unix_path();
+        if !path.starts_with(root) {
+            Err(ObjectKeyError::PathOutsideRoot {
+                root: root.to_path_buf(),
+                path: path.to_path_buf(),
+            })?
+        }
+        Ok(())
     }
 
     pub(crate) fn as_unix_path(&self) -> &Utf8UnixPath {
@@ -68,6 +130,12 @@ pub enum ObjectKeyError {
 
     #[error("key component {component:?} is a relative path reference")]
     RelativePathComponent { component: String },
+
+    #[error("path '{path}' not inside root '{root}'")]
+    PathOutsideRoot {
+        root: Utf8UnixPathBuf,
+        path: Utf8UnixPathBuf,
+    },
 
     #[error("other object key error: {0}")]
     Other(String),
@@ -135,6 +203,25 @@ impl Display for ObjectId {
 }
 
 impl ObjectId {
+    pub(super) fn new_root(
+        bucket: BucketName,
+        prefix: impl AsRef<str>,
+    ) -> Result<Self, ObjectKeyError> {
+        let key = ObjectKey::new_root(prefix)?;
+        Ok(Self { bucket, key })
+    }
+
+    pub(super) fn new(
+        bucket: BucketName,
+        root: &ObjectKey,
+        key: impl AsRef<str>,
+    ) -> Result<Self, ObjectKeyError> {
+        Ok(ObjectId {
+            bucket,
+            key: ObjectKey::new(root, key)?,
+        })
+    }
+
     #[inline]
     pub fn bucket(&self) -> &BucketName {
         &self.bucket
@@ -272,8 +359,8 @@ pub enum RenameError {
 
 #[derive(Debug, Error)]
 pub enum CreateDirectoryError {
-    #[error("parent '{0}' is not a directory")]
-    ParentNotDirectory(ObjectId),
+    #[error("'{0}' is not a directory")]
+    NotDirectory(ObjectId),
     #[error(transparent)]
     ObjectKeyError(#[from] ObjectKeyError),
     #[error(transparent)]
@@ -285,8 +372,7 @@ impl Client {
         &self,
         prefix: impl AsRef<str>,
     ) -> Result<impl TryStream<Ok = Object, Error = ClientError> + Send + Unpin, ListError> {
-        let prefix = self.try_to_object_key(prefix)?;
-        self.check_object_key(&prefix)?;
+        let prefix = ObjectKey::new(self.root().key(), prefix)?;
         let this = self.clone();
         let initial_state = (VecDeque::new(), true, None);
         Ok(
@@ -301,7 +387,7 @@ impl Client {
                     loop {
                         if let Some(object) = objects.pop_front() {
                             // filter out root object
-                            if object.id.key.as_unix_path() != this.root().as_path() {
+                            if object.id.key != this.root().key {
                                 return Ok(Some((object, (objects, has_more, next_marker))));
                             }
                             continue;
@@ -353,7 +439,8 @@ impl Client {
 
     pub async fn rename_object(&self, from: &ObjectId, to: &ObjectKey) -> Result<(), RenameError> {
         self.check_object_id(from)?;
-        self.check_object_key(to)?;
+        to.check_root(self.root().key())
+            .map_err(ClientError::ObjectKeyError)?;
 
         let is_folder = from.key.is_folder();
 
@@ -383,42 +470,31 @@ impl Client {
         Ok(())
     }
 
-    pub fn object_id(&self, path: impl AsRef<str>) -> Result<ObjectId, ObjectKeyError> {
-        let object_id = ObjectId {
-            bucket: self.bucket().clone(),
-            key: self.try_to_object_key(path)?,
-        };
+    pub fn object_id(
+        &self,
+        parent: &ObjectId,
+        name: impl AsRef<str>,
+        is_folder: bool,
+    ) -> Result<ObjectId, ObjectKeyError> {
+        self.check_object_id(parent)
+            .map_err(|e| ObjectKeyError::Other(e.to_string()))?;
+        if !parent.key.is_folder() {
+            Err(ObjectKeyError::Other(
+                "parent needs to be a folder".to_string(),
+            ))?;
+        }
+
+        let owned_name;
+        let mut name = name.as_ref();
+        if is_folder && !name.ends_with("/") {
+            owned_name = format!("{}/", name);
+            name = owned_name.as_str();
+        }
+
+        let object_id = ObjectId::new(self.bucket().clone(), parent.key(), name)?;
         self.check_object_id(&object_id)
             .map_err(|e| ObjectKeyError::Other(e.to_string()))?;
         Ok(object_id)
-    }
-
-    pub fn try_to_object_key(&self, path: impl AsRef<str>) -> Result<ObjectKey, ObjectKeyError> {
-        let mut owned_path;
-        let mut path = path.as_ref();
-        let end_with_slash = path.ends_with("/");
-        if path.starts_with("/") {
-            // make relative to root
-            owned_path = format!(".{}", path);
-            path = owned_path.as_str();
-        }
-        let path = self
-            .root()
-            .join_checked(path)
-            .map_err(|e| ObjectKeyError::Other(e.to_string()))?
-            .normalize();
-
-        let path = if end_with_slash && !path.as_str().ends_with("/") {
-            owned_path = format!("{}/", path.as_str());
-            owned_path.as_str()
-        } else {
-            path.as_str()
-        };
-
-        ObjectKey::from_str(path).map_err(|e| match e {
-            FromStrError::InnerError(e) => e,
-            FromStrError::StrError(_) => unreachable!("infallible str conversion"),
-        })
     }
 
     pub async fn upload<'a, U: AsyncRead + Send + Unpin + 'static>(
@@ -443,31 +519,17 @@ impl Client {
         Ok(())
     }
 
-    pub async fn create_directory(
-        &self,
-        parent_id: &ObjectId,
-        name: impl AsRef<str>,
-    ) -> Result<ObjectId, CreateDirectoryError> {
-        if !parent_id.key.is_folder() {
-            Err(CreateDirectoryError::ParentNotDirectory(parent_id.clone()))?;
+    pub async fn create_directory(&self, new_dir: &ObjectId) -> Result<(), CreateDirectoryError> {
+        self.check_object_id(new_dir)?;
+        if !new_dir.key.is_folder() {
+            Err(CreateDirectoryError::NotDirectory(new_dir.clone()))?;
         }
-        let path = format!(
-            "{}{}/",
-            parent_id
-                .key
-                .strip_prefix(self.root().as_str())
-                .unwrap_or("/"),
-            name.as_ref()
-        );
-        let object_id = self.object_id(path)?;
-        self.check_object_id(&object_id)?;
-        assert!(object_id.key.is_folder());
 
         let _ = self
-            .send_api_request(mkdir_req(object_id.key(), object_id.bucket()))
+            .send_api_request(mkdir_req(new_dir.key(), new_dir.bucket()))
             .await?;
 
-        Ok(object_id)
+        Ok(())
     }
 }
 

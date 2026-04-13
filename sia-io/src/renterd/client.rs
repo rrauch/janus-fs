@@ -1,7 +1,7 @@
 use crate::Password;
 use crate::confidential::RevealExt;
 use crate::renterd::BucketName;
-use crate::renterd::object::{ObjectId, ObjectKey};
+use crate::renterd::object::{ObjectId, ObjectKeyError};
 use bon::bon;
 use futures_io::AsyncRead;
 use futures_util::{AsyncReadExt, stream};
@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
-use typed_path::{Utf8UnixPath, Utf8UnixPathBuf};
+use typed_path::Utf8UnixPathBuf;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -31,11 +31,8 @@ pub enum ClientError {
     },
     #[error("invalid path: {0}")]
     InvalidPath(Utf8UnixPathBuf),
-    #[error("path '{path}' not inside root '{root}'")]
-    PathOutsideRoot {
-        root: Utf8UnixPathBuf,
-        path: Utf8UnixPathBuf,
-    },
+    #[error(transparent)]
+    ObjectKeyError(#[from] ObjectKeyError),
 }
 
 pub struct ApiPasswordKind;
@@ -49,8 +46,7 @@ pub struct Client(pub(crate) Arc<Inner>);
 struct Inner {
     api_endpoint: Url,
     api_password: Option<ApiPassword>,
-    bucket: BucketName,
-    root: Utf8UnixPathBuf,
+    root: ObjectId,
     reqwest_client: ReqwestClient,
 }
 
@@ -64,15 +60,11 @@ impl Client {
         #[builder(default = "/", into)] root: String,
         reqwest_client_builder: Option<reqwest::ClientBuilder>,
     ) -> Result<Self, ClientError> {
-        let root = Utf8UnixPath::new(root.as_str()).normalize();
-        if !root.is_valid() || !root.is_absolute() {
-            Err(ClientError::InvalidPath(root.clone()))?
-        }
+        let root = ObjectId::new_root(bucket, root)?;
 
         Ok(Self(Arc::new(Inner {
             api_endpoint,
             api_password,
-            bucket,
             root,
             reqwest_client: reqwest_client_builder.unwrap_or_default().build()?,
         })))
@@ -182,34 +174,23 @@ impl Client {
     }
 
     #[inline]
-    pub fn bucket(&self) -> &BucketName {
-        &self.0.bucket
-    }
-
-    #[inline]
-    pub fn root(&self) -> &Utf8UnixPathBuf {
+    pub fn root(&self) -> &ObjectId {
         &self.0.root
     }
 
+    #[inline]
+    pub fn bucket(&self) -> &BucketName {
+        self.0.root.bucket()
+    }
+
     pub(crate) fn check_object_id(&self, object_id: &ObjectId) -> Result<(), ClientError> {
-        if object_id.bucket() != self.bucket() {
+        if object_id.bucket() != self.root().bucket() {
             Err(ClientError::WrongBucket {
-                expected: self.bucket().clone(),
+                expected: self.root().bucket().clone(),
                 actual: object_id.bucket().clone(),
             })?
         }
-        self.check_object_key(object_id.key())?;
-        Ok(())
-    }
-
-    pub(crate) fn check_object_key(&self, object_key: &ObjectKey) -> Result<(), ClientError> {
-        let path = object_key.as_unix_path();
-        if !path.starts_with(self.root()) {
-            Err(ClientError::PathOutsideRoot {
-                root: self.root().clone(),
-                path: path.to_path_buf(),
-            })?
-        }
+        object_id.key().check_root(self.root().key())?;
         Ok(())
     }
 }
