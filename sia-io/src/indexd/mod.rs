@@ -85,3 +85,123 @@ fn into_static_str(s: Cow<'static, str>) -> &'static str {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::confidential::{NewSecretExt, RevealExt, RevealMutExt};
+    use crate::indexd::client::Client;
+    use crate::indexd::{AppDetails, AppId};
+    use anyhow::anyhow;
+    use ct_codecs::{Decoder, Encoder, Hex};
+    use futures_util::AsyncReadExt;
+    use futures_util::io::Cursor;
+    use reqwest::Url;
+    use sia_storage::AppKey;
+    use std::io::BufRead;
+    use std::str::FromStr;
+
+    static ONE_MB: &[u8] = include_bytes!("../../testdata/1mb.bin");
+
+    fn app_details() -> Result<AppDetails, anyhow::Error> {
+        let app_id = AppId::from_str(std::env::var("INDEXD_APP_ID").unwrap().as_str())?;
+
+        Ok(AppDetails::builder()
+            .id(app_id)
+            .name(std::env::var("INDEXD_APP_NAME")?)
+            .description(std::env::var("INDEXD_APP_DESCRIPTION")?)
+            .service_url(Url::parse(
+                std::env::var("INDEXD_APP_SERVICE_URL")?.as_str(),
+            )?)
+            .build())
+    }
+
+    fn app_key() -> Result<AppKey, anyhow::Error> {
+        let hex = std::env::var("INDEXD_APP_KEY")?;
+        Ok(AppKey::import(
+            Hex::decode_to_vec(hex, None)?
+                .try_into()
+                .map_err(|_| anyhow!("app key invalid format"))?,
+        ))
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn acquire_authorization() -> Result<(), anyhow::Error> {
+        dotenv::dotenv().ok();
+        let app_details = app_details()?;
+        let handle =
+            Client::acquire_authorization(std::env::var("INDEXD_ENDPOINT")?, app_details).await?;
+
+        eprintln!();
+        eprintln!("AUTHORIZATION URL: {}", handle.url().as_str());
+        eprintln!("waiting for authorization");
+        let handle = handle.await_authorization().await?;
+
+        eprintln!();
+        eprintln!("enter mnemonic and press enter");
+        let mut mnemonic = String::new().confidential();
+        std::io::stdin().lock().read_line(mnemonic.reveal_mut())?;
+        let trim_end = mnemonic.reveal().trim_end().len();
+        mnemonic.reveal_mut().truncate(trim_end);
+        let app_key = handle.finalize(&mnemonic).await?;
+
+        eprintln!();
+        eprintln!(
+            "APP KEY: {}",
+            Hex::encode_to_string(app_key.reveal().export())?
+        );
+        eprintln!();
+        Ok(())
+    }
+
+    async fn connect() -> Result<Client, anyhow::Error> {
+        dotenv::dotenv().ok();
+        let app_details = app_details()?;
+        let app_key = app_key()?;
+
+        Ok(Client::builder()
+            .indexd_endpoint(std::env::var("INDEXD_ENDPOINT")?)
+            .app_details(app_details)
+            .app_key(&app_key)
+            .build()
+            .await?)
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn integration_test1() -> Result<(), anyhow::Error> {
+        let client = connect().await?;
+        
+        let (objects, _) = client.list_objects().await?;
+        assert!(objects.len() < 10);
+        if !objects.is_empty() {
+            eprintln!("deleting objects from previous run");
+            for object in objects {
+                client.delete_object(object.id()).await?;
+            }
+            let (objects, _) = client.list_objects().await?;
+            assert_eq!(objects.len(), 0);
+        }
+
+        let object = client.upload(Cursor::new(ONE_MB), None).await?;
+        eprintln!("object: {:?}", object);
+        let (objects, _) = client.list_objects().await?;
+        assert_eq!(objects.len(), 1);
+
+        let dl = client.download(object.id()).await?;
+        assert_eq!(dl.object().id(), object.id());
+        assert_eq!(dl.object().size(), ONE_MB.len() as u64);
+
+        let mut buf = Vec::with_capacity(ONE_MB.len());
+        let mut reader = dl.open(None).await?;
+        let read = reader.read_to_end(&mut buf).await?;
+        assert_eq!(read, ONE_MB.len());
+        assert_eq!(&buf, ONE_MB);
+
+        client.delete_object(object.id()).await?;
+        let (objects, _) = client.list_objects().await?;
+        assert!(objects.is_empty());
+
+        Ok(())
+    }
+}
