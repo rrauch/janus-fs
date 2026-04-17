@@ -1,6 +1,6 @@
 use crate::renterd::client::{ApiRequest, ApiRequestBuilder, Client, ClientError};
 use crate::renterd::encode_object_path;
-use crate::renterd::object::{FileId, File};
+use crate::renterd::object::{File, FileId};
 use futures_io::AsyncRead;
 use futures_util::TryStreamExt;
 
@@ -11,6 +11,7 @@ pub struct DownloadableFile {
 }
 
 impl DownloadableFile {
+    #[inline]
     pub fn file(&self) -> &File {
         &self.inner
     }

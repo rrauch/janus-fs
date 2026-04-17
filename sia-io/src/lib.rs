@@ -6,6 +6,8 @@ use std::str::FromStr;
 use thiserror::Error;
 
 pub mod confidential;
+#[cfg(feature = "indexd")]
+pub mod indexd;
 #[cfg(feature = "renterd")]
 pub mod renterd;
 pub(crate) mod tagged;

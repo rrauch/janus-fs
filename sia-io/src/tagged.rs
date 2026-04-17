@@ -26,6 +26,10 @@ impl<Tag, Value> TaggedValue<Tag, Value> {
             _tag: PhantomData,
         }
     }
+
+    pub(crate) fn into_inner(self) -> Value {
+        self.inner
+    }
 }
 
 pub trait WithSerde {}
