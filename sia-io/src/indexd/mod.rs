@@ -199,6 +199,12 @@ mod tests {
         assert_eq!(read, ONE_MB.len());
         assert_eq!(&buf, ONE_MB);
 
+        let _ = client
+            .update_object_metadata(object.id(), "this is a test".as_bytes().to_vec())
+            .await?;
+        let object = client.object(object.id()).await?;
+        assert_eq!(object.metadata(), "this is a test".as_bytes());
+
         client.delete_objects(iter::once(object.id())).await?;
         let (objects, _) = client.list_objects().await?;
         assert!(objects.is_empty());

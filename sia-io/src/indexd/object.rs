@@ -41,6 +41,11 @@ impl Object {
     }
 
     #[inline]
+    pub fn metadata(&self) -> &[u8] {
+        self.inner.metadata.as_slice()
+    }
+
+    #[inline]
     pub(crate) fn as_inner(&self) -> &SiaObject {
         &self.inner
     }
