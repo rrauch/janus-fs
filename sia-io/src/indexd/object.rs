@@ -170,8 +170,15 @@ impl Client {
         Ok(object.into())
     }
 
-    pub async fn delete_object(&self, object_id: &ObjectId) -> Result<(), ClientError> {
-        Ok(self.sdk().delete_object(object_id.as_ref()).await?)
+    pub async fn delete_objects(
+        &self,
+        object_ids: impl Iterator<Item = &ObjectId>,
+    ) -> Result<(), ClientError> {
+        for id in object_ids {
+            self.sdk().delete_object(id.as_ref()).await?
+        }
+        self.sdk().prune_slabs().await?;
+        Ok(())
     }
 
     pub fn object_events(

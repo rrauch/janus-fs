@@ -98,6 +98,7 @@ mod tests {
     use reqwest::Url;
     use sia_storage::AppKey;
     use std::io::BufRead;
+    use std::iter;
     use std::str::FromStr;
 
     static ONE_MB: &[u8] = include_bytes!("../../testdata/1mb.bin");
@@ -171,13 +172,13 @@ mod tests {
     #[tokio::test]
     async fn integration_test1() -> Result<(), anyhow::Error> {
         let client = connect().await?;
-        
+
         let (objects, _) = client.list_objects().await?;
         assert!(objects.len() < 10);
         if !objects.is_empty() {
             eprintln!("deleting objects from previous run");
             for object in objects {
-                client.delete_object(object.id()).await?;
+                client.delete_objects(iter::once(object.id())).await?;
             }
             let (objects, _) = client.list_objects().await?;
             assert_eq!(objects.len(), 0);
@@ -198,7 +199,7 @@ mod tests {
         assert_eq!(read, ONE_MB.len());
         assert_eq!(&buf, ONE_MB);
 
-        client.delete_object(object.id()).await?;
+        client.delete_objects(iter::once(object.id())).await?;
         let (objects, _) = client.list_objects().await?;
         assert!(objects.is_empty());
 
