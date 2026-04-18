@@ -233,6 +233,7 @@ impl Client {
     pub async fn list_objects(&self) -> Result<(Vec<Object>, Option<ObjectsCursor>), ClientError> {
         let mut active_objects = IndexMap::new();
         let mut stream = self.object_events(None);
+        let mut latest_delete = None;
         while let Some(event) = stream.try_next().await? {
             match &event {
                 ObjectEvent::Updated(o, _) | ObjectEvent::New(o, _) => {
@@ -240,10 +241,21 @@ impl Client {
                 }
                 ObjectEvent::Deleted(id, _) => {
                     active_objects.shift_remove(id);
+                    latest_delete = Some(event);
                 }
             }
         }
-        let cursor = active_objects.last().map(|(_, e)| e.cursor());
+        let mut cursor = active_objects.last().map(|(_, e)| e.cursor());
+        let cursor = if let Some(latest_delete) = latest_delete {
+            Some(match cursor.take() {
+                None => latest_delete.cursor(),
+                Some(cursor) if &cursor.after < latest_delete.timestamp() => latest_delete.cursor(),
+                Some(cursor) => cursor,
+            })
+        } else {
+            cursor
+        };
+
         Ok((
             active_objects
                 .into_values()
