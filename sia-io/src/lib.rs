@@ -1,13 +1,18 @@
 use crate::confidential::{Confidential, NewSecretExt};
 use crate::tagged::{TaggedValue, TryFromInner, WithFromStr, WithSerde};
+use bon::bon;
 use mime::Mime;
 use serde::{Deserialize, Deserializer};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::str::FromStr;
 use thiserror::Error;
 
 pub mod confidential;
 #[cfg(feature = "indexd")]
 pub mod indexd;
+pub mod object;
 #[cfg(feature = "renterd")]
 pub mod renterd;
 pub(crate) mod tagged;
@@ -114,5 +119,54 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-pub struct FileKind;
-pub struct FolderKind;
+pub(crate) enum Backend {
+    #[cfg(feature = "indexd")]
+    Indexd(indexd::client::Client),
+    #[cfg(feature = "renterd")]
+    Renterd(renterd::client::Client),
+}
+
+#[cfg(feature = "indexd")]
+impl From<indexd::client::Client> for Backend {
+    fn from(value: indexd::client::Client) -> Self {
+        Self::Indexd(value)
+    }
+}
+
+#[cfg(feature = "renterd")]
+impl From<renterd::client::Client> for Backend {
+    fn from(value: renterd::client::Client) -> Self {
+        Self::Renterd(value)
+    }
+}
+
+pub enum Metadata<'a> {
+    #[cfg(feature = "indexd")]
+    Indexd(Cow<'a, [u8]>),
+    #[cfg(feature = "renterd")]
+    Renterd(Cow<'a, HashMap<String, String>>),
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[cfg(feature = "indexd")]
+    #[error(transparent)]
+    IndexdError(#[from] indexd::client::ClientError),
+    #[cfg(feature = "renterd")]
+    #[error(transparent)]
+    RenterdError(#[from] renterd::client::ClientError),
+    #[error("backend and input type mismatch")]
+    BackendMismatch,
+}
+
+pub struct Client {
+    backend: Backend,
+}
+
+#[bon]
+impl Client {
+    #[builder]
+    pub async fn new(#[builder(into)] backend: Backend) -> Result<Self, Error> {
+        Ok(Self { backend })
+    }
+}

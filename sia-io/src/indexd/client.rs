@@ -4,7 +4,7 @@ use bon::bon;
 use derive_where::derive_where;
 use sia_storage::{
     AppKey, ApprovedState, Builder, BuilderError, Error as SiaError, IntoUrl,
-    RequestingApprovalState, SDK, Url,
+    RequestingApprovalState, SDK, SealedObjectError, Url,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -16,6 +16,8 @@ pub enum ClientError {
     SiaError(#[from] SiaError),
     #[error(transparent)]
     BuilderError(#[from] BuilderError),
+    #[error(transparent)]
+    SealedObjectError(#[from] SealedObjectError),
     #[error("user authorization required")]
     AuthorizationRequired,
     #[error("client error: {0}")]
@@ -136,4 +138,3 @@ pub(crate) struct Inner {
     download_max_inflight: Option<usize>,
     upload_max_inflight: Option<usize>,
 }
-

@@ -170,6 +170,9 @@ fn encode_object_path<S: AsRef<str>>(path: S, prefix: &str) -> String {
     format!("{}/{}", prefix, path.as_ref().trim_start_matches('/'))
 }
 
+pub struct FileKind;
+pub struct FolderKind;
+
 #[cfg(test)]
 mod tests {
     use crate::MimeType;

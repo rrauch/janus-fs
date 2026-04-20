@@ -1,5 +1,5 @@
 use crate::indexd::client::{Client, ClientError};
-use crate::tagged::TaggedValue;
+use crate::tagged::{TaggedValue, TryFromInner, WithFromStr, WithSerde};
 use chrono::{DateTime, Utc};
 use futures_io::AsyncRead;
 use futures_util::{StreamExt, TryStream, TryStreamExt};
@@ -7,13 +7,30 @@ use indexmap::IndexMap;
 use sia_storage::{Hash256, UploadOptions};
 use sia_storage::{Object as SiaObject, ObjectsCursor};
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use thiserror::Error;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 pub struct ObjectIdKind;
 pub type ObjectId = TaggedValue<ObjectIdKind, Hash256>;
 
-#[derive(Debug, Clone)]
+impl WithSerde for ObjectId {}
+impl WithFromStr for ObjectId {}
+
+
+
+impl TryFromInner<Hash256> for ObjectId {
+    type Err = Infallible;
+
+    fn try_from_inner(inner: Hash256) -> Result<Self, Self::Err>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new_from_inner(inner))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Object {
     id: ObjectId,
     inner: SiaObject,
