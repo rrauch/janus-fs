@@ -269,3 +269,69 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
         id: cursor.id,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{Backend, Client, indexd, renterd};
+    use futures_util::io::Cursor;
+    use futures_util::{AsyncReadExt, TryStreamExt};
+
+    static ONE_MB: &[u8] = include_bytes!("../testdata/1mb.bin");
+
+    #[ignore]
+    #[tokio::test]
+    async fn indexd_test1() -> Result<(), anyhow::Error> {
+        dotenv::dotenv().ok();
+        let indexd = indexd::tests::connect().await?;
+        integration_test1(indexd).await?;
+        Ok(())
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn renterd_test1() -> Result<(), anyhow::Error> {
+        dotenv::dotenv().ok();
+        let renterd = renterd::tests::new_client().await?;
+        integration_test1(renterd).await?;
+        Ok(())
+    }
+
+    async fn integration_test1(backend: impl Into<Backend>) -> Result<(), anyhow::Error> {
+        let client = Client::builder().backend(backend).build().await?;
+        assert!(client.num_objects() < 10);
+
+        while let Some(object) = client.list_objects().try_next().await? {
+            client.delete_object(object.id()).await?;
+        }
+
+        assert_eq!(client.num_objects(), 0);
+
+        let file1 = client
+            .upload("/dir1/subdir1/file1", Cursor::new(ONE_MB), None)
+            .await?;
+
+        assert_eq!(client.num_objects(), 1);
+
+        let objects = client
+            .list_objects()
+            .map_err(anyhow::Error::from)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects.first().unwrap().id(), file1.id());
+        assert_eq!(objects.first().unwrap().size(), file1.size());
+
+        let dl1 = client.download(file1.id()).await?.unwrap();
+        assert_eq!(dl1.object().size(), ONE_MB.len() as u64);
+        let mut buf = Vec::with_capacity(ONE_MB.len());
+        let mut reader = dl1.open(None).await?;
+        let read = reader.read_to_end(&mut buf).await?;
+        assert_eq!(read, ONE_MB.len());
+        assert_eq!(&buf, ONE_MB);
+
+        client.delete_object(file1.id()).await?;
+        assert_eq!(client.num_objects(), 0);
+        Ok(())
+    }
+}

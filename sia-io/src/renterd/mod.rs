@@ -174,7 +174,7 @@ pub struct FileKind;
 pub struct FolderKind;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::MimeType;
     use crate::renterd::BucketName;
     use crate::renterd::client::{ApiPassword, Client};
@@ -203,10 +203,7 @@ mod tests {
         Ok(count)
     }
 
-    #[ignore]
-    #[tokio::test]
-    async fn integration_test1() -> Result<(), anyhow::Error> {
-        dotenv::dotenv().ok();
+    pub async fn new_client() -> Result<Client, anyhow::Error> {
         let renterd_api_endpoint =
             Url::parse(std::env::var("RENTERD_API_ENDPOINT").unwrap().as_str())?;
         let renterd_api_password = std::env::var("RENTERD_API_PASSWORD")
@@ -222,6 +219,15 @@ mod tests {
             .bucket(renterd_bucket_name)
             .root(renterd_root.clone())
             .build()?;
+        Ok(client)
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn integration_test1() -> Result<(), anyhow::Error> {
+        dotenv::dotenv().ok();
+        let client = new_client().await?;
+        let renterd_root = client.root().key().as_str();
 
         if !is_empty(&client).await? {
             bail!("bucket/directory not empty");

@@ -540,6 +540,10 @@ impl Client {
         .boxed()
     }
 
+    pub fn num_objects(&self) -> usize {
+        self.known_object_ids.pin().len()
+    }
+
     pub async fn object(&self, id: &ObjectId) -> Result<Option<Object>, crate::Error> {
         if !self.known_object_ids.pin().contains_key(id) {
             return Ok(None);
