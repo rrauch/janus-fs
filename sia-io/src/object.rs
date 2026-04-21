@@ -3,8 +3,10 @@ use crate::{Backend, Client, ETag, Metadata, MimeType, indexd, renterd};
 use chrono::{DateTime, Utc};
 use futures_io::AsyncRead;
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
+use ouroboros::self_referencing;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use sia_storage::ObjectsCursor;
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use std::{fmt, iter};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectId {
     #[cfg(feature = "indexd")]
     Indexd(indexd::object::ObjectId),
@@ -318,33 +320,127 @@ impl Backend {
         }
     }
 
-    async fn list_objects(
+    pub(super) async fn list_objects(
         &self,
-    ) -> Result<impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin, crate::Error>
-    {
-        let stream: Box<
-            dyn TryStream<Ok = Object, Error = crate::Error, Item = Result<Object, crate::Error>>
-                + Send
-                + Unpin,
-        > = match &self {
+    ) -> Result<
+        (
+            impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin,
+            Option<ObjectsCursor>,
+        ),
+        crate::Error,
+    > {
+        let (stream, cursor): (
+            Box<
+                dyn TryStream<
+                        Ok = Object,
+                        Error = crate::Error,
+                        Item = Result<Object, crate::Error>,
+                    > + Send
+                    + Unpin,
+            >,
+            _,
+        ) = match &self {
             Self::Indexd(indexd) => {
-                let (objects, _) = indexd.list_objects().await?;
-                Box::new(stream::iter(objects.into_iter().map(|o| Ok(o.into()))))
+                let (objects, cursor) = indexd.list_objects().await?;
+                (
+                    Box::new(stream::iter(objects.into_iter().map(|o| Ok(o.into())))),
+                    cursor,
+                )
             }
-            Self::Renterd(renterd) => Box::new(
-                renterd
-                    .list_objects("")?
-                    .map_err(crate::Error::from)
-                    .try_filter_map(|any| async move {
-                        Ok(match any {
-                            AnyObject::File(file) => Some(file.into()),
-                            AnyObject::Folder(_) => None,
+            Self::Renterd(renterd) => (
+                Box::new(
+                    renterd
+                        .list_objects("")?
+                        .map_err(crate::Error::from)
+                        .try_filter_map(|any| async move {
+                            Ok(match any {
+                                AnyObject::File(file) => Some(file.into()),
+                                AnyObject::Folder(_) => None,
+                            })
                         })
-                    })
-                    .boxed(),
+                        .boxed(),
+                ),
+                None,
             ),
         };
+        Ok((stream, cursor))
+    }
+
+    pub(super) async fn object_events(
+        &self,
+        cursor: Option<ObjectsCursor>,
+    ) -> Result<
+        Option<impl TryStream<Ok = ObjectEvent, Error = crate::Error> + Send + Unpin>,
+        crate::Error,
+    > {
+        let stream: Option<
+            Box<
+                dyn TryStream<
+                        Ok = ObjectEvent,
+                        Error = crate::Error,
+                        Item = Result<ObjectEvent, crate::Error>,
+                    > + Send
+                    + Unpin,
+            >,
+        > = match &self {
+            Self::Indexd(indexd) => Some(Box::new(
+                indexd
+                    .object_events(cursor)
+                    .map_err(crate::Error::from)
+                    .try_filter_map(|e| async move { Ok(Some(e.into())) })
+                    .boxed(),
+            )),
+            Self::Renterd(_) => None,
+        };
         Ok(stream)
+    }
+}
+
+#[derive(Debug)]
+pub enum ObjectEvent {
+    New(Object, DateTime<Utc>),
+    Updated(Object, DateTime<Utc>),
+    Deleted(ObjectId, DateTime<Utc>),
+}
+
+impl From<indexd::object::ObjectEvent> for ObjectEvent {
+    fn from(value: indexd::object::ObjectEvent) -> Self {
+        match value {
+            indexd::object::ObjectEvent::New(object, ts) => Self::New(object.into(), ts),
+            indexd::object::ObjectEvent::Updated(object, ts) => Self::Updated(object.into(), ts),
+            indexd::object::ObjectEvent::Deleted(id, ts) => Self::Deleted(id.into(), ts),
+        }
+    }
+}
+
+impl ObjectEvent {
+    #[inline]
+    pub fn object_id(&self) -> &ObjectId {
+        match self {
+            Self::New(o, _) => o.id(),
+            Self::Updated(o, _) => o.id(),
+            Self::Deleted(id, _) => id,
+        }
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> &DateTime<Utc> {
+        match self {
+            Self::New(_, ts) => ts,
+            Self::Updated(_, ts) => ts,
+            Self::Deleted(_, ts) => ts,
+        }
+    }
+
+    pub(crate) fn cursor(&self) -> Option<ObjectsCursor> {
+        let id = self.object_id();
+        match id {
+            ObjectId::Indexd(indexd_id) => Some(ObjectsCursor {
+                id: indexd_id.clone().into_inner(),
+                after: self.timestamp().clone(),
+            }),
+            ObjectId::Renterd(_) => None,
+        }
     }
 }
 
@@ -411,25 +507,62 @@ impl From<renterd::download::DownloadableFile> for DownloadableObject {
     }
 }
 
+#[self_referencing]
+struct IterHolder<K: 'static> {
+    set: Arc<papaya::HashMap<K, ()>>,
+    #[borrows(set)]
+    #[covariant]
+    guard: papaya::OwnedGuard<'this>,
+    #[borrows(set, guard)]
+    #[covariant]
+    iter: papaya::Iter<'this, K, (), papaya::OwnedGuard<'this>>,
+}
+
 impl Client {
-    pub async fn list_objects(
-        &self,
-    ) -> Result<impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin, crate::Error>
-    {
-        self.backend.list_objects().await
+    pub fn list_objects(&self) -> impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin {
+        let set = self.known_object_ids.clone();
+
+        let holder = IterHolderBuilder {
+            set,
+            guard_builder: |set| set.owned_guard(),
+            iter_builder: |set, guard| set.iter(guard),
+        }
+        .build();
+
+        stream::try_unfold(holder, move |mut holder| async move {
+            if let Some(id) = holder.with_iter_mut(|iter| iter.next().map(|(id, _)| id)) {
+                let object = self.backend.object(id).await?;
+                Ok(Some((object, holder)))
+            } else {
+                Ok(None)
+            }
+        })
+        .boxed()
     }
 
-    pub async fn object(&self, id: &ObjectId) -> Result<Object, crate::Error> {
-        self.backend.object(id).await
+    pub async fn object(&self, id: &ObjectId) -> Result<Option<Object>, crate::Error> {
+        if !self.known_object_ids.pin().contains_key(id) {
+            return Ok(None);
+        }
+
+        Ok(Some(self.backend.object(id).await?))
     }
 
     pub async fn delete_object(&self, id: &ObjectId) -> Result<(), crate::Error> {
-        self.backend.delete_object(id).await
+        self.backend.delete_object(id).await?;
+        self.known_object_ids.pin().remove(id);
+        Ok(())
     }
 
     #[inline]
-    pub async fn download(&self, id: &ObjectId) -> Result<DownloadableObject, crate::Error> {
-        self.backend.download(id).await
+    pub async fn download(
+        &self,
+        id: &ObjectId,
+    ) -> Result<Option<DownloadableObject>, crate::Error> {
+        if !self.known_object_ids.pin().contains_key(id) {
+            return Ok(None);
+        }
+        Ok(Some(self.backend.download(id).await?))
     }
 
     #[inline]
@@ -439,6 +572,8 @@ impl Client {
         content: impl AsyncRead + Send + Unpin + 'static,
         metadata: Option<Metadata<'static>>,
     ) -> Result<Object, crate::Error> {
-        self.backend.upload(name_hint, content, metadata).await
+        let object = self.backend.upload(name_hint, content, metadata).await?;
+        self.known_object_ids.pin().insert(object.id().clone(), ());
+        Ok(object)
     }
 }

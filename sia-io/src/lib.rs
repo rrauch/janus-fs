@@ -1,13 +1,19 @@
 use crate::confidential::{Confidential, NewSecretExt};
+use crate::object::{ObjectEvent, ObjectId};
 use crate::tagged::{TaggedValue, TryFromInner, WithFromStr, WithSerde};
 use bon::bon;
+use futures_util::TryStreamExt;
 use mime::Mime;
 use serde::{Deserialize, Deserializer};
+use sia_storage::ObjectsCursor;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 
 pub mod confidential;
 #[cfg(feature = "indexd")]
@@ -119,6 +125,7 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+#[derive(Debug, Clone)]
 pub(crate) enum Backend {
     #[cfg(feature = "indexd")]
     Indexd(indexd::client::Client),
@@ -161,12 +168,104 @@ pub enum Error {
 
 pub struct Client {
     backend: Backend,
+    known_object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
+    object_event_loop_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(handle) = self.object_event_loop_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[bon]
 impl Client {
     #[builder]
     pub async fn new(#[builder(into)] backend: Backend) -> Result<Self, Error> {
-        Ok(Self { backend })
+        let (mut stream, cursor) = backend.list_objects().await?;
+        let object_ids = Arc::new(papaya::HashMap::new());
+        while let Some(object) = stream.try_next().await? {
+            object_ids.pin().insert(object.id().clone(), ());
+        }
+        drop(stream);
+
+        let object_event_loop_handle = {
+            let object_ids = object_ids.clone();
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                object_event_loop(
+                    cursor,
+                    object_ids,
+                    backend,
+                    Duration::from_secs(10),
+                    Duration::from_secs(60),
+                )
+                .await
+            })
+        };
+
+        Ok(Self {
+            backend,
+            known_object_ids: object_ids,
+            object_event_loop_handle: Some(object_event_loop_handle),
+        })
     }
+}
+
+async fn object_event_loop(
+    mut cursor: Option<ObjectsCursor>,
+    object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
+    backend: Backend,
+    eof_retry_duration: Duration,
+    error_retry_duration: Duration,
+) {
+    'main: loop {
+        let mut event_stream = match backend.object_events(clone_cursor(cursor.as_ref())).await {
+            Ok(Some(event_stream)) => event_stream,
+            Err(_err) => {
+                // error getting events, retry later
+                tokio::time::sleep(error_retry_duration).await;
+                continue;
+            }
+            Ok(None) => {
+                // backend does NOT support events
+                return;
+            }
+        };
+
+        loop {
+            match event_stream.try_next().await {
+                Ok(Some(event)) => {
+                    match &event {
+                        ObjectEvent::New(object, _) | ObjectEvent::Updated(object, _) => {
+                            object_ids.pin().insert(object.id().clone(), ());
+                        }
+                        ObjectEvent::Deleted(id, _) => {
+                            object_ids.pin().remove(id);
+                        }
+                    }
+                    cursor = event.cursor();
+                }
+                Ok(None) => {
+                    // no more events
+                    tokio::time::sleep(eof_retry_duration).await;
+                    continue 'main;
+                }
+                Err(_err) => {
+                    // error retrieving event, retry later
+                    tokio::time::sleep(error_retry_duration).await;
+                    continue 'main;
+                }
+            }
+        }
+    }
+}
+
+fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
+    cursor.map(|cursor| ObjectsCursor {
+        after: cursor.after,
+        id: cursor.id,
+    })
 }

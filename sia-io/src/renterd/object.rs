@@ -193,7 +193,7 @@ impl<T> TryFromInner<String> for ObjectKey<T> {
     }
 }
 
-#[derive_where(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive_where(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObjectId<T> {
     bucket: BucketName,
     key: ObjectKey<T>,
