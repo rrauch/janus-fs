@@ -1,8 +1,8 @@
 use crate::confidential::Protected;
 use crate::renterd::client::{ApiRequest, ApiRequestBuilder, Client, ClientError, RequestContent};
-use crate::renterd::{BucketName, EncryptionKey, encode_object_path};
+use crate::renterd::{BucketName, EncryptionKey, FileKind, FolderKind, encode_object_path};
 use crate::tagged::{FromStrError, TaggedValue, TryFromInner, WithFromStr, WithSerde};
-use crate::{ETag, FileKind, FolderKind, MimeType};
+use crate::{ETag, MimeType};
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
 use futures_io::AsyncRead;
@@ -193,7 +193,7 @@ impl<T> TryFromInner<String> for ObjectKey<T> {
     }
 }
 
-#[derive_where(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive_where(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObjectId<T> {
     bucket: BucketName,
     key: ObjectKey<T>,
@@ -202,10 +202,43 @@ pub struct ObjectId<T> {
 pub type FileId = ObjectId<FileKind>;
 pub type FolderId = ObjectId<FolderKind>;
 
-impl<T> Display for ObjectId<T> {
+impl<T: SupportedObjectKind> Display for ObjectId<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}]{}", self.bucket, self.key)
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ObjectIdError {
+    #[error("invalid object id: '{0}; expected '[bucket]path'")]
+    InvalidFormat(String),
+    #[error(transparent)]
+    BucketError(#[from] <BucketName as FromStr>::Err),
+    #[error("key error: {0}")]
+    KeyError(String),
+    #[error("expected file path but got folder path")]
+    ExpectedFile,
+}
+
+impl<T: SupportedObjectKind> FromStr for ObjectId<T> {
+    type Err = ObjectIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (bucket, path) =
+            bucket_path(s).ok_or_else(|| ObjectIdError::InvalidFormat(s.to_string()))?;
+        let bucket = BucketName::from_str(bucket)?;
+        let key = ObjectKey::from_str(path).map_err(|e| ObjectIdError::KeyError(e.to_string()))?;
+        if key.ends_with("/") && !T::is_folder() {
+            Err(ObjectIdError::ExpectedFile)?;
+        }
+        Ok(Self { bucket, key })
+    }
+}
+
+fn bucket_path(s: &str) -> Option<(&str, &str)> {
+    let s = s.strip_prefix('[')?;
+    let (bucket, key) = s.split_once(']')?;
+    Some((bucket, key))
 }
 
 impl FolderId {
@@ -362,7 +395,7 @@ impl<'de> Deserialize<'de> for AnyObject {
     }
 }
 
-#[derive_where(Debug, Clone, Serialize, Deserialize)]
+#[derive_where(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Object<T> {
     #[serde(flatten)]
@@ -434,7 +467,7 @@ impl<T: SupportedObjectKind> Object<T> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SlabSlice {
     slab: Slab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,7 +490,7 @@ impl TryFromInner<EncryptionKey> for TaggedValue<SlabEncryptionKeyKind, Encrypti
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Slab {
     health: f64,
@@ -467,27 +500,12 @@ pub struct Slab {
     min_shards: Option<u64>,
 }
 
-#[derive(Debug, Error)]
-pub enum ListError {
-    #[error(transparent)]
-    ObjectKeyError(#[from] ObjectKeyError),
-    #[error(transparent)]
-    ClientError(#[from] ClientError),
-}
-
-#[derive(Debug, Error)]
-pub enum CreateDirectoryError {
-    #[error(transparent)]
-    ObjectKeyError(#[from] ObjectKeyError),
-    #[error(transparent)]
-    ClientError(#[from] ClientError),
-}
-
 impl Client {
     pub fn list_objects(
         &self,
         prefix: impl AsRef<str>,
-    ) -> Result<impl TryStream<Ok = AnyObject, Error = ClientError> + Send + Unpin, ListError> {
+    ) -> Result<impl TryStream<Ok = AnyObject, Error = ClientError> + Send + Unpin, ClientError>
+    {
         let prefix: FolderKey = ObjectKey::new(self.root().key(), prefix)?;
         let this = self.clone();
         let initial_state = (VecDeque::new(), true, None);
@@ -636,7 +654,7 @@ impl Client {
     pub async fn create_directory(
         &self,
         new_dir: &ObjectId<FolderKind>,
-    ) -> Result<(), CreateDirectoryError> {
+    ) -> Result<(), ClientError> {
         self.check_object_id(new_dir)?;
         let _ = self
             .send_api_request(mkdir_req(new_dir.key(), new_dir.bucket()))

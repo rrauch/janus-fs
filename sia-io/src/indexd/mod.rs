@@ -87,7 +87,7 @@ fn into_static_str(s: Cow<'static, str>) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::confidential::{NewSecretExt, RevealExt, RevealMutExt};
     use crate::indexd::client::Client;
     use crate::indexd::{AppDetails, AppId};
@@ -155,7 +155,7 @@ mod tests {
         Ok(())
     }
 
-    async fn connect() -> Result<Client, anyhow::Error> {
+    pub async fn connect() -> Result<Client, anyhow::Error> {
         dotenv::dotenv().ok();
         let app_details = app_details()?;
         let app_key = app_key()?;
