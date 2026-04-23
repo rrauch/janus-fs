@@ -17,8 +17,6 @@ pub type ObjectId = TaggedValue<ObjectIdKind, Hash256>;
 impl WithSerde for ObjectId {}
 impl WithFromStr for ObjectId {}
 
-
-
 impl TryFromInner<Hash256> for ObjectId {
     type Err = Infallible;
 
@@ -178,6 +176,8 @@ impl Client {
             .into();
 
         self.sdk().pin_object(object.as_inner()).await?;
+        // retrieve object again to ensure it's identical to remote version
+        let object = self.sdk().object(object.id().as_ref()).await?.into();
         Ok(object)
     }
 

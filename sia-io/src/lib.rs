@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 
 pub mod cache;
+pub mod chunk;
 pub mod confidential;
 #[cfg(feature = "indexd")]
 pub mod indexd;
@@ -169,6 +170,8 @@ pub enum Error {
     #[error("cached error: {0}")]
     CachedError(String),
     #[error(transparent)]
+    ChunkError(#[from] chunk::ChunkError),
+    #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
 
@@ -177,6 +180,7 @@ pub struct Client {
     cache: Cache,
     known_object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
     object_event_loop_handle: Option<JoinHandle<()>>,
+    chunk_size: usize,
 }
 
 impl Drop for Client {
@@ -193,7 +197,9 @@ impl Client {
     pub async fn new(
         #[builder(into)] backend: Backend,
         #[builder(default)] cache: Cache,
+        #[builder(default = 1024 * 256)] chunk_size: usize,
     ) -> Result<Self, Error> {
+        assert!(chunk_size > 0);
         let (mut stream, cursor) = backend.list_objects().await?;
         let object_ids = Arc::new(papaya::HashMap::new());
         while let Some(object) = stream.try_next().await? {
@@ -221,6 +227,7 @@ impl Client {
         };
 
         Ok(Self {
+            chunk_size,
             backend,
             cache,
             known_object_ids: object_ids,
@@ -294,7 +301,8 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 mod tests {
     use crate::{Backend, Client, indexd, renterd};
     use futures_util::io::Cursor;
-    use futures_util::{AsyncReadExt, TryStreamExt};
+    use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};
+    use std::io::SeekFrom;
 
     static ONE_MB: &[u8] = include_bytes!("../testdata/1mb.bin");
 
@@ -345,10 +353,16 @@ mod tests {
         let dl1 = client.download(file1.id()).await?.unwrap();
         assert_eq!(dl1.object().size(), ONE_MB.len() as u64);
         let mut buf = Vec::with_capacity(ONE_MB.len());
-        let mut reader = dl1.open(None).await?;
+        let mut reader = dl1.open().await?;
         let read = reader.read_to_end(&mut buf).await?;
         assert_eq!(read, ONE_MB.len());
         assert_eq!(&buf, ONE_MB);
+
+        buf.clear();
+        reader.seek(SeekFrom::End(-1024)).await?;
+        let read = reader.read_to_end(&mut buf).await?;
+        assert_eq!(read, 1024);
+        assert_eq!(&buf[..1024], &ONE_MB[ONE_MB.len() - 1024..]);
 
         client.delete_object(file1.id()).await?;
         assert_eq!(client.num_objects(), 0);

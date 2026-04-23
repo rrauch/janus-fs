@@ -1,6 +1,6 @@
 use crate::indexd::client::{Client, ClientError};
 use crate::indexd::object::{Object, ObjectId};
-use futures_io::AsyncRead;
+use futures_util::AsyncRead;
 use sia_storage::{DownloadError, DownloadOptions};
 use std::pin::Pin;
 use std::task::{Context, Poll};

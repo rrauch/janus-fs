@@ -10,6 +10,7 @@ indexd = ["dep:sia_storage", "dep:tokio", "dep:tokio-util"]
 [dependencies]
 async-trait = "0.1"
 bon = "3.9"
+bytes = "1"
 bytesize = "2.3"
 chrono = { version = "0.4", features = ["serde"], optional = true }
 ct-codecs = "1.1"

@@ -1,8 +1,9 @@
 pub mod chunk;
 pub mod metadata;
 
+use crate::cache::chunk::{ChunkCache, L2ChunkCache};
 use crate::cache::metadata::{L2MetadataCache, MetadataCache};
-use bon::{bon};
+use bon::bon;
 use bytesize::ByteSize;
 use moka::future::Cache as MokaCache;
 use moka::future::CacheBuilder as MokaCacheBuilder;
@@ -18,6 +19,7 @@ pub struct Cache(Arc<Inner>);
 #[derive(Debug)]
 struct Inner {
     metadata: MetadataCache,
+    chunk: ChunkCache,
 }
 
 impl Default for Cache {
@@ -34,6 +36,11 @@ impl Cache {
         #[builder(default = Duration::from_secs(3600 * 24))] metadata_max_ttl: Duration,
         #[builder(with = |l2: impl L2MetadataCache + 'static| Box::new(l2))]
         metadata_l2_cache: Option<Box<dyn L2MetadataCache>>,
+        #[builder(default = ByteSize::mib(16))] chunk_max_mem: ByteSize,
+        #[builder(default = Duration::from_secs(3600 * 24))] chunk_max_ttl: Duration,
+        #[builder(with = |l2: impl L2ChunkCache + 'static| Box::new(l2))] chunk_l2_cache: Option<
+            Box<dyn L2ChunkCache>,
+        >,
     ) -> Self {
         let metadata_cache = MetadataCache::new(
             "meta_l1_cache",
@@ -42,8 +49,16 @@ impl Cache {
             metadata_l2_cache,
         );
 
+        let chunk_cache = ChunkCache::new(
+            "chunk_l1_cache",
+            chunk_max_mem,
+            chunk_max_ttl,
+            chunk_l2_cache,
+        );
+
         Self(Arc::new(Inner {
             metadata: metadata_cache,
+            chunk: chunk_cache,
         }))
     }
 }
