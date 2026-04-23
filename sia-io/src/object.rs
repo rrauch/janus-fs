@@ -235,7 +235,7 @@ impl From<renterd::object::File> for Object {
 
 impl Backend {
     #[inline]
-    async fn object(&self, id: &ObjectId) -> Result<Object, crate::Error> {
+    pub(crate) async fn object(&self, id: &ObjectId) -> Result<Object, crate::Error> {
         match (&self, id) {
             #[cfg(feature = "indexd")]
             (Self::Indexd(indexd), ObjectId::Indexd(id)) => {
@@ -531,7 +531,7 @@ impl Client {
 
         stream::try_unfold(holder, move |mut holder| async move {
             if let Some(id) = holder.with_iter_mut(|iter| iter.next().map(|(id, _)| id)) {
-                let object = self.backend.object(id).await?;
+                let object = self.cache.get_object(id, &self.backend).await?;
                 Ok(Some((object, holder)))
             } else {
                 Ok(None)
@@ -549,12 +549,13 @@ impl Client {
             return Ok(None);
         }
 
-        Ok(Some(self.backend.object(id).await?))
+        Ok(Some(self.cache.get_object(id, &self.backend).await?))
     }
 
     pub async fn delete_object(&self, id: &ObjectId) -> Result<(), crate::Error> {
         self.backend.delete_object(id).await?;
         self.known_object_ids.pin().remove(id);
+        self.cache.invalidate_object(id).await?;
         Ok(())
     }
 
@@ -577,6 +578,9 @@ impl Client {
         metadata: Option<Metadata<'static>>,
     ) -> Result<Object, crate::Error> {
         let object = self.backend.upload(name_hint, content, metadata).await?;
+        self.cache
+            .insert_object(object.clone(), &self.backend)
+            .await?;
         self.known_object_ids.pin().insert(object.id().clone(), ());
         Ok(object)
     }
