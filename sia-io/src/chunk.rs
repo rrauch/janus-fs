@@ -54,7 +54,7 @@ impl ChunkId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
     id: ChunkId,
     content: Bytes,

@@ -59,7 +59,7 @@ async fn retrieve_chunk<L2: L2ChunkCache>(
 
     let chunk = Chunk::new(id.clone(), content)?;
     if let Some(l2) = l2 {
-        l2.insert_chunk(&chunk).await?;
+        l2.insert_chunk(chunk.clone()).await?;
     }
     Ok(chunk)
 }
@@ -67,7 +67,7 @@ async fn retrieve_chunk<L2: L2ChunkCache>(
 #[async_trait]
 pub trait L2ChunkCache: Send + Sync {
     async fn get_chunk(&self, id: &ChunkId) -> Result<Option<Chunk>, std::io::Error>;
-    async fn insert_chunk(&self, chunk: &Chunk) -> Result<(), std::io::Error>;
+    async fn insert_chunk(&self, chunk: Chunk) -> Result<(), std::io::Error>;
 }
 
 #[async_trait]
@@ -78,7 +78,7 @@ impl L2ChunkCache for Box<dyn L2ChunkCache> {
     }
 
     #[inline]
-    async fn insert_chunk(&self, chunk: &Chunk) -> Result<(), std::io::Error> {
+    async fn insert_chunk(&self, chunk: Chunk) -> Result<(), std::io::Error> {
         self.as_ref().insert_chunk(chunk).await
     }
 }

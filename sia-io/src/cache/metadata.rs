@@ -30,7 +30,7 @@ pub trait L2MetadataCache: Send + Sync {
     async fn insert_indexd_object(
         &self,
         id: &crate::indexd::object::ObjectId,
-        object: &SealedObject,
+        object: SealedObject,
     ) -> Result<(), std::io::Error>;
 
     #[cfg(feature = "indexd")]
@@ -48,7 +48,7 @@ pub trait L2MetadataCache: Send + Sync {
     #[cfg(feature = "renterd")]
     async fn insert_renterd_object(
         &self,
-        object: &crate::renterd::object::File,
+        object: crate::renterd::object::File,
     ) -> Result<(), std::io::Error>;
 
     #[cfg(feature = "renterd")]
@@ -74,7 +74,7 @@ impl L2MetadataCache for Box<dyn L2MetadataCache> {
     async fn insert_indexd_object(
         &self,
         id: &crate::indexd::object::ObjectId,
-        object: &SealedObject,
+        object: SealedObject,
     ) -> Result<(), std::io::Error> {
         self.as_ref().insert_indexd_object(id, object).await
     }
@@ -101,7 +101,7 @@ impl L2MetadataCache for Box<dyn L2MetadataCache> {
     #[inline]
     async fn insert_renterd_object(
         &self,
-        object: &crate::renterd::object::File,
+        object: crate::renterd::object::File,
     ) -> Result<(), std::io::Error> {
         self.as_ref().insert_renterd_object(object).await
     }
@@ -142,13 +142,13 @@ impl Cache {
                 Object::Indexd { inner, .. } => match backend {
                     Backend::Indexd(indexd) => {
                         let sealed_object = inner.as_inner().seal(indexd.sdk().app_key());
-                        l2.insert_indexd_object(inner.id(), &sealed_object).await?;
+                        l2.insert_indexd_object(inner.id(), sealed_object).await?;
                     }
                     _ => Err(crate::Error::BackendMismatch)?,
                 },
                 #[cfg(feature = "renterd")]
                 Object::Renterd { inner, .. } => {
-                    l2.insert_renterd_object(inner.as_ref()).await?;
+                    l2.insert_renterd_object(inner.as_ref().clone()).await?;
                 }
             }
         }
@@ -220,13 +220,13 @@ async fn retrieve_object<L2: L2MetadataCache>(
             Object::Indexd { inner, .. } => match backend {
                 Backend::Indexd(indexd) => {
                     let sealed_object = inner.as_inner().seal(indexd.sdk().app_key());
-                    l2.insert_indexd_object(inner.id(), &sealed_object).await?;
+                    l2.insert_indexd_object(inner.id(), sealed_object).await?;
                 }
                 _ => Err(crate::Error::BackendMismatch)?,
             },
             #[cfg(feature = "renterd")]
             Object::Renterd { inner, .. } => {
-                l2.insert_renterd_object(inner.as_ref()).await?;
+                l2.insert_renterd_object(inner.as_ref().clone()).await?;
             }
         }
     }

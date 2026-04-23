@@ -1,8 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["cachalot", "main", "sia-io"]
+members = ["cachalot", "foyer-cache", "main", "sia-io"]
 
 [workspace.dependencies]
+foyer-cache = { path = "foyer-cache" }
+sia-io = { path = "sia-io" }
+
 anyhow = "1.0"
 bytes = "1.7"
 chrono = "0.4"
