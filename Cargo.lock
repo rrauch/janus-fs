@@ -3472,6 +3472,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "twox-hash",
  "typed-path",
  "zeroize",
 ]

@@ -8,6 +8,7 @@ use sia_storage::{Hash256, UploadOptions};
 use sia_storage::{Object as SiaObject, ObjectsCursor};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use thiserror::Error;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
@@ -63,6 +64,23 @@ impl Object {
     #[inline]
     pub(crate) fn as_inner(&self) -> &SiaObject {
         &self.inner
+    }
+
+    pub(crate) fn hash(&self, hasher: &mut impl Hasher) {
+        hasher.write(b"ID:");
+        self.id.hash(hasher);
+        hasher.write(b"\nCREATED_AT:");
+        self.inner.created_at().hash(hasher);
+        hasher.write(b"\nUPDATED_AT:");
+        self.inner.updated_at().hash(hasher);
+        hasher.write(b"\nSIZE:");
+        hasher.write_u64(self.size());
+
+        hasher.write(b"\nMETADATA:");
+        let metadata = self.metadata();
+        hasher.write(metadata);
+        hasher.write(b"\nMETADATA_LEN:");
+        hasher.write_usize(metadata.len());
     }
 }
 

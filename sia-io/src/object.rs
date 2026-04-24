@@ -10,11 +10,16 @@ use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sia_storage::ObjectsCursor;
 use std::borrow::Cow;
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
+use std::hash::Hasher;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt, iter};
 use thiserror::Error;
+use twox_hash::XxHash3_64;
+
+const VERSION_HASH_PREFIX: &[u8] = b"_SIA_OBJECT_VERSION_BEGIN_\n";
+const VERSION_HASH_SUFFIX: &[u8] = b"\n_SIA_OBJECT_VERSION_END_";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectId {
@@ -127,16 +132,28 @@ impl From<renterd::object::FileId> for ObjectId {
     }
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct Version(u64);
+
+impl Display for Version {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Object {
     #[cfg(feature = "indexd")]
     Indexd {
         id: ObjectId,
+        version: Version,
         inner: Arc<indexd::object::Object>,
     },
     #[cfg(feature = "renterd")]
     Renterd {
         id: ObjectId,
+        version: Version,
         inner: Arc<renterd::object::File>,
     },
 }
@@ -149,6 +166,16 @@ impl Object {
             Self::Indexd { id, .. } => id,
             #[cfg(feature = "renterd")]
             Self::Renterd { id, .. } => id,
+        }
+    }
+
+    #[inline]
+    pub fn version(&self) -> Version {
+        match self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd { version, .. } => *version,
+            #[cfg(feature = "renterd")]
+            Self::Renterd { version, .. } => *version,
         }
     }
 
@@ -216,9 +243,17 @@ impl Object {
 #[cfg(feature = "indexd")]
 impl From<indexd::object::Object> for Object {
     fn from(value: indexd::object::Object) -> Self {
+        let mut hasher = XxHash3_64::new();
+        hasher.write(VERSION_HASH_PREFIX);
+        hasher.write("INDEXD\n".as_bytes());
+        value.hash(&mut hasher);
+        hasher.write(VERSION_HASH_SUFFIX);
+        let version = Version(hasher.finish());
+
         let id = value.id().clone().into();
         Self::Indexd {
             id,
+            version,
             inner: Arc::new(value),
         }
     }
@@ -227,9 +262,17 @@ impl From<indexd::object::Object> for Object {
 #[cfg(feature = "renterd")]
 impl From<renterd::object::File> for Object {
     fn from(value: renterd::object::File) -> Self {
+        let mut hasher = XxHash3_64::new();
+        hasher.write(VERSION_HASH_PREFIX);
+        hasher.write("RENTERD\n".as_bytes());
+        value.hash(&mut hasher);
+        hasher.write(VERSION_HASH_SUFFIX);
+        let version = Version(hasher.finish());
+
         let id = value.id().clone().into();
         Self::Renterd {
             id,
+            version,
             inner: Arc::new(value),
         }
     }

@@ -1,8 +1,7 @@
 use crate::Backend;
 use crate::cache::Cache;
-use crate::object::{Object, ObjectId};
+use crate::object::{Object, ObjectId, Version};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures_util::{AsyncRead, AsyncSeek, ready};
 use serde::{Deserialize, Serialize};
 use std::io::SeekFrom;
@@ -15,8 +14,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId {
     object_id: ObjectId,
-    object_updated: DateTime<Utc>,
-    object_size: u64,
+    object_version: Version,
     range: Range<u64>,
 }
 
@@ -24,8 +22,7 @@ impl ChunkId {
     fn from_object(object: &Object, range: Range<u64>) -> Self {
         Self {
             object_id: object.id().clone(),
-            object_updated: *object.updated(),
-            object_size: object.size(),
+            object_version: object.version(),
             range,
         }
     }
@@ -33,6 +30,11 @@ impl ChunkId {
     #[inline]
     pub fn object_id(&self) -> &ObjectId {
         &self.object_id
+    }
+
+    #[inline]
+    pub fn object_version(&self) -> Version {
+        self.object_version
     }
 
     #[inline]
@@ -44,10 +46,7 @@ impl ChunkId {
         if &self.object_id != object.id() {
             Err(ChunkError::ObjectIdMismatch)?;
         }
-        if self.object_size != object.size() {
-            Err(ChunkError::ObjectModified)?;
-        }
-        if &self.object_updated != object.updated() {
+        if self.object_version != object.version() {
             Err(ChunkError::ObjectModified)?;
         }
         Ok(())

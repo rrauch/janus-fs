@@ -11,6 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::str::FromStr;
 use thiserror::Error;
@@ -464,6 +465,30 @@ impl<T: SupportedObjectKind> Object<T> {
     #[inline]
     pub fn metadata(&self) -> &HashMap<String, String> {
         &self.metadata
+    }
+
+    pub(crate) fn hash(&self, hasher: &mut impl Hasher) {
+        hasher.write(b"ID:");
+        self.id.hash(hasher);
+        hasher.write(b"\nMOD_TIME:");
+        self.mod_time.hash(hasher);
+        hasher.write(b"\nMIME_TYPE:");
+        self.mime_type.hash(hasher);
+        hasher.write(b"\nETAG:");
+        self.etag.hash(hasher);
+        hasher.write(b"\nSIZE:");
+        hasher.write_u64(self.size());
+
+        hasher.write(b"\nMETADATA:");
+        let metadata = self.metadata();
+        for (k, v) in metadata.iter() {
+            hasher.write(b"\nKEY:");
+            k.hash(hasher);
+            hasher.write(b"\nVALUE:");
+            v.hash(hasher);
+        }
+        hasher.write(b"\nMETADATA_LEN:");
+        hasher.write_usize(metadata.len());
     }
 }
 
