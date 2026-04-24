@@ -148,12 +148,7 @@ impl L2MetadataCache for FoyerMetadataCache {
         &self,
         id: &ObjectId,
     ) -> Result<Option<SealedObject>, std::io::Error> {
-        self.0
-            .get(BorrowedCacheKey::Indexd(id))
-            .await?
-            .map(SealedObject::try_from)
-            .transpose()
-            .map_err(|_| std::io::Error::other("invalid cache entry"))
+        self.0.get(BorrowedCacheKey::Indexd(id)).await
     }
 
     #[cfg(feature = "indexd")]
@@ -172,12 +167,7 @@ impl L2MetadataCache for FoyerMetadataCache {
 
     #[cfg(feature = "renterd")]
     async fn get_renterd_object(&self, id: &FileId) -> Result<Option<File>, std::io::Error> {
-        self.0
-            .get(BorrowedCacheKey::Renterd(id))
-            .await?
-            .map(File::try_from)
-            .transpose()
-            .map_err(|_| std::io::Error::other("invalid cache entry"))
+        self.0.get(BorrowedCacheKey::Renterd(id)).await
     }
 
     #[cfg(feature = "renterd")]

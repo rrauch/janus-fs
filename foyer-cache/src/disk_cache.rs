@@ -58,7 +58,10 @@ impl<K: StorageKey, V: StorageValue + Clone> DiskCache<K, V> {
         Ok(())
     }
 
-    pub async fn get(&self, key: impl Equivalent<K> + Hash) -> Result<Option<V>, std::io::Error> {
+    pub async fn get<T: TryFrom<V>>(
+        &self,
+        key: impl Equivalent<K> + Hash,
+    ) -> Result<Option<T>, std::io::Error> {
         let value = match self.hybrid_cache.storage().load(&key).await {
             Ok(Load::Entry { value, .. }) => value,
             Ok(Load::Piece { piece, .. }) => piece.value().clone(),
@@ -69,10 +72,15 @@ impl<K: StorageKey, V: StorageValue + Clone> DiskCache<K, V> {
                 return Err(std::io::Error::other(err));
             }
         };
-
-        Ok(Some(value.try_into().map_err(|_| {
-            std::io::Error::other("invalid cache entry")
-        })?))
+        
+        match T::try_from(value) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => {
+                // invalid cache entry detected; remove
+                self.hybrid_cache.storage().delete(&key);
+                Err(std::io::Error::other("invalid cache entry"))
+            }
+        }
     }
 
     pub async fn insert(
@@ -93,10 +101,6 @@ impl<K: StorageKey, V: StorageValue + Clone> DiskCache<K, V> {
     pub async fn invalidate(&self, key: impl Equivalent<K> + Hash) -> Result<(), std::io::Error> {
         self.hybrid_cache.storage().delete(&key);
         Ok(())
-    }
-
-    pub async fn flush(&self) {
-        self.hybrid_cache.storage().wait().await
     }
 
     async fn check_compat_file(&self) -> bool {
