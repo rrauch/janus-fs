@@ -1,7 +1,9 @@
+use crate::cache::Cache;
+use crate::chunk::ChunkedReader;
 use crate::renterd::object::AnyObject;
 use crate::{Backend, Client, ETag, Metadata, MimeType, indexd, renterd};
 use chrono::{DateTime, Utc};
-use futures_io::AsyncRead;
+use futures_io::{AsyncRead, AsyncSeek};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
 use ouroboros::self_referencing;
 use serde::de::Visitor;
@@ -233,9 +235,72 @@ impl From<renterd::object::File> for Object {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum BackendDO {
+    #[cfg(feature = "indexd")]
+    Indexd {
+        object: Object,
+        inner: indexd::download::DownloadableObject,
+    },
+    #[cfg(feature = "renterd")]
+    Renterd {
+        object: Object,
+        inner: renterd::download::DownloadableFile,
+    },
+}
+
+impl BackendDO {
+    #[inline]
+    pub fn object(&self) -> &Object {
+        match &self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd { object, .. } => object,
+            #[cfg(feature = "renterd")]
+            Self::Renterd { object, .. } => object,
+        }
+    }
+
+    #[inline]
+    pub async fn open(
+        &self,
+        offset: impl Into<Option<u64>>,
+    ) -> Result<impl AsyncRead + Send + Unpin, crate::Error> {
+        let offset = offset.into();
+        let reader: Box<dyn AsyncRead + Send + Unpin> = match &self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd { inner, .. } => Box::new(inner.open(offset).await?),
+            #[cfg(feature = "renterd")]
+            Self::Renterd { inner, .. } => Box::new(inner.open(offset).await?),
+        };
+        Ok(reader)
+    }
+}
+
+#[cfg(feature = "indexd")]
+impl From<indexd::download::DownloadableObject> for BackendDO {
+    fn from(value: indexd::download::DownloadableObject) -> Self {
+        let object = Object::from(value.object().clone());
+        Self::Indexd {
+            object,
+            inner: value,
+        }
+    }
+}
+
+#[cfg(feature = "renterd")]
+impl From<renterd::download::DownloadableFile> for BackendDO {
+    fn from(value: renterd::download::DownloadableFile) -> Self {
+        let object = Object::from(value.file().clone());
+        Self::Renterd {
+            object,
+            inner: value,
+        }
+    }
+}
+
 impl Backend {
     #[inline]
-    async fn object(&self, id: &ObjectId) -> Result<Object, crate::Error> {
+    pub(crate) async fn object(&self, id: &ObjectId) -> Result<Object, crate::Error> {
         match (&self, id) {
             #[cfg(feature = "indexd")]
             (Self::Indexd(indexd), ObjectId::Indexd(id)) => {
@@ -265,13 +330,15 @@ impl Backend {
     }
 
     #[inline]
-    async fn download(&self, id: &ObjectId) -> Result<DownloadableObject, crate::Error> {
+    pub(crate) async fn download(&self, id: &ObjectId) -> Result<BackendDO, crate::Error> {
         match (&self, id) {
             #[cfg(feature = "indexd")]
-            (Self::Indexd(indexd), ObjectId::Indexd(id)) => Ok(indexd.download(id).await?.into()),
+            (Self::Indexd(indexd), ObjectId::Indexd(id)) => {
+                Ok(BackendDO::from(indexd.download(id).await?))
+            }
             #[cfg(feature = "renterd")]
             (Self::Renterd(renterd), ObjectId::Renterd(id)) => {
-                Ok(renterd.download(id).await?.into())
+                Ok(BackendDO::from(renterd.download(id).await?))
             }
             _ => Err(crate::Error::BackendMismatch),
         }
@@ -445,65 +512,27 @@ impl ObjectEvent {
 }
 
 #[derive(Debug, Clone)]
-pub enum DownloadableObject {
-    #[cfg(feature = "indexd")]
-    Indexd {
-        object: Object,
-        inner: indexd::download::DownloadableObject,
-    },
-    #[cfg(feature = "renterd")]
-    Renterd {
-        object: Object,
-        inner: renterd::download::DownloadableFile,
-    },
+pub struct DownloadableObject {
+    chunk_size: usize,
+    object: Object,
+    backend: Backend,
+    cache: Cache,
 }
 
 impl DownloadableObject {
     #[inline]
     pub fn object(&self) -> &Object {
-        match &self {
-            #[cfg(feature = "indexd")]
-            Self::Indexd { object, .. } => object,
-            #[cfg(feature = "renterd")]
-            Self::Renterd { object, .. } => object,
-        }
+        &self.object
     }
 
     #[inline]
-    pub async fn open(
-        &self,
-        offset: impl Into<Option<u64>>,
-    ) -> Result<impl AsyncRead + Send + Unpin, crate::Error> {
-        let offset = offset.into();
-        let reader: Box<dyn AsyncRead + Send + Unpin> = match &self {
-            #[cfg(feature = "indexd")]
-            Self::Indexd { inner, .. } => Box::new(inner.open(offset).await?),
-            #[cfg(feature = "renterd")]
-            Self::Renterd { inner, .. } => Box::new(inner.open(offset).await?),
-        };
-        Ok(reader)
-    }
-}
-
-#[cfg(feature = "indexd")]
-impl From<indexd::download::DownloadableObject> for DownloadableObject {
-    fn from(value: indexd::download::DownloadableObject) -> Self {
-        let object = Object::from(value.object().clone());
-        Self::Indexd {
-            object,
-            inner: value,
-        }
-    }
-}
-
-#[cfg(feature = "renterd")]
-impl From<renterd::download::DownloadableFile> for DownloadableObject {
-    fn from(value: renterd::download::DownloadableFile) -> Self {
-        let object = Object::from(value.file().clone());
-        Self::Renterd {
-            object,
-            inner: value,
-        }
+    pub async fn open(&self) -> Result<impl AsyncRead + AsyncSeek + Send + Unpin, crate::Error> {
+        Ok(ChunkedReader::new(
+            self.object.clone(),
+            self.chunk_size,
+            self.backend.clone(),
+            self.cache.clone(),
+        ))
     }
 }
 
@@ -531,7 +560,7 @@ impl Client {
 
         stream::try_unfold(holder, move |mut holder| async move {
             if let Some(id) = holder.with_iter_mut(|iter| iter.next().map(|(id, _)| id)) {
-                let object = self.backend.object(id).await?;
+                let object = self.cache.get_object(id, &self.backend).await?;
                 Ok(Some((object, holder)))
             } else {
                 Ok(None)
@@ -549,12 +578,13 @@ impl Client {
             return Ok(None);
         }
 
-        Ok(Some(self.backend.object(id).await?))
+        Ok(Some(self.cache.get_object(id, &self.backend).await?))
     }
 
     pub async fn delete_object(&self, id: &ObjectId) -> Result<(), crate::Error> {
         self.backend.delete_object(id).await?;
         self.known_object_ids.pin().remove(id);
+        self.cache.invalidate_object(id).await?;
         Ok(())
     }
 
@@ -563,10 +593,12 @@ impl Client {
         &self,
         id: &ObjectId,
     ) -> Result<Option<DownloadableObject>, crate::Error> {
-        if !self.known_object_ids.pin().contains_key(id) {
-            return Ok(None);
-        }
-        Ok(Some(self.backend.download(id).await?))
+        Ok(self.object(id).await?.map(|object| DownloadableObject {
+            chunk_size: self.chunk_size,
+            object,
+            backend: self.backend.clone(),
+            cache: self.cache.clone(),
+        }))
     }
 
     #[inline]
@@ -577,6 +609,9 @@ impl Client {
         metadata: Option<Metadata<'static>>,
     ) -> Result<Object, crate::Error> {
         let object = self.backend.upload(name_hint, content, metadata).await?;
+        self.cache
+            .insert_object(object.clone(), &self.backend)
+            .await?;
         self.known_object_ids.pin().insert(object.id().clone(), ());
         Ok(object)
     }

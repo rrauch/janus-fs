@@ -1,0 +1,27 @@
+[package]
+name = "foyer-cache"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+renterd = ["sia-io/renterd"]
+indexd = ["sia-io/indexd"]
+
+[dependencies]
+sia-io = { workspace = true }
+
+async-trait = "0.1"
+blocking = "1.6"
+bon = "3.9"
+equivalent = "1"
+foyer = { version = "0.22", features = ["default", "serde"] }
+serde = "1.0"
+serde_json = "1.0"
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1.0"
+dotenv = "0.15"
+tokio = { version = "1.51", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

@@ -1,3 +1,4 @@
+use crate::cache::Cache;
 use crate::confidential::{Confidential, NewSecretExt};
 use crate::object::{ObjectEvent, ObjectId};
 use crate::tagged::{TaggedValue, TryFromInner, WithFromStr, WithSerde};
@@ -15,6 +16,11 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "indexd")]
+pub use sia_storage::SealedObject;
+
+pub mod cache;
+pub mod chunk;
 pub mod confidential;
 #[cfg(feature = "indexd")]
 pub mod indexd;
@@ -164,12 +170,20 @@ pub enum Error {
     RenterdError(#[from] renterd::client::ClientError),
     #[error("backend and input type mismatch")]
     BackendMismatch,
+    #[error("cached error: {0}")]
+    CachedError(String),
+    #[error(transparent)]
+    ChunkError(#[from] chunk::ChunkError),
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
 }
 
 pub struct Client {
     backend: Backend,
+    cache: Cache,
     known_object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
     object_event_loop_handle: Option<JoinHandle<()>>,
+    chunk_size: usize,
 }
 
 impl Drop for Client {
@@ -183,22 +197,31 @@ impl Drop for Client {
 #[bon]
 impl Client {
     #[builder]
-    pub async fn new(#[builder(into)] backend: Backend) -> Result<Self, Error> {
+    pub async fn new(
+        #[builder(into)] backend: Backend,
+        #[builder(default)] cache: Cache,
+        #[builder(default = 1024 * 256)] chunk_size: usize,
+    ) -> Result<Self, Error> {
+        assert!(chunk_size > 0);
         let (mut stream, cursor) = backend.list_objects().await?;
         let object_ids = Arc::new(papaya::HashMap::new());
         while let Some(object) = stream.try_next().await? {
-            object_ids.pin().insert(object.id().clone(), ());
+            let id = object.id().clone();
+            cache.insert_object(object, &backend).await?;
+            object_ids.pin().insert(id, ());
         }
         drop(stream);
 
         let object_event_loop_handle = {
             let object_ids = object_ids.clone();
             let backend = backend.clone();
+            let cache = cache.clone();
             tokio::spawn(async move {
                 object_event_loop(
                     cursor,
                     object_ids,
                     backend,
+                    cache,
                     Duration::from_secs(10),
                     Duration::from_secs(60),
                 )
@@ -207,7 +230,9 @@ impl Client {
         };
 
         Ok(Self {
+            chunk_size,
             backend,
+            cache,
             known_object_ids: object_ids,
             object_event_loop_handle: Some(object_event_loop_handle),
         })
@@ -218,6 +243,7 @@ async fn object_event_loop(
     mut cursor: Option<ObjectsCursor>,
     object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
     backend: Backend,
+    cache: Cache,
     eof_retry_duration: Duration,
     error_retry_duration: Duration,
 ) {
@@ -238,15 +264,19 @@ async fn object_event_loop(
         loop {
             match event_stream.try_next().await {
                 Ok(Some(event)) => {
-                    match &event {
+                    let latest_cursor = event.cursor();
+                    match event {
                         ObjectEvent::New(object, _) | ObjectEvent::Updated(object, _) => {
-                            object_ids.pin().insert(object.id().clone(), ());
+                            let id = object.id().clone();
+                            let _ = cache.insert_object(object, &backend).await;
+                            object_ids.pin().insert(id, ());
                         }
                         ObjectEvent::Deleted(id, _) => {
-                            object_ids.pin().remove(id);
+                            object_ids.pin().remove(&id);
+                            let _ = cache.invalidate_object(&id).await;
                         }
                     }
-                    cursor = event.cursor();
+                    cursor = latest_cursor;
                 }
                 Ok(None) => {
                     // no more events
@@ -274,7 +304,8 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 mod tests {
     use crate::{Backend, Client, indexd, renterd};
     use futures_util::io::Cursor;
-    use futures_util::{AsyncReadExt, TryStreamExt};
+    use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};
+    use std::io::SeekFrom;
 
     static ONE_MB: &[u8] = include_bytes!("../testdata/1mb.bin");
 
@@ -325,10 +356,16 @@ mod tests {
         let dl1 = client.download(file1.id()).await?.unwrap();
         assert_eq!(dl1.object().size(), ONE_MB.len() as u64);
         let mut buf = Vec::with_capacity(ONE_MB.len());
-        let mut reader = dl1.open(None).await?;
+        let mut reader = dl1.open().await?;
         let read = reader.read_to_end(&mut buf).await?;
         assert_eq!(read, ONE_MB.len());
         assert_eq!(&buf, ONE_MB);
+
+        buf.clear();
+        reader.seek(SeekFrom::End(-1024)).await?;
+        let read = reader.read_to_end(&mut buf).await?;
+        assert_eq!(read, 1024);
+        assert_eq!(&buf[..1024], &ONE_MB[ONE_MB.len() - 1024..]);
 
         client.delete_object(file1.id()).await?;
         assert_eq!(client.num_objects(), 0);

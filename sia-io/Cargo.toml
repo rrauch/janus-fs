@@ -8,14 +8,19 @@ renterd = ["dep:chrono", "dep:reqwest", "dep:serde_json"]
 indexd = ["dep:sia_storage", "dep:tokio", "dep:tokio-util"]
 
 [dependencies]
+async-trait = "0.1"
 bon = "3.9"
+bytes = { version = "1", features = ["serde"] }
+bytesize = "2.3"
 chrono = { version = "0.4", features = ["serde"], optional = true }
 ct-codecs = "1.1"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 indexmap = "2"
+maybe-owned = "0.3"
 mime = "0.3"
+moka = { version = "0.12", features = ["future"] }
 ouroboros = "0.18"
 papaya = "0.2"
 reqwest = { version = "0.13", features = ["stream", "json", "query"], optional = true }
