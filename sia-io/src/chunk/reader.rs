@@ -1,102 +1,15 @@
-use crate::Backend;
 use crate::cache::Cache;
+use crate::chunk::{Chunk, ChunkDownloader, ChunkError, ChunkId};
 use crate::object::{Object, ObjectId, Version};
-use bytes::{Bytes, BytesMut};
-use futures_util::{AsyncRead, AsyncReadExt, AsyncSeek, ready};
-use serde::{Deserialize, Serialize};
+use crate::scheduler::Scheduler;
+use bytes::BytesMut;
+use futures_io::{AsyncRead, AsyncSeek};
+use futures_util::{AsyncReadExt, ready};
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use thiserror::Error;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ChunkId {
-    object_id: ObjectId,
-    object_version: Version,
-    range: Range<u64>,
-}
-
-impl ChunkId {
-    fn from_object(object: &Object, range: Range<u64>) -> Self {
-        Self {
-            object_id: object.id().clone(),
-            object_version: object.version(),
-            range,
-        }
-    }
-
-    #[inline]
-    pub fn object_id(&self) -> &ObjectId {
-        &self.object_id
-    }
-
-    #[inline]
-    pub fn object_version(&self) -> Version {
-        self.object_version
-    }
-
-    #[inline]
-    pub fn range(&self) -> &Range<u64> {
-        &self.range
-    }
-
-    pub(crate) fn check_object_details(&self, object: &Object) -> Result<(), ChunkError> {
-        if &self.object_id != object.id() {
-            Err(ChunkError::ObjectIdMismatch)?;
-        }
-        if self.object_version != object.version() {
-            Err(ChunkError::ObjectModified)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Chunk {
-    id: ChunkId,
-    content: Bytes,
-}
-
-#[derive(Debug, Error)]
-pub enum ChunkError {
-    #[error("invalid chunk content length: expected {expected} != actual {actual}")]
-    InvalidLength { expected: usize, actual: usize },
-    #[error("the object was modified")]
-    ObjectModified,
-    #[error("object id mismatch")]
-    ObjectIdMismatch,
-}
-
-impl Chunk {
-    pub(crate) fn new(id: ChunkId, content: Bytes) -> Result<Self, ChunkError> {
-        let len = (id.range.end - id.range.start) as usize;
-        if len != content.len() {
-            Err(ChunkError::InvalidLength {
-                expected: len,
-                actual: content.len(),
-            })
-        } else {
-            Ok(Self { id, content })
-        }
-    }
-
-    #[inline]
-    pub fn id(&self) -> &ChunkId {
-        &self.id
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.content.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.content.is_empty()
-    }
-}
 
 enum State {
     Ready { chunk: Option<Chunk> },
@@ -119,26 +32,41 @@ type RetrieveFut = Pin<Box<dyn Future<Output = Result<Chunk, crate::Error>> + Se
 
 pub struct ChunkedReader {
     chunk_size: usize,
-    backend: Backend,
     cache: Cache,
+    downloader: Arc<Scheduler<ChunkDownloader>>,
     object: Object,
+    access_key: (ObjectId, Version),
     pos: u64,
     len: u64,
     state: State,
 }
 
 impl ChunkedReader {
-    pub(crate) fn new(object: Object, chunk_size: usize, backend: Backend, cache: Cache) -> Self {
+    pub(crate) async fn new(
+        cache: Cache,
+        object: Object,
+        chunk_size: usize,
+        downloader: Arc<Scheduler<ChunkDownloader>>,
+    ) -> Result<Self, crate::Error> {
         assert!(chunk_size > 0);
-        Self {
-            chunk_size,
-            backend,
+        let access_key = downloader
+            .prepare(object.id())
+            .await
+            .map_err(|e| crate::Error::CachedError(e.to_string()))?;
+        if object.version() != access_key.1 {
+            Err(ChunkError::ObjectModified)?
+        }
+
+        Ok(Self {
             cache,
+            chunk_size,
+            downloader,
+            access_key,
             pos: 0,
             len: object.size(),
             object,
             state: State::default(),
-        }
+        })
     }
 
     fn calc_range(&self, pos: u64) -> Result<(Range<u64>, usize), std::io::Error> {
@@ -163,22 +91,22 @@ impl ChunkedReader {
 
         let chunk_id = ChunkId::from_object(&self.object, range);
 
-        let cache = self.cache.clone();
-        let backend = self.backend.clone();
+        let downloader = self.downloader.clone();
         let id = chunk_id.clone();
+        let access_key = self.access_key.clone();
         let source = async move {
-            let dl = backend.download(id.object_id()).await?;
-            id.check_object_details(dl.object())?;
-            let len = ((id.range().end - id.range().start) as usize)
-                .min(dl.object().size().try_into().unwrap_or(usize::MAX));
-            let mut reader = dl.open(id.range().start).await?;
+            let mut reader = downloader
+                .access(&access_key, id.range.start)
+                .await
+                .map_err(|e| crate::Error::CachedError(e.to_string()))?;
+            let len = (id.range().end - id.range().start) as usize;
             let mut buf = BytesMut::zeroed(len);
-            reader.read_exact(&mut buf).await?;
+            reader.as_mut().read_exact(&mut buf).await?;
             let content = buf.freeze();
-
-            Ok(Chunk::new(id.clone(), content)?)
+            Ok(Chunk::new(id, content)?)
         };
 
+        let cache = self.cache.clone();
         let fut = Box::pin(async move { cache.get_chunk(&chunk_id, source).await });
 
         self.state = State::Retrieving {

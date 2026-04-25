@@ -10,12 +10,15 @@ use sia_storage::ObjectsCursor;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
+use crate::chunk::ChunkDownloader;
+use crate::scheduler::Scheduler;
 #[cfg(feature = "indexd")]
 pub use sia_storage::SealedObject;
 
@@ -27,6 +30,7 @@ pub mod indexd;
 pub mod object;
 #[cfg(feature = "renterd")]
 pub mod renterd;
+pub mod scheduler;
 pub(crate) mod tagged;
 
 pub struct MimeTypeKind;
@@ -176,6 +180,18 @@ pub enum Error {
     ChunkError(#[from] chunk::ChunkError),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    ConfigError(#[from] ConfigError),
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid chunk size")]
+    InvalidChunkSize,
+    #[error("invalid download max skip ahead")]
+    InvalidDownloadMaxSkipAhead,
+    #[error("invalid max concurrent downloads")]
+    InvalidMaxConcurrentDownloads,
 }
 
 pub struct Client {
@@ -184,6 +200,7 @@ pub struct Client {
     known_object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
     object_event_loop_handle: Option<JoinHandle<()>>,
     chunk_size: usize,
+    chunk_downloader: Arc<Scheduler<ChunkDownloader>>,
 }
 
 impl Drop for Client {
@@ -201,8 +218,17 @@ impl Client {
         #[builder(into)] backend: Backend,
         #[builder(default)] cache: Cache,
         #[builder(default = 1024 * 256)] chunk_size: usize,
+        #[builder(default = 1024 * 1024)] download_max_skip_ahead: usize,
+        #[builder(default = 64)] max_concurrent_downloads: usize,
     ) -> Result<Self, Error> {
-        assert!(chunk_size > 0);
+        if chunk_size == 0 {
+            Err(ConfigError::InvalidChunkSize)?;
+        }
+        let download_max_skip_ahead = NonZeroU64::new(download_max_skip_ahead as u64)
+            .ok_or_else(|| ConfigError::InvalidDownloadMaxSkipAhead)?;
+        let max_concurrent_downloads = NonZeroUsize::new(max_concurrent_downloads)
+            .ok_or_else(|| ConfigError::InvalidMaxConcurrentDownloads)?;
+
         let (mut stream, cursor) = backend.list_objects().await?;
         let object_ids = Arc::new(papaya::HashMap::new());
         while let Some(object) = stream.try_next().await? {
@@ -229,12 +255,23 @@ impl Client {
             })
         };
 
+        let chunk_downloader = Arc::new(
+            ChunkDownloader::builder()
+                .backend(backend.clone())
+                .cache(cache.clone())
+                .chunk_size(chunk_size)
+                .max_skip_ahead(download_max_skip_ahead)
+                .max_concurrent_downloads(max_concurrent_downloads)
+                .build(),
+        );
+
         Ok(Self {
             chunk_size,
             backend,
             cache,
             known_object_ids: object_ids,
             object_event_loop_handle: Some(object_event_loop_handle),
+            chunk_downloader,
         })
     }
 }
@@ -312,6 +349,10 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn indexd_test1() -> Result<(), anyhow::Error> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
         dotenv::dotenv().ok();
         let indexd = indexd::tests::connect().await?;
         integration_test1(indexd).await?;
@@ -321,6 +362,10 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn renterd_test1() -> Result<(), anyhow::Error> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
         dotenv::dotenv().ok();
         let renterd = renterd::tests::new_client().await?;
         integration_test1(renterd).await?;

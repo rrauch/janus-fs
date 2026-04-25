@@ -1,7 +1,10 @@
 use crate::cache::Cache;
-use crate::chunk::ChunkedReader;
+use crate::chunk::{ChunkDownloader, ChunkedReader};
 use crate::renterd::object::AnyObject;
+use crate::scheduler::Scheduler;
+use crate::scheduler::resource_manager::Resource;
 use crate::{Backend, Client, ETag, Metadata, MimeType, indexd, renterd};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_io::{AsyncRead, AsyncSeek};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
@@ -12,8 +15,10 @@ use sia_storage::ObjectsCursor;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::hash::Hasher;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::{fmt, iter};
 use thiserror::Error;
 use twox_hash::XxHash3_64;
@@ -304,18 +309,79 @@ impl BackendDO {
     }
 
     #[inline]
-    pub async fn open(
-        &self,
-        offset: impl Into<Option<u64>>,
-    ) -> Result<impl AsyncRead + Send + Unpin, crate::Error> {
+    pub async fn open(&self, offset: impl Into<Option<u64>>) -> Result<Download, crate::Error> {
         let offset = offset.into();
-        let reader: Box<dyn AsyncRead + Send + Unpin> = match &self {
+        Ok(match &self {
             #[cfg(feature = "indexd")]
-            Self::Indexd { inner, .. } => Box::new(inner.open(offset).await?),
+            Self::Indexd { inner, .. } => Download::Indexd(inner.open(offset).await?),
             #[cfg(feature = "renterd")]
-            Self::Renterd { inner, .. } => Box::new(inner.open(offset).await?),
-        };
-        Ok(reader)
+            Self::Renterd { inner, .. } => Download::Renterd(inner.open(offset).await?),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum Download {
+    #[cfg(feature = "indexd")]
+    Indexd(indexd::download::Download),
+    #[cfg(feature = "renterd")]
+    Renterd(renterd::download::Download),
+}
+
+impl Download {
+    pub fn len(&self) -> u64 {
+        match self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd(indexd) => indexd.len(),
+            #[cfg(feature = "renterd")]
+            Self::Renterd(renterd) => renterd.len(),
+        }
+    }
+}
+
+impl AsyncRead for Download {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.as_mut();
+        match this.get_mut() {
+            #[cfg(feature = "indexd")]
+            Self::Indexd(indexd) => Pin::new(indexd).poll_read(cx, buf),
+            #[cfg(feature = "renterd")]
+            Self::Renterd(renterd) => Pin::new(renterd).poll_read(cx, buf),
+        }
+    }
+}
+
+#[async_trait]
+impl Resource for Download {
+    fn offset(&self) -> u64 {
+        match self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd(indexd) => indexd.offset(),
+            #[cfg(feature = "renterd")]
+            Self::Renterd(renterd) => renterd.offset(),
+        }
+    }
+
+    fn can_reuse(&self) -> bool {
+        match self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd(indexd) => indexd.can_reuse(),
+            #[cfg(feature = "renterd")]
+            Self::Renterd(renterd) => renterd.can_reuse(),
+        }
+    }
+
+    async fn finalize(self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd(indexd) => indexd.finalize().await,
+            #[cfg(feature = "renterd")]
+            Self::Renterd(renterd) => renterd.finalize().await,
+        }
     }
 }
 
@@ -560,6 +626,7 @@ pub struct DownloadableObject {
     object: Object,
     backend: Backend,
     cache: Cache,
+    downloader: Arc<Scheduler<ChunkDownloader>>,
 }
 
 impl DownloadableObject {
@@ -570,12 +637,13 @@ impl DownloadableObject {
 
     #[inline]
     pub async fn open(&self) -> Result<impl AsyncRead + AsyncSeek + Send + Unpin, crate::Error> {
-        Ok(ChunkedReader::new(
+        ChunkedReader::new(
+            self.cache.clone(),
             self.object.clone(),
             self.chunk_size,
-            self.backend.clone(),
-            self.cache.clone(),
-        ))
+            self.downloader.clone(),
+        )
+        .await
     }
 }
 
@@ -641,6 +709,7 @@ impl Client {
             object,
             backend: self.backend.clone(),
             cache: self.cache.clone(),
+            downloader: self.chunk_downloader.clone(),
         }))
     }
 

@@ -1,5 +1,7 @@
 use crate::indexd::client::{Client, ClientError};
 use crate::indexd::object::{Object, ObjectId};
+use crate::scheduler::resource_manager::Resource;
+use async_trait::async_trait;
 use futures_util::AsyncRead;
 use sia_storage::{DownloadError, DownloadOptions};
 use std::pin::Pin;
@@ -19,15 +21,13 @@ impl DownloadableObject {
         &self.inner
     }
 
-    pub async fn open(
-        &self,
-        offset: impl Into<Option<u64>>,
-    ) -> Result<impl AsyncRead + Send + Unpin, ClientError> {
+    pub async fn open(&self, offset: impl Into<Option<u64>>) -> Result<Download, ClientError> {
         let offset = offset.into();
         let mut options = DownloadOptions::default();
         if let Some(offset) = offset {
             options.offset = offset;
         }
+        let offset = offset.unwrap_or(0);
         if let Some(max_inflight) = self.client.download_max_inflight() {
             options.max_inflight = max_inflight;
         }
@@ -36,24 +36,53 @@ impl DownloadableObject {
 
         let client = self.client.clone();
         let object = self.inner.as_inner().clone();
+        let len = object.size();
         let jh =
             tokio::spawn(async move { client.sdk().download(&mut writer, &object, options).await });
 
-        Ok(Downloader {
+        Ok(Download {
             reader,
             jh: Some(jh),
             task_error: None,
+            error_count: 0,
+            offset,
+            len,
         })
     }
 }
 
-struct Downloader {
+#[derive(Debug)]
+pub struct Download {
     reader: DuplexStream,
     jh: Option<JoinHandle<Result<(), DownloadError>>>,
     task_error: Option<std::io::Error>,
+    error_count: usize,
+    offset: u64,
+    len: u64,
 }
 
-impl Drop for Downloader {
+impl Download {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+#[async_trait]
+impl Resource for Download {
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn can_reuse(&self) -> bool {
+        self.offset < self.len && self.error_count == 0
+    }
+
+    async fn finalize(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Download {
     fn drop(&mut self) {
         if let Some(jh) = self.jh.take() {
             jh.abort();
@@ -61,7 +90,7 @@ impl Drop for Downloader {
     }
 }
 
-impl Downloader {
+impl Download {
     fn poll_task(&mut self, cx: &mut Context<'_>, eof: bool) -> Poll<std::io::Result<usize>> {
         let Some(jh) = &mut self.jh else {
             return if eof {
@@ -85,6 +114,7 @@ impl Downloader {
                     Ok(Err(e)) => std::io::Error::new(std::io::ErrorKind::Other, e),
                     Err(e) => std::io::Error::new(std::io::ErrorKind::Other, e),
                 };
+                self.error_count += 1;
                 if eof {
                     Poll::Ready(Err(err))
                 } else {
@@ -97,7 +127,7 @@ impl Downloader {
     }
 }
 
-impl AsyncRead for Downloader {
+impl AsyncRead for Download {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -112,7 +142,9 @@ impl AsyncRead for Downloader {
         let mut read_buf = tokio::io::ReadBuf::new(buf);
         match Pin::new(&mut this.reader).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) if !read_buf.filled().is_empty() => {
-                Poll::Ready(Ok(read_buf.filled().len()))
+                let n = read_buf.filled().len();
+                this.offset += n as u64;
+                Poll::Ready(Ok(n))
             }
             Poll::Ready(Ok(())) => this.poll_task(cx, true),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
