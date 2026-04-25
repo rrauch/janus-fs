@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-renterd = ["dep:chrono", "dep:reqwest", "dep:serde_json"]
+default = ["indexd", "renterd"]
 indexd = ["dep:sia_storage", "dep:tokio", "dep:tokio-util"]
+renterd = ["dep:chrono", "dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 anyhow = "1"
