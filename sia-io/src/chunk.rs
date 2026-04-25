@@ -1,8 +1,8 @@
 use crate::Backend;
 use crate::cache::Cache;
 use crate::object::{Object, ObjectId, Version};
-use bytes::Bytes;
-use futures_util::{AsyncRead, AsyncSeek, ready};
+use bytes::{Bytes, BytesMut};
+use futures_util::{AsyncRead, AsyncReadExt, AsyncSeek, ready};
 use serde::{Deserialize, Serialize};
 use std::io::SeekFrom;
 use std::ops::Range;
@@ -165,7 +165,21 @@ impl ChunkedReader {
 
         let cache = self.cache.clone();
         let backend = self.backend.clone();
-        let fut = Box::pin(async move { cache.get_chunk(&chunk_id, &backend).await });
+        let id = chunk_id.clone();
+        let source = async move {
+            let dl = backend.download(id.object_id()).await?;
+            id.check_object_details(dl.object())?;
+            let len = ((id.range().end - id.range().start) as usize)
+                .min(dl.object().size().try_into().unwrap_or(usize::MAX));
+            let mut reader = dl.open(id.range().start).await?;
+            let mut buf = BytesMut::zeroed(len);
+            reader.read_exact(&mut buf).await?;
+            let content = buf.freeze();
+
+            Ok(Chunk::new(id.clone(), content)?)
+        };
+
+        let fut = Box::pin(async move { cache.get_chunk(&chunk_id, source).await });
 
         self.state = State::Retrieving {
             fut: Mutex::new(fut),
