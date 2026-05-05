@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 pub mod blob;
 pub mod chunk;
+mod chunk_map;
 
 #[derive_where(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -33,6 +34,6 @@ impl<T> Display for ContentId<T> {
 
 impl<T> ContentId<T> {
     pub(crate) fn new_internal(hash: blake3::Hash) -> Self {
-        Self(Arc::new(hash), PhantomData::default())
+        Self(Arc::new(hash), PhantomData)
     }
 }
