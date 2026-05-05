@@ -3487,10 +3487,13 @@ name = "sia-vfs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "bytes",
  "derive-where",
  "dotenv",
+ "futures-io",
+ "futures-util",
  "sia-io",
  "tokio",
  "tracing-subscriber",

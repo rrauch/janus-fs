@@ -1,4 +1,5 @@
 use crate::ContentId;
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::ops::Deref;
 
@@ -62,4 +63,14 @@ fn hash(content: &[u8]) -> ChunkId {
     hasher.update(content);
     hasher.update(b"\nend");
     ChunkId::new_internal(hasher.finalize())
+}
+
+#[async_trait]
+pub trait ChunkSource: Send + Sync + Unpin {
+    async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, std::io::Error>;
+}
+
+#[async_trait]
+pub trait ChunkSink: Send + Sync + Unpin {
+    async fn insert_chunk(&self, chunk: Chunk) -> Result<(), std::io::Error>;
 }

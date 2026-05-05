@@ -11,9 +11,12 @@ renterd = ["sia-io/renterd"]
 [dependencies]
 sia-io = { path = "../sia-io", default-features = false }
 
+async-trait = "0.1"
 blake3 = "1.8"
 bytes = "1"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
+futures-io = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
 
 [dev-dependencies]
 anyhow = "1.0"

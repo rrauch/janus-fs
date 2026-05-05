@@ -1,3 +1,5 @@
+pub mod reader;
+
 use crate::ContentId;
 use crate::chunk_map::ChunkMap;
 
