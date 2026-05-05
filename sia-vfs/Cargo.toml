@@ -1,0 +1,22 @@
+[package]
+name = "sia-vfs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["indexd", "renterd"]
+indexd = ["sia-io/indexd"]
+renterd = ["sia-io/renterd"]
+
+[dependencies]
+sia-io = { path = "../sia-io", default-features = false }
+
+blake3 = "1.8"
+bytes = "1"
+derive-where = { version = "1.6", features = ["zeroize", "serde"] }
+
+[dev-dependencies]
+anyhow = "1.0"
+dotenv = "0.15"
+tokio = { version = "1.51", features = ["full"] }
+tracing-subscriber = "0.3"

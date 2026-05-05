@@ -3483,6 +3483,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sia-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "derive-where",
+ "dotenv",
+ "sia-io",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sia_core"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
