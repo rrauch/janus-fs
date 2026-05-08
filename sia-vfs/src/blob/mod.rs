@@ -1,4 +1,4 @@
-pub mod reader;
+pub mod io;
 
 use crate::ContentId;
 use crate::chunk_map::ChunkMap;
@@ -55,6 +55,10 @@ impl BlobMut {
         Self {
             chunk_map: ChunkMap::new(),
         }
+    }
+    
+    pub fn len(&self) -> u64 {
+        self.chunk_map.len()
     }
 
     pub fn set_len(&mut self, new_len: u64) {
