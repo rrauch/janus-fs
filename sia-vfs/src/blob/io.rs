@@ -610,3 +610,282 @@ fn write_into_vec(vec: &mut Vec<u8>, offset: usize, data: &[u8]) -> usize {
     }
     writable
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::blob::BlobMut;
+    use crate::blob::io::{BlobReader, BlobWriter};
+    use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
+    use async_trait::async_trait;
+    use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    use std::collections::HashMap;
+    use std::io::{Error, ErrorKind, SeekFrom};
+    use std::sync::{Arc, Mutex};
+
+    static ONE_MB: &[u8] = include_bytes!("../../../sia-io/testdata/1mb.bin");
+
+    #[derive(Debug, Clone)]
+    struct MockBackend(Arc<Mutex<HashMap<ChunkId, Chunk>>>);
+
+    impl Default for MockBackend {
+        fn default() -> Self {
+            Self(Arc::new(Mutex::new(HashMap::default())))
+        }
+    }
+
+    #[async_trait]
+    impl ChunkSource for MockBackend {
+        async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, Error> {
+            let lock = self.0.lock().unwrap();
+            Ok(lock.get(chunk_id).cloned())
+        }
+    }
+
+    #[async_trait]
+    impl ChunkSink for MockBackend {
+        async fn insert_chunk(&self, chunk: Chunk) -> Result<(), Error> {
+            let mut lock = self.0.lock().unwrap();
+            lock.insert(chunk.id().clone(), chunk);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_varying_chunk_sizes() -> anyhow::Result<()> {
+        for &chunk_size in &[1024, 4096, 1024 * 16, 64 * 1024, 1024 * 1024] {
+            let backend = MockBackend::default();
+            let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), chunk_size);
+
+            writer.write_all(ONE_MB).await?;
+            let blob = writer.finalize().await?;
+
+            assert_eq!(blob.len(), ONE_MB.len() as u64, "chunk_size={chunk_size}");
+            let expected_chunks = ONE_MB.len().div_ceil(chunk_size);
+            assert_eq!(
+                blob.chunk_map.iter().count(),
+                expected_chunks,
+                "chunk_size={chunk_size}"
+            );
+
+            let mut reader = BlobReader::new_reader(blob, backend);
+            let mut buf = Vec::with_capacity(ONE_MB.len());
+            reader.read_to_end(&mut buf).await?;
+            assert_eq!(buf.as_slice(), ONE_MB, "chunk_size={chunk_size}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_with_seek_and_small_buffer() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), 1024 * 256);
+        writer.write_all(ONE_MB).await?;
+        let blob = writer.finalize().await?;
+
+        let mut reader = BlobReader::new_reader(blob, backend);
+
+        // Offsets chosen to hit start, mid-chunk, chunk boundary, and near-end.
+        let offsets = [
+            0u64,
+            1,
+            1023,
+            1024 * 256,
+            1024 * 256 + 1,
+            1024 * 512,
+            ONE_MB.len() as u64 - 17,
+        ];
+
+        for &off in &offsets {
+            reader.seek(SeekFrom::Start(off)).await?;
+
+            let mut collected = Vec::new();
+            let mut tmp = [0u8; 17];
+            loop {
+                let n = reader.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                collected.extend_from_slice(&tmp[..n]);
+            }
+
+            assert_eq!(
+                collected.as_slice(),
+                &ONE_MB[off as usize..],
+                "mismatch reading from offset {off}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overwrite_spanning_two_chunks() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        const CHUNK_SIZE: usize = 1024 * 256;
+
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), CHUNK_SIZE);
+        writer.write_all(ONE_MB).await?;
+        let blob = writer.finalize().await?;
+        assert_eq!(blob.chunk_map.iter().count(), 4);
+
+        // Capture original chunk ids in position order.
+        let original_ids: Vec<_> = blob.chunk_map.iter().map(|r| r.chunk_id.clone()).collect();
+
+        // Overwrite 4KB straddling the boundary between chunk 1 and chunk 2.
+        let boundary = CHUNK_SIZE as u64 * 2; // end of chunk 1 / start of chunk 2
+        let overwrite_start = boundary - 2048;
+        let overwrite_len = 4096;
+        let patch: Vec<u8> = (0..overwrite_len).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = BlobWriter::new_writer(blob.into_mut(), backend.clone(), CHUNK_SIZE);
+        writer.seek(SeekFrom::Start(overwrite_start)).await?;
+        writer.write_all(&patch).await?;
+        let blob = writer.finalize().await?;
+
+        // Length unchanged, still 4 chunks.
+        assert_eq!(blob.len(), ONE_MB.len() as u64);
+        assert_eq!(blob.chunk_map.iter().count(), 4);
+
+        // Chunks 0 and 3 untouched, chunks 1 and 2 changed.
+        let new_ids: Vec<_> = blob.chunk_map.iter().map(|r| r.chunk_id.clone()).collect();
+        assert_eq!(new_ids[0], original_ids[0], "chunk 0 should be untouched");
+        assert_ne!(new_ids[1], original_ids[1], "chunk 1 should be modified");
+        assert_ne!(new_ids[2], original_ids[2], "chunk 2 should be modified");
+        assert_eq!(new_ids[3], original_ids[3], "chunk 3 should be untouched");
+
+        // Read back and verify content matches the expected modified buffer.
+        let mut expected = ONE_MB.to_vec();
+        expected[overwrite_start as usize..overwrite_start as usize + overwrite_len]
+            .copy_from_slice(&patch);
+
+        let mut reader = BlobReader::new_reader(blob, backend);
+        let mut got = Vec::with_capacity(ONE_MB.len());
+        reader.read_to_end(&mut got).await?;
+        assert_eq!(got, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_from_dirty_write_buffer() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), 1024 * 256);
+
+        // Write data without flushing.
+        let data = &ONE_MB[..1024];
+        writer.write_all(data).await?;
+
+        // Backend must still be empty - nothing has been submitted yet.
+        assert!(backend.0.lock().unwrap().is_empty());
+
+        // Seek back and read; data must come from the dirty in-memory buffer.
+        writer.seek(SeekFrom::Start(0)).await?;
+        let mut buf = vec![0u8; data.len()];
+        writer.read_exact(&mut buf).await?;
+        assert_eq!(&buf, data);
+
+        // Backend still empty - read must not have triggered a flush.
+        assert!(backend.0.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_after_flush_invalidates_fetch_cache() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let chunk_size = 1024 * 64;
+
+        // Initial write: fill one chunk with 'A's.
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), chunk_size);
+        writer.write_all(&vec![b'A'; chunk_size]).await?;
+        writer.flush().await?;
+
+        // Read first byte: this populates the fetch cache with the original chunk.
+        writer.seek(SeekFrom::Start(0)).await?;
+        let mut buf = [0u8; 1];
+        writer.read_exact(&mut buf).await?;
+        assert_eq!(buf[0], b'A');
+
+        // Overwrite the same region with 'B's, then flush.
+        writer.seek(SeekFrom::Start(0)).await?;
+        writer.write_all(&vec![b'B'; chunk_size]).await?;
+        writer.flush().await?;
+
+        // Read back: must see the updated bytes, not the stale cached chunk.
+        writer.seek(SeekFrom::Start(0)).await?;
+        let mut out = vec![0u8; chunk_size];
+        writer.read_exact(&mut out).await?;
+        assert_eq!(out, vec![b'B'; chunk_size]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_small_writes_equal_one_big_write() -> anyhow::Result<()> {
+        let chunk_size = 1024 * 256;
+
+        // Reference: one big write.
+        let backend_ref = MockBackend::default();
+        let mut w_ref = BlobWriter::new_writer(BlobMut::empty(), backend_ref.clone(), chunk_size);
+        w_ref.write_all(ONE_MB).await?;
+        w_ref.flush().await?;
+        let blob_ref = w_ref.finalize().await?;
+
+        // Subject: many 1-byte writes.
+        let backend_small = MockBackend::default();
+        let mut w_small =
+            BlobWriter::new_writer(BlobMut::empty(), backend_small.clone(), chunk_size);
+        for byte in ONE_MB {
+            w_small.write_all(&[*byte]).await?;
+        }
+        w_small.flush().await?;
+        let blob_small = w_small.finalize().await?;
+
+        assert_eq!(blob_small.id, blob_ref.id);
+        assert_eq!(blob_small.len(), blob_ref.len());
+
+        let ids_ref: Vec<ChunkId> = blob_ref
+            .chunk_map
+            .iter()
+            .map(|r| r.chunk_id.clone())
+            .collect();
+        let ids_small: Vec<ChunkId> = blob_small
+            .chunk_map
+            .iter()
+            .map(|r| r.chunk_id.clone())
+            .collect();
+        assert_eq!(ids_small, ids_ref);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operations_after_close_fail() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), 1024);
+
+        writer.write_all(b"hello world").await?;
+        writer.close().await?;
+
+        // write after close: error
+        let err = writer.write(b"more").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        // flush after close: error
+        let err = writer.flush().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        // close is idempotent
+        writer.close().await?;
+
+        // finalize after close still produces correct blob
+        let blob = writer.finalize().await?;
+        assert_eq!(blob.len(), 11);
+
+        let mut reader = BlobReader::new_reader(blob, backend);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        assert_eq!(&buf, b"hello world");
+
+        Ok(())
+    }
+}
