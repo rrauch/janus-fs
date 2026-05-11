@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["indexd", "renterd"]
+default = ["indexd", "lz4", "renterd", "zstd"]
 indexd = ["sia-io/indexd"]
+lz4 = ["dep:lz4_flex"]
 renterd = ["sia-io/renterd"]
+zstd = ["dep:zstd"]
 
 [dependencies]
 sia-io = { path = "../sia-io", default-features = false }
@@ -15,8 +17,11 @@ async-trait = "0.1"
 blake3 = "1.8"
 bytes = "1"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
+lz4_flex = { version = "0.13", optional = true }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
+thiserror = "2"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0"

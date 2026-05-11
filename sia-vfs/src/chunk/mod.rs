@@ -1,4 +1,5 @@
 pub(crate) mod chunk_map;
+mod compression;
 
 use crate::ContentId;
 use async_trait::async_trait;
