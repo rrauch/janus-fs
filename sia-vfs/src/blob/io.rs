@@ -1,6 +1,6 @@
 use crate::blob::{Blob, BlobMut};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::chunk_map::{ChunkMap, ChunkMapEntry};
+use crate::chunk::chunk_map::{ChunkMap, ChunkMapEntry};
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_util::{AsyncWriteExt, ready};
 use std::cmp::{max, min};

@@ -1,7 +1,7 @@
 pub mod io;
 
 use crate::ContentId;
-use crate::chunk_map::ChunkMap;
+use crate::chunk::chunk_map::ChunkMap;
 
 pub type BlobId = ContentId<Blob>;
 
@@ -56,7 +56,7 @@ impl BlobMut {
             chunk_map: ChunkMap::new(),
         }
     }
-    
+
     pub fn len(&self) -> u64 {
         self.chunk_map.len()
     }

@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 pub mod blob;
 pub mod chunk;
-mod chunk_map;
 
 #[derive_where(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
