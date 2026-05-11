@@ -3,7 +3,7 @@ use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
 use crate::chunk_map::{ChunkMap, ChunkMapEntry};
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_util::{AsyncWriteExt, ready};
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::future::Future;
 use std::io::{ErrorKind, SeekFrom};
 use std::ops::Deref;
@@ -327,7 +327,7 @@ impl<S: ChunkSource + 'static> AsyncSeek for BlobReader<S> {
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
         let len = self.mode.blob.len();
-        let target = compute_seek_target(self.pos, len, pos)?;
+        let target = compute_seek_target::<false>(self.pos, len, pos)?;
         self.pos = target;
         Poll::Ready(Ok(target))
     }
@@ -460,11 +460,13 @@ impl<B: ChunkSource + ChunkSink + 'static> ReadWrite<B> {
                     ));
                 }
                 Some(ChunkMapEntry::Hole { len }) => {
-                    let cap = min(len as usize, self.max_chunk_size);
-                    self.pipeline.buffer = Some(WriteBuffer::new(pos, cap));
+                    let aligned_pos = pos - (pos % self.max_chunk_size as u64);
+                    let cap = min(((pos - aligned_pos) + len) as usize, self.max_chunk_size);
+                    self.pipeline.buffer = Some(WriteBuffer::new(aligned_pos, cap));
                 }
                 None => {
-                    self.pipeline.buffer = Some(WriteBuffer::new(pos, self.max_chunk_size));
+                    let aligned_pos = pos - (pos % self.max_chunk_size as u64);
+                    self.pipeline.buffer = Some(WriteBuffer::new(aligned_pos, self.max_chunk_size));
                 }
             };
         }
@@ -494,7 +496,14 @@ impl<B: ChunkSource + ChunkSink + 'static> BlobWriter<B> {
     }
 
     pub fn len(&self) -> u64 {
-        self.mode.blob.len()
+        let blob_len = self.mode.blob.len();
+        // check dirty buffer
+        let write_buf_end = if let Some(write_buf) = self.mode.pipeline.buffer.as_ref() {
+            write_buf.end_pos()
+        } else {
+            0
+        };
+        max(blob_len, write_buf_end)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -536,7 +545,7 @@ impl<B: ChunkSource + ChunkSink + 'static> AsyncSeek for BlobWriter<B> {
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
         let len = self.mode.blob.len();
-        let target = compute_seek_target(self.pos, len, pos)?;
+        let target = compute_seek_target::<true>(self.pos, len, pos)?;
         self.pos = target;
         Poll::Ready(Ok(target))
     }
@@ -568,7 +577,11 @@ impl<B: ChunkSource + ChunkSink + 'static> AsyncWrite for BlobWriter<B> {
     }
 }
 
-fn compute_seek_target(current: u64, len: u64, pos: SeekFrom) -> std::io::Result<u64> {
+fn compute_seek_target<const ALLOW_BEYOND_EOF: bool>(
+    current: u64,
+    len: u64,
+    pos: SeekFrom,
+) -> std::io::Result<u64> {
     let target = match pos {
         SeekFrom::Start(n) => n,
         SeekFrom::Current(n) => current
@@ -579,7 +592,7 @@ fn compute_seek_target(current: u64, len: u64, pos: SeekFrom) -> std::io::Result
             .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "seek underflow"))?,
     };
 
-    if target > len {
+    if target > len && !ALLOW_BEYOND_EOF {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "seeking beyond EOF unsupported",
@@ -885,6 +898,117 @@ mod tests {
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await?;
         assert_eq!(&buf, b"hello world");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn len_truncate_extend() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), 1024 * 256);
+
+        assert_eq!(writer.len(), 0);
+        assert!(writer.is_empty());
+
+        // After write, len reflects bytes written (even before flush)
+        writer.write_all(ONE_MB).await?;
+        assert_eq!(writer.len(), ONE_MB.len() as u64);
+
+        writer.flush().await?;
+        assert_eq!(writer.len(), ONE_MB.len() as u64);
+        assert!(!writer.is_empty());
+
+        // Extend via set_len
+        let extended_len = ONE_MB.len() as u64 + 4096;
+        writer.set_len(extended_len).await?;
+        assert_eq!(writer.len(), extended_len);
+
+        // Read-back: original bytes intact, extension reads as zeros
+        let blob = writer.finalize().await?;
+        assert_eq!(blob.len(), extended_len);
+
+        let mut reader = BlobReader::new_reader(blob, backend.clone());
+        let mut buf = Vec::with_capacity(extended_len as usize);
+        reader.read_to_end(&mut buf).await?;
+        assert_eq!(buf.len(), extended_len as usize);
+        assert_eq!(&buf[..ONE_MB.len()], ONE_MB);
+        assert!(buf[ONE_MB.len()..].iter().all(|&b| b == 0));
+
+        // Truncate via set_len
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), 1024 * 256);
+        writer.write_all(ONE_MB).await?;
+        writer.flush().await?;
+        assert_eq!(writer.len(), ONE_MB.len() as u64);
+
+        let truncated_len = 1000u64;
+        writer.set_len(truncated_len).await?;
+        assert_eq!(writer.len(), truncated_len);
+
+        let blob = writer.finalize().await?;
+        assert_eq!(blob.len(), truncated_len);
+
+        let mut reader = BlobReader::new_reader(blob, backend.clone());
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        assert_eq!(buf.len(), truncated_len as usize);
+        assert_eq!(&buf[..], &ONE_MB[..truncated_len as usize]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_write_with_holes() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let max_chunk_size = 1024;
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), max_chunk_size);
+
+        // 1. Extend the blob to create a leading hole, then write a small region.
+        writer.set_len(4096).await?;
+        assert_eq!(writer.len(), 4096);
+
+        // Seek into the middle of the hole and write some data.
+        let mid_data = b"hello world";
+        writer.seek(SeekFrom::Start(2000)).await?;
+        writer.write_all(mid_data).await?;
+        writer.flush().await?;
+
+        // 2. Extend further by seeking beyond EOF (creating a trailing hole), then write at the very end.
+        let tail_data = b"tail-bytes";
+        writer
+            .seek(SeekFrom::Start(8192 - tail_data.len() as u64))
+            .await?;
+        writer.write_all(tail_data).await?;
+
+        let blob = writer.finalize().await?;
+        assert_eq!(blob.len(), 8192);
+
+        let entries = blob.chunk_map.iter().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get(0).unwrap().offset, 1024);
+        assert_eq!(entries.get(0).unwrap().len, 987);
+        assert_eq!(entries.get(0).unwrap().chunk_offset, 0);
+        assert_eq!(entries.get(1).unwrap().offset, 7168);
+        assert_eq!(entries.get(1).unwrap().len, 1024);
+        assert_eq!(entries.get(1).unwrap().chunk_offset, 0);
+
+        // Build the expected byte image: zeros everywhere except the two written regions.
+        let mut expected = vec![0u8; 8192];
+        expected[2000..2000 + mid_data.len()].copy_from_slice(mid_data);
+        expected[8192 - tail_data.len()..].copy_from_slice(tail_data);
+
+        // Read back the full blob and compare.
+        let mut reader = BlobReader::new_reader(blob.clone(), backend.clone());
+        let mut buf = Vec::with_capacity(8192);
+        reader.read_to_end(&mut buf).await?;
+        assert_eq!(buf.len(), expected.len());
+        assert_eq!(buf, expected);
+
+        // Spot-check: read just the hole region, must be all zeros.
+        let mut reader = BlobReader::new_reader(blob.clone(), backend.clone());
+        reader.seek(SeekFrom::Start(100)).await?;
+        let mut hole_buf = vec![0xFFu8; 500];
+        reader.read_exact(&mut hole_buf).await?;
+        assert!(hole_buf.iter().all(|&b| b == 0));
 
         Ok(())
     }
