@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["cachalot", "foyer-cache", "main", "sia-io"]
+members = ["cachalot", "foyer-cache", "main", "sia-io", "sia-vfs"]
 
 [workspace.dependencies]
 foyer-cache = { path = "foyer-cache" }
