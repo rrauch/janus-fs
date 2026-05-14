@@ -1,7 +1,7 @@
 use crate::blob::Blob;
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::{Inode, InodeId, InodeMut, Name, Vfs, VfsResult};
+use crate::vfs::{Container, Inode, InodeId, InodeMut, Name, Vfs, VfsResult};
 use async_trait::async_trait;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use std::io::SeekFrom;
@@ -38,9 +38,9 @@ impl Vfs {
         todo!()
     }
 
-    pub async fn create_file(
+    pub async fn create_file<T>(
         &self,
-        parent_id: InodeId,
+        parent: Container<T>,
         name: Name,
     ) -> VfsResult<FileHandle<ReadWrite>> {
         todo!()

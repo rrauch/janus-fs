@@ -90,7 +90,7 @@ impl TryFrom<String> for VfsPath {
 impl Vfs {
     pub async fn get_by_path(&self, path: &VfsPath) -> VfsResult<Option<Entry>> {
         if path.is_root() {
-            return self.get_by_id(self.root_id()).await;
+            return Ok(Some(self.root().into()));
         }
         todo!()
     }

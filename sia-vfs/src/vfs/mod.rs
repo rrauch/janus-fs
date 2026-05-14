@@ -190,9 +190,16 @@ struct Inner {
 
 impl Vfs {
     #[inline]
-    pub fn root_id(&self) -> InodeId {
-        let root = self.0.root.lock().expect("lock to not be poisoned");
-        root.id()
+    pub fn root(&self) -> Root {
+        self.0.root.lock().expect("lock to not be poisoned").clone()
+    }
+
+    pub async fn get_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Entry>> {
+        let root = self.root();
+        if inode_id == root.id() {
+            return Ok(Some(Entry::Root(root)));
+        }
+        todo!()
     }
 
     pub async fn list<T>(
@@ -205,36 +212,27 @@ impl Vfs {
         Ok(futures_util::stream::empty())
     }
 
-    pub async fn get_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Entry>> {
-        let root_id = self.root_id();
-        if inode_id == root_id {
-            let root = self.0.root.lock().expect("lock to not be poisoned");
-            return Ok(Some(Entry::Root(root.clone())));
-        }
-        todo!()
-    }
-
     pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<Inode<T, I>> {
         let inode = modified_inode.freeze();
         todo!()
     }
 
     pub async fn delete(&self, inode_id: InodeId) -> VfsResult<()> {
-        if inode_id == self.root_id() {
+        if inode_id == self.root().id() {
             return Err(VfsError::DeleteRootError);
         }
         todo!()
     }
 
-    pub async fn mv(&self, inode_id: InodeId, parent_id: InodeId) -> VfsResult<()> {
-        if inode_id == self.root_id() {
+    pub async fn mv<T>(&self, inode_id: InodeId, parent: Container<T>) -> VfsResult<()> {
+        if inode_id == self.root().id() {
             return Err(VfsError::MoveRootError);
         }
         todo!()
     }
 
-    pub async fn copy(&self, inode_id: InodeId, new_parent_id: InodeId) -> VfsResult<()> {
-        if inode_id == self.root_id() {
+    pub async fn copy<T>(&self, inode_id: InodeId, new_parent: Container<T>) -> VfsResult<()> {
+        if inode_id == self.root().id() {
             return Err(VfsError::CopyRootError);
         }
         todo!()
