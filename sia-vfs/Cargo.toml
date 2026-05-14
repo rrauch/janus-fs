@@ -16,11 +16,14 @@ sia-io = { path = "../sia-io", default-features = false }
 async-trait = "0.1"
 blake3 = "1.8"
 bytes = "1"
+chrono = "0.4"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
 lz4_flex = { version = "0.13", optional = true }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 thiserror = "2"
+typed-path = "0.12"
+uuid = { version = "1.23", features = ["v7"] }
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
