@@ -1,6 +1,6 @@
 use crate::vfs::{
-    Container, InodeKey, ContainerMut, InodeInner, Name, RevisionHasher, Vfs, VfsResult,
-    hash_entries,
+    Container, ContainerMut, InodeInner, InodeKey, Name, Read, RevisionHasher, Vfs, VfsResult,
+    Write, hash_entries,
 };
 
 pub struct DirectoryKind;
@@ -18,7 +18,7 @@ impl RevisionHasher<Vec<InodeKey>> for DirectoryKind {
 pub type Directory = Container<DirectoryKind>;
 pub type DirectoryMut = ContainerMut<DirectoryKind>;
 
-impl Vfs {
+impl<Mode: Read + Write> Vfs<Mode> {
     pub async fn create_dir<T: RevisionHasher<Vec<InodeKey>>>(
         &self,
         parent: Container<T>,

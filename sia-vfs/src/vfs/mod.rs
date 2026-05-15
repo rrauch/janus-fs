@@ -210,16 +210,28 @@ impl From<Root> for Entry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive_where(Debug, Clone)]
 #[repr(transparent)]
-pub struct Vfs(Arc<Inner>);
+pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 
 #[derive(Debug)]
 struct Inner {
     root: Mutex<Root>,
 }
 
-impl Vfs {
+pub trait Read {}
+pub trait Write {}
+
+pub struct ReadOnly;
+
+impl Read for ReadOnly {}
+
+pub struct ReadWrite;
+
+impl Read for ReadWrite {}
+impl Write for ReadWrite {}
+
+impl<Mode: Read> Vfs<Mode> {
     #[inline]
     pub fn root(&self) -> Root {
         self.0.root.lock().expect("lock to not be poisoned").clone()
@@ -245,7 +257,9 @@ impl Vfs {
         }
         Ok(futures_util::stream::empty())
     }
+}
 
+impl<Mode: Read + Write> Vfs<Mode> {
     pub async fn update<T: RevisionHasher<I>, I>(
         &self,
         modified_inode: InodeMut<T, I>,
@@ -319,8 +333,8 @@ pub struct InodeKey {
 pub struct RevisionKind;
 pub type Revision = ContentId<RevisionKind>;
 
-type Container<T: RevisionHasher<Vec<InodeKey>>> = Inode<T, Vec<InodeKey>>;
-type ContainerMut<T: RevisionHasher<Vec<InodeKey>>> = InodeMut<T, Vec<InodeKey>>;
+type Container<T> = Inode<T, Vec<InodeKey>>;
+type ContainerMut<T> = InodeMut<T, Vec<InodeKey>>;
 
 impl<T: RevisionHasher<Vec<InodeKey>>> Container<T> {
     fn entries(&self) -> &Vec<InodeKey> {

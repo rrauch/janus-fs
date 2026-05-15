@@ -1,10 +1,7 @@
 use crate::blob::Blob;
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::{
-    Container, InodeKey, Inode, InodeId, InodeInner, InodeMut, Name, RevisionHasher, Vfs,
-    VfsResult,
-};
+use crate::vfs::{Container, InodeKey, Inode, InodeId, InodeInner, InodeMut, Name, RevisionHasher, Vfs, VfsResult, Read, Write};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
@@ -52,8 +49,14 @@ impl FileMut {
     }
 }
 
-impl Vfs {
-    pub async fn open<M: Mode>(&self, file: &File) -> VfsResult<FileHandle<M>> {
+impl<Mode: Read> Vfs<Mode> {
+    pub async fn open(&self, file: &File) -> VfsResult<FileHandle<ReadOnly>> {
+        todo!()
+    }
+}
+
+impl<Mode: Read + Write> Vfs<Mode> {
+    pub async fn open_rw(&self, file: &File) -> VfsResult<FileHandle<ReadWrite>> {
         todo!()
     }
 
@@ -66,7 +69,7 @@ impl Vfs {
     }
 }
 
-pub trait Mode {}
+pub trait FileMode {}
 
 #[repr(transparent)]
 pub struct ReadOnly(BlobReader<()>);
@@ -85,15 +88,15 @@ impl ChunkSink for () {
     }
 }
 
-impl Mode for ReadOnly {}
+impl FileMode for ReadOnly {}
 
-pub struct FileHandle<M: Mode> {
+pub struct FileHandle<M: FileMode> {
     id: Uuid,
     file: File,
     inner: M,
 }
 
-impl<M: Mode> FileHandle<M> {
+impl<M: FileMode> FileHandle<M> {
     pub fn file_id(&self) -> InodeId {
         self.file.id()
     }
@@ -136,7 +139,7 @@ impl AsyncSeek for FileHandle<ReadOnly> {
 #[repr(transparent)]
 pub struct ReadWrite(BlobWriter<()>);
 
-impl Mode for ReadWrite {}
+impl FileMode for ReadWrite {}
 
 impl FileHandle<ReadWrite> {
     pub fn len(&self) -> u64 {

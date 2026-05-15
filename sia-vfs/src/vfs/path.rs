@@ -1,4 +1,4 @@
-use crate::vfs::{Entry, Name, NameError, Vfs, VfsResult, check_valid_filename};
+use crate::vfs::{Entry, Name, NameError, Read, Vfs, VfsResult, check_valid_filename};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use thiserror::Error;
@@ -87,7 +87,7 @@ impl TryFrom<String> for VfsPath {
     }
 }
 
-impl Vfs {
+impl<Mode: Read> Vfs<Mode> {
     pub async fn get_by_path(&self, path: &VfsPath) -> VfsResult<Option<Entry>> {
         if path.is_root() {
             return Ok(Some(self.root().into()));
