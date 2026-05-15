@@ -1,8 +1,12 @@
 use crate::blob::Blob;
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::{Container, Inode, InodeId, InodeMut, Name, Vfs, VfsResult};
+use crate::vfs::{
+    Container, InodeKey, Inode, InodeId, InodeInner, InodeMut, Name, RevisionHasher, Vfs,
+    VfsResult,
+};
 use async_trait::async_trait;
+use chrono::Utc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -10,6 +14,21 @@ use std::task::{Context, Poll};
 use uuid::Uuid;
 
 pub struct FileKind;
+
+impl RevisionHasher<Blob> for FileKind {
+    fn hash(inner: &InodeInner<Self, Blob>) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_revision]");
+        hasher.update(b"begin:\n");
+        inner.hash_metadata(&mut hasher);
+        hasher.update(b"\nbegin_blob:\nid:\n");
+        hasher.update(inner.inner.id().as_slice());
+        hasher.update(b"\nlength:\n");
+        hasher.update(&inner.inner.len().to_be_bytes());
+        hasher.update(b"\nend_blob\nend");
+        hasher.finalize()
+    }
+}
+
 pub type File = Inode<FileKind, Blob>;
 pub type FileMut = InodeMut<FileKind, Blob>;
 
@@ -38,7 +57,7 @@ impl Vfs {
         todo!()
     }
 
-    pub async fn create_file<T>(
+    pub async fn create_file<T: RevisionHasher<Vec<InodeKey>>>(
         &self,
         parent: Container<T>,
         name: Name,
@@ -47,7 +66,7 @@ impl Vfs {
     }
 }
 
-trait Mode {}
+pub trait Mode {}
 
 #[repr(transparent)]
 pub struct ReadOnly(BlobReader<()>);
@@ -70,13 +89,13 @@ impl Mode for ReadOnly {}
 
 pub struct FileHandle<M: Mode> {
     id: Uuid,
-    file_id: InodeId,
+    file: File,
     inner: M,
 }
 
 impl<M: Mode> FileHandle<M> {
-    pub fn file_id(&self) -> &InodeId {
-        &self.file_id
+    pub fn file_id(&self) -> InodeId {
+        self.file.id()
     }
 }
 
@@ -134,6 +153,10 @@ impl FileHandle<ReadWrite> {
 
     pub async fn commit(self) -> VfsResult<File> {
         let blob = self.inner.0.finalize().await?;
+        let mut file = self.file.into_mut();
+        file.set_content(blob);
+        file.set_last_modified(Utc::now());
+        let file = file.freeze();
         todo!()
     }
 }

@@ -2,6 +2,7 @@ pub mod directory;
 pub mod file;
 pub mod path;
 
+use crate::ContentId;
 use crate::vfs::directory::Directory;
 use crate::vfs::file::File;
 use chrono::{DateTime, Utc};
@@ -26,6 +27,8 @@ pub enum VfsError {
     MoveRootError,
     #[error("root cannot be copied")]
     CopyRootError,
+    #[error("root revision mismatch")]
+    RootRevisionMismatch,
 }
 
 #[derive(Error, Debug)]
@@ -83,9 +86,14 @@ impl AsRef<str> for Name {
     }
 }
 
+pub trait RevisionHasher<I>: Sized {
+    fn hash(inner: &InodeInner<Self, I>) -> blake3::Hash;
+}
+
 #[derive_where(Debug, Clone; I)]
-struct InodeInner<T, I> {
+struct InodeInner<T: RevisionHasher<I>, I> {
     id: InodeId,
+    revision: Revision,
     name: Name,
     created: DateTime<Utc>,
     last_modified: DateTime<Utc>,
@@ -94,12 +102,30 @@ struct InodeInner<T, I> {
     _phantom: PhantomData<T>,
 }
 
-#[derive_where(Debug, Clone; I)]
-pub struct Inode<T, I>(Arc<InodeInner<T, I>>);
+impl<T: RevisionHasher<I>, I> InodeInner<T, I> {
+    fn hash_metadata(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(b"begin_metadata:\nid:");
+        hasher.update(self.id.as_bytes());
+        hasher.update(b"\nname:");
+        hasher.update(self.name.as_bytes());
+        hasher.update(b"\ncreated:");
+        hasher.update(&self.created.timestamp().to_be_bytes());
+        hasher.update(b"\nlast_modified:");
+        hasher.update(&self.last_modified.timestamp().to_be_bytes());
+        hasher.update(b"\nend_metadata");
+    }
+}
 
-impl<T, I> Inode<T, I> {
+#[derive_where(Debug, Clone; I)]
+pub struct Inode<T: RevisionHasher<I>, I>(Arc<InodeInner<T, I>>);
+
+impl<T: RevisionHasher<I>, I> Inode<T, I> {
     pub fn id(&self) -> InodeId {
         self.0.id
+    }
+
+    pub fn revision(&self) -> &Revision {
+        &self.0.revision
     }
 
     pub fn name(&self) -> &Name {
@@ -115,16 +141,16 @@ impl<T, I> Inode<T, I> {
     }
 }
 
-impl<T, I: Clone> Inode<T, I> {
+impl<T: RevisionHasher<I>, I: Clone> Inode<T, I> {
     pub fn into_mut(self) -> InodeMut<T, I> {
         InodeMut(Arc::unwrap_or_clone(self.0))
     }
 }
 
 #[derive_where(Debug; I)]
-pub struct InodeMut<T, I>(InodeInner<T, I>);
+pub struct InodeMut<T: RevisionHasher<I>, I>(InodeInner<T, I>);
 
-impl<T, I> InodeMut<T, I> {
+impl<T: RevisionHasher<I>, I> InodeMut<T, I> {
     pub fn id(&self) -> InodeId {
         self.0.id
     }
@@ -149,8 +175,13 @@ impl<T, I> InodeMut<T, I> {
         self.0.last_modified = new;
     }
 
-    pub(crate) fn freeze(self) -> Inode<T, I> {
+    pub(crate) fn freeze(mut self) -> Inode<T, I> {
+        self.update_revision();
         Inode(Arc::new(self.0))
+    }
+
+    fn update_revision(&mut self) {
+        self.0.revision = ContentId::new_internal(T::hash(&self.0));
     }
 }
 
@@ -194,15 +225,18 @@ impl Vfs {
         self.0.root.lock().expect("lock to not be poisoned").clone()
     }
 
-    pub async fn get_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Entry>> {
+    pub async fn get_by_key(&self, inode_key: &InodeKey) -> VfsResult<Option<Entry>> {
         let root = self.root();
-        if inode_id == root.id() {
+        if inode_key.id == root.id() {
+            if root.revision() != &inode_key.revision {
+                return Err(VfsError::RootRevisionMismatch);
+            }
             return Ok(Some(Entry::Root(root)));
         }
         todo!()
     }
 
-    pub async fn list<T>(
+    pub async fn list<T: RevisionHasher<Vec<InodeKey>>>(
         &self,
         inode: &Container<T>,
     ) -> VfsResult<impl TryStream<Ok = Entry, Error = VfsError> + Send + Unpin> {
@@ -212,7 +246,10 @@ impl Vfs {
         Ok(futures_util::stream::empty())
     }
 
-    pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<Inode<T, I>> {
+    pub async fn update<T: RevisionHasher<I>, I>(
+        &self,
+        modified_inode: InodeMut<T, I>,
+    ) -> VfsResult<Inode<T, I>> {
         let inode = modified_inode.freeze();
         todo!()
     }
@@ -224,14 +261,22 @@ impl Vfs {
         todo!()
     }
 
-    pub async fn mv<T>(&self, inode_id: InodeId, parent: Container<T>) -> VfsResult<()> {
+    pub async fn mv<T: RevisionHasher<Vec<InodeKey>>>(
+        &self,
+        inode_id: InodeId,
+        parent: Container<T>,
+    ) -> VfsResult<()> {
         if inode_id == self.root().id() {
             return Err(VfsError::MoveRootError);
         }
         todo!()
     }
 
-    pub async fn copy<T>(&self, inode_id: InodeId, new_parent: Container<T>) -> VfsResult<()> {
+    pub async fn copy<T: RevisionHasher<Vec<InodeKey>>>(
+        &self,
+        inode_id: InodeId,
+        new_parent: Container<T>,
+    ) -> VfsResult<()> {
         if inode_id == self.root().id() {
             return Err(VfsError::CopyRootError);
         }
@@ -265,21 +310,55 @@ fn check_valid_filename(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-type Container<T> = Inode<T, Vec<InodeId>>;
-type ContainerMut<T> = InodeMut<T, Vec<InodeId>>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InodeKey {
+    id: InodeId,
+    revision: Revision,
+}
 
-impl<T> Container<T> {
-    pub(crate) fn entries(&self) -> &Vec<InodeId> {
+pub struct RevisionKind;
+pub type Revision = ContentId<RevisionKind>;
+
+type Container<T: RevisionHasher<Vec<InodeKey>>> = Inode<T, Vec<InodeKey>>;
+type ContainerMut<T: RevisionHasher<Vec<InodeKey>>> = InodeMut<T, Vec<InodeKey>>;
+
+impl<T: RevisionHasher<Vec<InodeKey>>> Container<T> {
+    fn entries(&self) -> &Vec<InodeKey> {
         &self.0.inner
     }
 }
 
-impl<T> ContainerMut<T> {
-    pub(crate) fn entries_mut(&mut self) -> &mut Vec<InodeId> {
+impl<T: RevisionHasher<Vec<InodeKey>>> ContainerMut<T> {
+    fn entries_mut(&mut self) -> &mut Vec<InodeKey> {
         &mut self.0.inner
     }
 }
 
 pub struct RootKind;
+
+impl RevisionHasher<Vec<InodeKey>> for RootKind {
+    fn hash(inner: &InodeInner<Self, Vec<InodeKey>>) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[root_revision]");
+        hasher.update(b"begin:\n");
+        hash_entries(&inner.inner, &mut hasher);
+        hasher.update(b"\nend");
+        hasher.finalize()
+    }
+}
+
+fn hash_entries(entries: &Vec<InodeKey>, hasher: &mut blake3::Hasher) {
+    hasher.update(b"begin_entries:\nno_entries:");
+    hasher.update(&entries.len().to_be_bytes());
+    hasher.update(b"\nentries:");
+    for entry in entries {
+        hasher.update(b"inode_id:");
+        hasher.update(entry.id.as_bytes());
+        hasher.update(b"\nrevision:");
+        hasher.update(entry.revision.as_ref());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"\nend_entries");
+}
+
 pub type Root = Container<RootKind>;
 pub type RootMut = ContainerMut<RootKind>;
