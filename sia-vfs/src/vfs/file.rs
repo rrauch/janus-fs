@@ -1,7 +1,10 @@
 use crate::blob::Blob;
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::{Container, InodeKey, Inode, InodeId, InodeInner, InodeMut, Name, RevisionHasher, Vfs, VfsResult, Read, Write};
+use crate::vfs::{
+    Container, Inode, InodeId, InodeInner, InodeKey, InodeMut, Name, Normalizer, Read,
+    RevisionHasher, Vfs, VfsResult, Write,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
@@ -24,6 +27,10 @@ impl RevisionHasher<Blob> for FileKind {
         hasher.update(b"\nend_blob\nend");
         hasher.finalize()
     }
+}
+
+impl Normalizer<Blob> for FileKind {
+    fn normalize(inner: &mut InodeInner<Self, Blob>) {}
 }
 
 pub type File = Inode<FileKind, Blob>;

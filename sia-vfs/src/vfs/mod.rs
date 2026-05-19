@@ -47,7 +47,7 @@ pub enum NameError {
 
 pub type VfsResult<T> = Result<T, VfsError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct InodeId(Uuid);
 
@@ -88,6 +88,10 @@ impl AsRef<str> for Name {
 
 pub trait RevisionHasher<I>: Sized {
     fn hash(inner: &InodeInner<Self, I>) -> blake3::Hash;
+}
+
+pub trait Normalizer<I>: RevisionHasher<I> {
+    fn normalize(inner: &mut InodeInner<Self, I>);
 }
 
 #[derive_where(Debug, Clone; I)]
@@ -141,16 +145,16 @@ impl<T: RevisionHasher<I>, I> Inode<T, I> {
     }
 }
 
-impl<T: RevisionHasher<I>, I: Clone> Inode<T, I> {
+impl<T: RevisionHasher<I> + Normalizer<I>, I: Clone> Inode<T, I> {
     pub fn into_mut(self) -> InodeMut<T, I> {
         InodeMut(Arc::unwrap_or_clone(self.0))
     }
 }
 
 #[derive_where(Debug; I)]
-pub struct InodeMut<T: RevisionHasher<I>, I>(InodeInner<T, I>);
+pub struct InodeMut<T: RevisionHasher<I> + Normalizer<I>, I>(InodeInner<T, I>);
 
-impl<T: RevisionHasher<I>, I> InodeMut<T, I> {
+impl<T: RevisionHasher<I> + Normalizer<I>, I> InodeMut<T, I> {
     pub fn id(&self) -> InodeId {
         self.0.id
     }
@@ -181,6 +185,7 @@ impl<T: RevisionHasher<I>, I> InodeMut<T, I> {
     }
 
     fn update_revision(&mut self) {
+        T::normalize(&mut self.0);
         self.0.revision = ContentId::new_internal(T::hash(&self.0));
     }
 }
@@ -260,7 +265,7 @@ impl<Mode: Read> Vfs<Mode> {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T: RevisionHasher<I>, I>(
+    pub async fn update<T: RevisionHasher<I> + Normalizer<I>, I>(
         &self,
         modified_inode: InodeMut<T, I>,
     ) -> VfsResult<Inode<T, I>> {
@@ -324,7 +329,7 @@ fn check_valid_filename(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InodeKey {
     id: InodeId,
     revision: Revision,
@@ -342,7 +347,7 @@ impl<T: RevisionHasher<Vec<InodeKey>>> Container<T> {
     }
 }
 
-impl<T: RevisionHasher<Vec<InodeKey>>> ContainerMut<T> {
+impl<T: RevisionHasher<Vec<InodeKey>> + Normalizer<Vec<InodeKey>>> ContainerMut<T> {
     fn entries_mut(&mut self) -> &mut Vec<InodeKey> {
         &mut self.0.inner
     }
@@ -357,6 +362,12 @@ impl RevisionHasher<Vec<InodeKey>> for RootKind {
         hash_entries(&inner.inner, &mut hasher);
         hasher.update(b"\nend");
         hasher.finalize()
+    }
+}
+
+impl Normalizer<Vec<InodeKey>> for RootKind {
+    fn normalize(inner: &mut InodeInner<Self, Vec<InodeKey>>) {
+        inner.inner.sort();
     }
 }
 

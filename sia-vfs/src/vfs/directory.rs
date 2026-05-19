@@ -1,6 +1,6 @@
 use crate::vfs::{
-    Container, ContainerMut, InodeInner, InodeKey, Name, Read, RevisionHasher, Vfs, VfsResult,
-    Write, hash_entries,
+    Container, ContainerMut, InodeInner, InodeKey, Name, Normalizer, Read, RevisionHasher, Vfs,
+    VfsResult, Write, hash_entries,
 };
 
 pub struct DirectoryKind;
@@ -12,6 +12,12 @@ impl RevisionHasher<Vec<InodeKey>> for DirectoryKind {
         hash_entries(&inner.inner, &mut hasher);
         hasher.update(b"\nend");
         hasher.finalize()
+    }
+}
+
+impl Normalizer<Vec<InodeKey>> for DirectoryKind {
+    fn normalize(inner: &mut InodeInner<Self, Vec<InodeKey>>) {
+        inner.inner.sort();
     }
 }
 
