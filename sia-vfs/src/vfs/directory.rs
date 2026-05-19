@@ -8,6 +8,7 @@ impl<Mode> RevisionHasher<Vec<EntityKey>, Mode> for DirectoryKind {
     fn hash(inner: &RawEntityInner<Self, Vec<EntityKey>, Mode>) -> Hash {
         let mut hasher = Hasher::new_derive_key("[sia-vfs]/[v0]/[directory_revision]");
         hasher.update(b"begin:\n");
+        inner.hash_metadata(&mut hasher);
         hash_entries(&inner.inner, &mut hasher);
         hasher.update(b"\nend");
         hasher.finalize()
