@@ -6,7 +6,7 @@ pub mod path;
 use crate::ContentId;
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    EditMode, Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntity, RawEntityInner,
+    DraftEntity, Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntityInner,
     RevisionHasher,
 };
 use crate::vfs::file::File;
@@ -160,7 +160,7 @@ impl<T, I> InodeMut<T, I>
 where
     EntityMut<T, I>: Freezable<T, I>,
 {
-    pub(crate) fn freeze(self) -> RawEntity<T, I, EditMode> {
+    pub(crate) fn freeze(self) -> DraftEntity<T, I> {
         self.entity.freeze()
     }
 }
@@ -236,7 +236,7 @@ impl<Mode: Read + Write> Vfs<Mode> {
         EntityMut<T, I>: Freezable<T, I>,
     {
         let inode_id = modified_inode.inode_id;
-        let inode = modified_inode.freeze();
+        let draft_entity = modified_inode.freeze();
         todo!()
     }
 

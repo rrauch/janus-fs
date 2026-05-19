@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[derive_where(Debug, Clone; I)]
 pub enum Entity<T, I> {
     Synced(SyncedEntity<T, I>),
-    Wal(WalEntity<T, I>),
+    Local(LocalEntity<T, I>),
 }
 
 impl<T, I> Entity<T, I> {
@@ -18,7 +18,7 @@ impl<T, I> Entity<T, I> {
     pub fn entity_id(&self) -> EntityId {
         match self {
             Self::Synced(e) => e.entity_id(),
-            Self::Wal(e) => e.entity_id(),
+            Self::Local(e) => e.entity_id(),
         }
     }
 
@@ -26,7 +26,7 @@ impl<T, I> Entity<T, I> {
     pub fn revision(&self) -> &Revision {
         match self {
             Self::Synced(e) => e.revision(),
-            Self::Wal(e) => e.revision(),
+            Self::Local(e) => e.revision(),
         }
     }
 
@@ -34,7 +34,7 @@ impl<T, I> Entity<T, I> {
     pub fn name(&self) -> &Name {
         match self {
             Self::Synced(e) => e.name(),
-            Self::Wal(e) => e.name(),
+            Self::Local(e) => e.name(),
         }
     }
 
@@ -42,7 +42,7 @@ impl<T, I> Entity<T, I> {
     pub fn created(&self) -> &DateTime<Utc> {
         match self {
             Self::Synced(e) => e.created(),
-            Self::Wal(e) => e.created(),
+            Self::Local(e) => e.created(),
         }
     }
 
@@ -50,7 +50,7 @@ impl<T, I> Entity<T, I> {
     pub fn last_modified(&self) -> &DateTime<Utc> {
         match self {
             Self::Synced(e) => e.last_modified(),
-            Self::Wal(e) => e.last_modified(),
+            Self::Local(e) => e.last_modified(),
         }
     }
 
@@ -58,7 +58,7 @@ impl<T, I> Entity<T, I> {
     pub fn is_synced(&self) -> bool {
         match self {
             Self::Synced(_) => true,
-            Self::Wal(_) => false,
+            Self::Local(_) => false,
         }
     }
 
@@ -73,7 +73,7 @@ impl<T, I> Entity<T, I> {
     pub(crate) fn inner(&self) -> &I {
         match self {
             Self::Synced(e) => e.inner(),
-            Self::Wal(e) => e.inner(),
+            Self::Local(e) => e.inner(),
         }
     }
 
@@ -84,7 +84,7 @@ impl<T, I> Entity<T, I> {
     {
         match self {
             Self::Synced(e) => e.into_mut(),
-            Self::Wal(e) => e.into_mut(),
+            Self::Local(e) => e.into_mut(),
         }
     }
 }
@@ -96,11 +96,12 @@ pub struct EntityKey {
 }
 
 pub struct SyncedMode;
-pub struct WalMode;
-pub struct EditMode;
+pub struct LocalMode;
+pub struct DraftMode;
 
-type SyncedEntity<T, I> = RawEntity<T, I, SyncedMode>;
-type WalEntity<T, I> = RawEntity<T, I, WalMode>;
+pub type SyncedEntity<T, I> = RawEntity<T, I, SyncedMode>;
+pub type LocalEntity<T, I> = RawEntity<T, I, LocalMode>;
+pub type DraftEntity<T, I> = RawEntity<T, I, DraftMode>;
 
 #[derive_where(Debug, Clone; I)]
 pub struct RawEntity<T, I, Mode>(Arc<RawEntityInner<T, I, Mode>>);
@@ -132,7 +133,7 @@ impl<T, I, Mode> RawEntityInner<T, I, Mode> {
 }
 
 impl<T, I, Mode> RawEntityInner<T, I, Mode> {
-    fn into_edit(self) -> RawEntityInner<T, I, EditMode> {
+    fn into_draft(self) -> RawEntityInner<T, I, DraftMode> {
         RawEntityInner {
             entity_id: self.entity_id,
             revision: self.revision,
@@ -140,7 +141,7 @@ impl<T, I, Mode> RawEntityInner<T, I, Mode> {
             created: self.created,
             last_modified: self.last_modified,
             inner: self.inner,
-            _phantom: PhantomData::default(),
+            _phantom: PhantomData,
         }
     }
 }
@@ -173,12 +174,12 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
 
 impl<T, I: Clone, Mode> RawEntity<T, I, Mode> {
     pub fn into_mut(self) -> EntityMut<T, I> {
-        EntityMut(Arc::unwrap_or_clone(self.0).into_edit())
+        EntityMut(Arc::unwrap_or_clone(self.0).into_draft())
     }
 }
 
 #[derive_where(Debug; I)]
-pub struct EntityMut<T, I>(RawEntityInner<T, I, EditMode>);
+pub struct EntityMut<T, I>(RawEntityInner<T, I, DraftMode>);
 
 impl<T, I> EntityMut<T, I> {
     pub fn entity_id(&self) -> EntityId {
@@ -219,11 +220,11 @@ impl<T, I> EntityMut<T, I> {
 }
 
 pub trait Freezable<T, I> {
-    fn freeze(self) -> RawEntity<T, I, EditMode>;
+    fn freeze(self) -> DraftEntity<T, I>;
 }
 
-impl<T: RevisionHasher<I, EditMode> + Normalizer<I>, I> Freezable<T, I> for EntityMut<T, I> {
-    fn freeze(mut self) -> RawEntity<T, I, EditMode> {
+impl<T: RevisionHasher<I, DraftMode> + Normalizer<I>, I> Freezable<T, I> for EntityMut<T, I> {
+    fn freeze(mut self) -> DraftEntity<T, I> {
         T::normalize(&mut self.0.inner);
         self.0.revision = ContentId::new_internal(T::hash(&self.0));
         RawEntity(Arc::new(self.0))
