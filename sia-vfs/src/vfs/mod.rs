@@ -4,6 +4,7 @@ pub mod file;
 pub mod path;
 
 use crate::ContentId;
+use crate::blob::BlobId;
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntityInner,
@@ -11,6 +12,7 @@ use crate::vfs::entity::{
 };
 use crate::vfs::file::File;
 use blake3::Hash;
+use chrono::{DateTime, Utc};
 use derive_where::derive_where;
 use futures_util::TryStream;
 use std::marker::PhantomData;
@@ -95,6 +97,86 @@ pub enum Inode {
     Directory(Directory),
 }
 
+impl Inode {
+    #[inline]
+    pub fn id(&self) -> InodeId {
+        match self {
+            Self::Root(i) => i.inode_id,
+            Self::Directory(i) => i.inode_id,
+            Self::File(i) => i.inode_id,
+        }
+    }
+
+    #[inline]
+    pub fn parent_id(&self) -> Option<InodeId> {
+        match self {
+            Self::Root(_) => None,
+            Self::Directory(i) => Some(i.parent_id()),
+            Self::File(i) => Some(i.parent_id()),
+        }
+    }
+
+    #[inline]
+    pub fn name(&self) -> &Name {
+        match self {
+            Self::Root(i) => i.name(),
+            Self::Directory(i) => i.name(),
+            Self::File(i) => i.name(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> Option<u64> {
+        match self {
+            Self::Root(_) | Self::Directory(_) => None,
+            Self::File(i) => Some(i.len()),
+        }
+    }
+
+    #[inline]
+    pub fn blob_id(&self) -> Option<&BlobId> {
+        match self {
+            Self::Root(_) | Self::Directory(_) => None,
+            Self::File(i) => Some(i.blob_id()),
+        }
+    }
+
+    #[inline]
+    pub fn created(&self) -> &DateTime<Utc> {
+        match self {
+            Self::Root(i) => i.created(),
+            Self::Directory(i) => i.created(),
+            Self::File(i) => i.created(),
+        }
+    }
+
+    #[inline]
+    pub fn last_modified(&self) -> &DateTime<Utc> {
+        match self {
+            Self::Root(i) => i.last_modified(),
+            Self::Directory(i) => i.last_modified(),
+            Self::File(i) => i.last_modified(),
+        }
+    }
+
+    #[inline]
+    pub fn is_container(&self) -> bool {
+        match self {
+            Self::Root(_) | Self::Directory(_) => true,
+            Self::File(i) => false,
+        }
+    }
+
+    #[inline]
+    pub fn is_synced(&self) -> bool {
+        match self {
+            Self::Root(i) => i.is_synced(),
+            Self::Directory(i) => i.is_synced(),
+            Self::File(i) => i.is_synced(),
+        }
+    }
+}
+
 impl From<Root> for Inode {
     fn from(value: Root) -> Self {
         Self::Root(value)
@@ -113,29 +195,37 @@ impl From<Directory> for Inode {
     }
 }
 
-#[derive_where(Debug, Clone; I)]
-pub struct TypedInode<T, I> {
+#[derive_where(Debug, Clone; I, P)]
+pub struct TypedInode<T, I, P> {
+    parent: P,
     inode_id: InodeId,
     entity: Entity<T, I>,
 }
 
-impl<T, I> TypedInode<T, I> {
+impl<T, I> TypedInode<T, I, InodeId> {
+    pub fn parent_id(&self) -> InodeId {
+        self.parent
+    }
+}
+
+impl<T, I, P> TypedInode<T, I, P> {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
 
-    pub fn into_mut(self) -> InodeMut<T, I>
+    pub fn into_mut(self) -> InodeMut<T, I, P>
     where
         I: Clone,
     {
         InodeMut {
+            parent: self.parent,
             inode_id: self.inode_id,
             entity: self.entity.into_mut(),
         }
     }
 }
 
-impl<T, I> Deref for TypedInode<T, I> {
+impl<T, I, P> Deref for TypedInode<T, I, P> {
     type Target = Entity<T, I>;
 
     #[inline]
@@ -144,19 +234,26 @@ impl<T, I> Deref for TypedInode<T, I> {
     }
 }
 
-#[derive_where(Debug; I)]
-pub struct InodeMut<T, I> {
+#[derive_where(Debug; I, P)]
+pub struct InodeMut<T, I, P> {
+    parent: P,
     inode_id: InodeId,
     entity: EntityMut<T, I>,
 }
 
-impl<T, I> InodeMut<T, I> {
+impl<T, I> InodeMut<T, I, InodeId> {
+    pub fn parent_id(&self) -> InodeId {
+        self.parent
+    }
+}
+
+impl<T, I, P> InodeMut<T, I, P> {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
 }
 
-impl<T, I> InodeMut<T, I>
+impl<T, I, P> InodeMut<T, I, P>
 where
     EntityMut<T, I>: Freezable<T, I>,
 {
@@ -165,7 +262,7 @@ where
     }
 }
 
-impl<T, I> Deref for InodeMut<T, I> {
+impl<T, I, P> Deref for InodeMut<T, I, P> {
     type Target = EntityMut<T, I>;
 
     #[inline]
@@ -174,7 +271,7 @@ impl<T, I> Deref for InodeMut<T, I> {
     }
 }
 
-impl<T, I> DerefMut for InodeMut<T, I> {
+impl<T, I, P> DerefMut for InodeMut<T, I, P> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.entity
     }
@@ -219,9 +316,9 @@ impl<Mode: Read> Vfs<Mode> {
         todo!()
     }
 
-    pub async fn list<T>(
+    pub async fn list<T, P>(
         &self,
-        inode: &Container<T>,
+        inode: &Container<T, P>,
     ) -> VfsResult<impl TryStream<Ok = Inode, Error = VfsError> + Send + Unpin> {
         if true {
             todo!()
@@ -231,7 +328,10 @@ impl<Mode: Read> Vfs<Mode> {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<TypedInode<T, I>>
+    pub async fn update<T, I, P>(
+        &self,
+        modified_inode: InodeMut<T, I, P>,
+    ) -> VfsResult<TypedInode<T, I, P>>
     where
         EntityMut<T, I>: Freezable<T, I>,
     {
@@ -247,14 +347,18 @@ impl<Mode: Read + Write> Vfs<Mode> {
         todo!()
     }
 
-    pub async fn mv<T>(&self, inode_id: InodeId, parent: &Container<T>) -> VfsResult<()> {
+    pub async fn mv<T, P>(&self, inode_id: InodeId, parent: &Container<T, P>) -> VfsResult<()> {
         if inode_id == self.root().inode_id() {
             return Err(VfsError::MoveRootError);
         }
         todo!()
     }
 
-    pub async fn copy<T>(&self, inode_id: InodeId, new_parent: &Container<T>) -> VfsResult<()> {
+    pub async fn copy<T, P>(
+        &self,
+        inode_id: InodeId,
+        new_parent: &Container<T, P>,
+    ) -> VfsResult<()> {
         if inode_id == self.root().inode_id() {
             return Err(VfsError::CopyRootError);
         }
@@ -324,19 +428,19 @@ fn hash_entries(entries: &Vec<EntityKey>, hasher: &mut blake3::Hasher) {
     hasher.update(b"\nend_entries");
 }
 
-pub type Container<T> = TypedInode<T, Vec<EntityKey>>;
-pub type ContainerMut<T> = InodeMut<T, Vec<EntityKey>>;
+pub type Container<T, P> = TypedInode<T, Vec<EntityKey>, P>;
+pub type ContainerMut<T, P> = InodeMut<T, Vec<EntityKey>, P>;
 
-impl<T> Container<T> {
+impl<T, P> Container<T, P> {
     pub(crate) fn entries(&self) -> &Vec<EntityKey> {
         self.entity.inner()
     }
 }
 
-impl<T> ContainerMut<T> {
+impl<T, P> ContainerMut<T, P> {
     fn entries_mut(&mut self) -> &mut Vec<EntityKey> {
         self.inner_mut()
     }
 }
 
-pub type Root = Container<RootKind>;
+pub type Root = Container<RootKind, ()>;

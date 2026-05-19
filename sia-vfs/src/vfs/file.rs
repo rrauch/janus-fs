@@ -50,8 +50,8 @@ impl From<Blob> for BlobInfo {
     }
 }
 
-pub type File = TypedInode<FileKind, BlobInfo>;
-pub type FileMut = InodeMut<FileKind, BlobInfo>;
+pub type File = TypedInode<FileKind, BlobInfo, InodeId>;
+pub type FileMut = InodeMut<FileKind, BlobInfo, InodeId>;
 
 impl File {
     pub fn len(&self) -> u64 {
@@ -84,9 +84,9 @@ impl<Mode: Read + Write> Vfs<Mode> {
         todo!()
     }
 
-    pub async fn create_file<T>(
+    pub async fn create_file<T, P>(
         &self,
-        parent: &Container<T>,
+        parent: &Container<T, P>,
         name: Name,
     ) -> VfsResult<FileHandle<ReadWrite>> {
         todo!()
@@ -122,8 +122,8 @@ pub struct FileHandle<M: FileMode> {
 }
 
 impl FileHandle<ReadOnly> {
-    pub fn file_id(&self) -> InodeId {
-        self.inner.file.inode_id
+    pub fn file(&self) -> &File {
+        &self.inner.file
     }
 
     pub fn len(&self) -> u64 {

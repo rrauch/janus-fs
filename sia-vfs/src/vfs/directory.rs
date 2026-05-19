@@ -1,5 +1,5 @@
 use crate::vfs::entity::{EntityKey, Normalizer, RawEntityInner, RevisionHasher};
-use crate::vfs::{Container, Name, Read, Vfs, VfsResult, Write, hash_entries};
+use crate::vfs::{Container, InodeId, Name, Read, Vfs, VfsResult, Write, hash_entries};
 use blake3::{Hash, Hasher};
 
 pub struct DirectoryKind;
@@ -21,12 +21,12 @@ impl Normalizer<Vec<EntityKey>> for DirectoryKind {
     }
 }
 
-pub type Directory = Container<DirectoryKind>;
+pub type Directory = Container<DirectoryKind, InodeId>;
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn create_dir<M, T: RevisionHasher<Vec<EntityKey>, M>>(
+    pub async fn create_dir<M, T: RevisionHasher<Vec<EntityKey>, M>, P>(
         &self,
-        parent: &Container<T>,
+        parent: &Container<T, P>,
         name: Name,
     ) -> VfsResult<Directory> {
         todo!()
