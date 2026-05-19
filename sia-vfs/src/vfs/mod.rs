@@ -1,19 +1,22 @@
 pub mod directory;
+mod entity;
 pub mod file;
 pub mod path;
 
 use crate::ContentId;
 use crate::vfs::directory::Directory;
+use crate::vfs::entity::{
+    Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntityInner, RevisionHasher,
+};
 use crate::vfs::file::File;
-use chrono::{DateTime, Utc};
+use blake3::Hash;
 use derive_where::derive_where;
 use futures_util::TryStream;
 use std::marker::PhantomData;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum VfsError {
@@ -27,8 +30,6 @@ pub enum VfsError {
     MoveRootError,
     #[error("root cannot be copied")]
     CopyRootError,
-    #[error("root revision mismatch")]
-    RootRevisionMismatch,
 }
 
 #[derive(Error, Debug)]
@@ -49,10 +50,10 @@ pub type VfsResult<T> = Result<T, VfsError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct InodeId(Uuid);
+pub struct InodeId(u64);
 
 impl Deref for InodeId {
-    type Target = Uuid;
+    type Target = u64;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -86,132 +87,76 @@ impl AsRef<str> for Name {
     }
 }
 
-pub trait RevisionHasher<I>: Sized {
-    fn hash(inner: &InodeInner<Self, I>) -> blake3::Hash;
-}
-
-pub trait Normalizer<I>: RevisionHasher<I> {
-    fn normalize(inner: &mut InodeInner<Self, I>);
-}
-
-#[derive_where(Debug, Clone; I)]
-struct InodeInner<T: RevisionHasher<I>, I> {
-    id: InodeId,
-    revision: Revision,
-    name: Name,
-    created: DateTime<Utc>,
-    last_modified: DateTime<Utc>,
-    //extended_attributes: HashMap<String, Bytes>,
-    inner: I,
-    _phantom: PhantomData<T>,
-}
-
-impl<T: RevisionHasher<I>, I> InodeInner<T, I> {
-    fn hash_metadata(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(b"begin_metadata:\nid:");
-        hasher.update(self.id.as_bytes());
-        hasher.update(b"\nname:");
-        hasher.update(self.name.as_bytes());
-        hasher.update(b"\ncreated:");
-        hasher.update(&self.created.timestamp().to_be_bytes());
-        hasher.update(b"\nlast_modified:");
-        hasher.update(&self.last_modified.timestamp().to_be_bytes());
-        hasher.update(b"\nend_metadata");
-    }
-}
-
-#[derive_where(Debug, Clone; I)]
-pub struct Inode<T: RevisionHasher<I>, I>(Arc<InodeInner<T, I>>);
-
-impl<T: RevisionHasher<I>, I> Inode<T, I> {
-    pub fn id(&self) -> InodeId {
-        self.0.id
-    }
-
-    pub fn revision(&self) -> &Revision {
-        &self.0.revision
-    }
-
-    pub fn name(&self) -> &Name {
-        &self.0.name
-    }
-
-    pub fn created(&self) -> &DateTime<Utc> {
-        &self.0.created
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.0.last_modified
-    }
-}
-
-impl<T: RevisionHasher<I> + Normalizer<I>, I: Clone> Inode<T, I> {
-    pub fn into_mut(self) -> InodeMut<T, I> {
-        InodeMut(Arc::unwrap_or_clone(self.0))
-    }
-}
-
-#[derive_where(Debug; I)]
-pub struct InodeMut<T: RevisionHasher<I> + Normalizer<I>, I>(InodeInner<T, I>);
-
-impl<T: RevisionHasher<I> + Normalizer<I>, I> InodeMut<T, I> {
-    pub fn id(&self) -> InodeId {
-        self.0.id
-    }
-
-    pub fn name(&self) -> &Name {
-        &self.0.name
-    }
-
-    pub fn set_name(&mut self, new: Name) {
-        self.0.name = new;
-    }
-
-    pub fn created(&self) -> &DateTime<Utc> {
-        &self.0.created
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.0.last_modified
-    }
-
-    pub fn set_last_modified(&mut self, new: DateTime<Utc>) {
-        self.0.last_modified = new;
-    }
-
-    pub(crate) fn freeze(mut self) -> Inode<T, I> {
-        self.update_revision();
-        Inode(Arc::new(self.0))
-    }
-
-    fn update_revision(&mut self) {
-        T::normalize(&mut self.0);
-        self.0.revision = ContentId::new_internal(T::hash(&self.0));
-    }
-}
-
 #[derive(Debug, Clone)]
-pub enum Entry {
+pub enum Inode {
     Root(Root),
     File(File),
     Directory(Directory),
 }
 
-impl From<File> for Entry {
+impl From<Root> for Inode {
+    fn from(value: Root) -> Self {
+        Self::Root(value)
+    }
+}
+
+impl From<File> for Inode {
     fn from(value: File) -> Self {
         Self::File(value)
     }
 }
 
-impl From<Directory> for Entry {
+impl From<Directory> for Inode {
     fn from(value: Directory) -> Self {
         Self::Directory(value)
     }
 }
 
-impl From<Root> for Entry {
-    fn from(value: Root) -> Self {
-        Self::Root(value)
+#[derive_where(Debug, Clone; I)]
+pub struct TypedInode<T, I> {
+    inode_id: InodeId,
+    entity: Entity<T, I>,
+}
+
+impl<T, I> TypedInode<T, I> {
+    pub fn inode_id(&self) -> InodeId {
+        self.inode_id
+    }
+}
+
+impl<T, I> Deref for TypedInode<T, I> {
+    type Target = Entity<T, I>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.entity
+    }
+}
+
+#[derive_where(Debug; I)]
+pub struct InodeMut<T, I> {
+    inode_id: InodeId,
+    entity: EntityMut<T, I>,
+}
+
+impl<T, I> InodeMut<T, I> {
+    pub fn inode_id(&self) -> InodeId {
+        self.inode_id
+    }
+}
+
+impl<T, I> Deref for InodeMut<T, I> {
+    type Target = EntityMut<T, I>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.entity
+    }
+}
+
+impl<T, I> DerefMut for InodeMut<T, I> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entity
     }
 }
 
@@ -239,24 +184,25 @@ impl Write for ReadWrite {}
 impl<Mode: Read> Vfs<Mode> {
     #[inline]
     pub fn root(&self) -> Root {
-        self.0.root.lock().expect("lock to not be poisoned").clone()
+        self.0
+            .root
+            .lock()
+            .expect("mutex not to be poisoned")
+            .clone()
     }
 
-    pub async fn get_by_key(&self, inode_key: &InodeKey) -> VfsResult<Option<Entry>> {
+    pub async fn inode_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Inode>> {
         let root = self.root();
-        if inode_key.id == root.id() {
-            if root.revision() != &inode_key.revision {
-                return Err(VfsError::RootRevisionMismatch);
-            }
-            return Ok(Some(Entry::Root(root)));
+        if inode_id == root.inode_id() {
+            return Ok(Some(root.into()));
         }
         todo!()
     }
 
-    pub async fn list<T: RevisionHasher<Vec<InodeKey>>>(
+    pub async fn list<T>(
         &self,
         inode: &Container<T>,
-    ) -> VfsResult<impl TryStream<Ok = Entry, Error = VfsError> + Send + Unpin> {
+    ) -> VfsResult<impl TryStream<Ok = Inode, Error = VfsError> + Send + Unpin> {
         if true {
             todo!()
         }
@@ -265,38 +211,30 @@ impl<Mode: Read> Vfs<Mode> {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T: RevisionHasher<I> + Normalizer<I>, I>(
-        &self,
-        modified_inode: InodeMut<T, I>,
-    ) -> VfsResult<Inode<T, I>> {
+    pub async fn update<T, I>(&self, modified_inode: EntityMut<T, I>) -> VfsResult<TypedInode<T, I>>
+    where
+        EntityMut<T, I>: Freezable<T, I>,
+    {
         let inode = modified_inode.freeze();
         todo!()
     }
 
     pub async fn delete(&self, inode_id: InodeId) -> VfsResult<()> {
-        if inode_id == self.root().id() {
+        if inode_id == self.root().inode_id() {
             return Err(VfsError::DeleteRootError);
         }
         todo!()
     }
 
-    pub async fn mv<T: RevisionHasher<Vec<InodeKey>>>(
-        &self,
-        inode_id: InodeId,
-        parent: Container<T>,
-    ) -> VfsResult<()> {
-        if inode_id == self.root().id() {
+    pub async fn mv<T>(&self, inode_id: InodeId, parent: &Container<T>) -> VfsResult<()> {
+        if inode_id == self.root().inode_id() {
             return Err(VfsError::MoveRootError);
         }
         todo!()
     }
 
-    pub async fn copy<T: RevisionHasher<Vec<InodeKey>>>(
-        &self,
-        inode_id: InodeId,
-        new_parent: Container<T>,
-    ) -> VfsResult<()> {
-        if inode_id == self.root().id() {
+    pub async fn copy<T>(&self, inode_id: InodeId, new_parent: &Container<T>) -> VfsResult<()> {
+        if inode_id == self.root().inode_id() {
             return Err(VfsError::CopyRootError);
         }
         todo!()
@@ -329,34 +267,13 @@ fn check_valid_filename(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InodeKey {
-    id: InodeId,
-    revision: Revision,
-}
-
 pub struct RevisionKind;
 pub type Revision = ContentId<RevisionKind>;
 
-type Container<T> = Inode<T, Vec<InodeKey>>;
-type ContainerMut<T> = InodeMut<T, Vec<InodeKey>>;
-
-impl<T: RevisionHasher<Vec<InodeKey>>> Container<T> {
-    fn entries(&self) -> &Vec<InodeKey> {
-        &self.0.inner
-    }
-}
-
-impl<T: RevisionHasher<Vec<InodeKey>> + Normalizer<Vec<InodeKey>>> ContainerMut<T> {
-    fn entries_mut(&mut self) -> &mut Vec<InodeKey> {
-        &mut self.0.inner
-    }
-}
-
 pub struct RootKind;
 
-impl RevisionHasher<Vec<InodeKey>> for RootKind {
-    fn hash(inner: &InodeInner<Self, Vec<InodeKey>>) -> blake3::Hash {
+impl<Mode> RevisionHasher<Vec<EntityKey>, Mode> for RootKind {
+    fn hash(inner: &RawEntityInner<Self, Vec<EntityKey>, Mode>) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[root_revision]");
         hasher.update(b"begin:\n");
         hash_entries(&inner.inner, &mut hasher);
@@ -365,24 +282,39 @@ impl RevisionHasher<Vec<InodeKey>> for RootKind {
     }
 }
 
-impl Normalizer<Vec<InodeKey>> for RootKind {
-    fn normalize(inner: &mut InodeInner<Self, Vec<InodeKey>>) {
-        inner.inner.sort();
+impl Normalizer<Vec<EntityKey>> for RootKind {
+    fn normalize(value: &mut Vec<EntityKey>) {
+        value.sort();
     }
 }
 
-fn hash_entries(entries: &Vec<InodeKey>, hasher: &mut blake3::Hasher) {
+fn hash_entries(entries: &Vec<EntityKey>, hasher: &mut blake3::Hasher) {
     hasher.update(b"begin_entries:\nno_entries:");
     hasher.update(&entries.len().to_be_bytes());
     hasher.update(b"\nentries:");
     for entry in entries {
-        hasher.update(b"inode_id:");
-        hasher.update(entry.id.as_bytes());
+        hasher.update(b"entity_id:");
+        hasher.update(entry.entity_id.as_bytes());
         hasher.update(b"\nrevision:");
         hasher.update(entry.revision.as_ref());
         hasher.update(b"\n");
     }
     hasher.update(b"\nend_entries");
+}
+
+pub type Container<T> = TypedInode<T, Vec<EntityKey>>;
+pub type ContainerMut<T> = EntityMut<T, Vec<EntityKey>>;
+
+impl<T> Container<T> {
+    pub(crate) fn entries(&self) -> &Vec<EntityKey> {
+        self.entity.inner()
+    }
+}
+
+impl<T> ContainerMut<T> {
+    fn entries_mut(&mut self) -> &mut Vec<EntityKey> {
+        self.inner_mut()
+    }
 }
 
 pub type Root = Container<RootKind>;

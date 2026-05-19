@@ -1,11 +1,12 @@
-use crate::blob::Blob;
 use crate::blob::io::{BlobReader, BlobWriter};
+use crate::blob::{Blob, BlobId};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
+use crate::vfs::entity::{EntityMut, Freezable, RawEntityInner};
 use crate::vfs::{
-    Container, Inode, InodeId, InodeInner, InodeKey, InodeMut, Name, Normalizer, Read,
-    RevisionHasher, Vfs, VfsResult, Write,
+    Container, InodeId, Name, Normalizer, Read, RevisionHasher, TypedInode, Vfs, VfsResult, Write,
 };
 use async_trait::async_trait;
+use blake3::Hash;
 use chrono::Utc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use std::io::SeekFrom;
@@ -15,44 +16,59 @@ use uuid::Uuid;
 
 pub struct FileKind;
 
-impl RevisionHasher<Blob> for FileKind {
-    fn hash(inner: &InodeInner<Self, Blob>) -> blake3::Hash {
+impl<Mode> RevisionHasher<BlobInfo, Mode> for FileKind {
+    fn hash(inner: &RawEntityInner<Self, BlobInfo, Mode>) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_revision]");
         hasher.update(b"begin:\n");
         inner.hash_metadata(&mut hasher);
         hasher.update(b"\nbegin_blob:\nid:\n");
-        hasher.update(inner.inner.id().as_slice());
+        hasher.update(inner.inner.blob_id.as_slice());
         hasher.update(b"\nlength:\n");
-        hasher.update(&inner.inner.len().to_be_bytes());
+        hasher.update(&inner.inner.len.to_be_bytes());
         hasher.update(b"\nend_blob\nend");
         hasher.finalize()
     }
 }
 
-impl Normalizer<Blob> for FileKind {
-    fn normalize(inner: &mut InodeInner<Self, Blob>) {}
+impl Normalizer<BlobInfo> for FileKind {
+    fn normalize(value: &mut BlobInfo) {}
 }
 
-pub type File = Inode<FileKind, Blob>;
-pub type FileMut = InodeMut<FileKind, Blob>;
+#[derive(Debug, Clone)]
+pub struct BlobInfo {
+    blob_id: BlobId,
+    len: u64,
+}
+
+impl From<Blob> for BlobInfo {
+    fn from(value: Blob) -> Self {
+        Self {
+            blob_id: value.id().clone(),
+            len: value.len(),
+        }
+    }
+}
+
+pub type File = TypedInode<FileKind, BlobInfo>;
+pub type FileMut = EntityMut<FileKind, BlobInfo>;
 
 impl File {
     pub fn len(&self) -> u64 {
-        self.0.inner.len()
+        self.inner().len
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub(crate) fn content(&self) -> &Blob {
-        &self.0.inner
+    pub(crate) fn blob_id(&self) -> &BlobId {
+        &self.inner().blob_id
     }
 }
 
 impl FileMut {
-    pub(crate) fn set_content(&mut self, new: Blob) {
-        self.0.inner = new;
+    pub(crate) fn set_content(&mut self, new: BlobInfo) {
+        self.set_inner(new);
     }
 }
 
@@ -67,9 +83,9 @@ impl<Mode: Read + Write> Vfs<Mode> {
         todo!()
     }
 
-    pub async fn create_file<T: RevisionHasher<Vec<InodeKey>>>(
+    pub async fn create_file<T>(
         &self,
-        parent: Container<T>,
+        parent: &Container<T>,
         name: Name,
     ) -> VfsResult<FileHandle<ReadWrite>> {
         todo!()
@@ -78,8 +94,12 @@ impl<Mode: Read + Write> Vfs<Mode> {
 
 pub trait FileMode {}
 
-#[repr(transparent)]
-pub struct ReadOnly(BlobReader<()>);
+pub struct ReadOnly {
+    reader: BlobReader<()>,
+    file: File,
+}
+
+impl FileMode for ReadOnly {}
 
 #[async_trait]
 impl ChunkSource for () {
@@ -95,27 +115,22 @@ impl ChunkSink for () {
     }
 }
 
-impl FileMode for ReadOnly {}
-
 pub struct FileHandle<M: FileMode> {
     id: Uuid,
-    file: File,
     inner: M,
 }
 
-impl<M: FileMode> FileHandle<M> {
-    pub fn file_id(&self) -> InodeId {
-        self.file.id()
-    }
-}
-
 impl FileHandle<ReadOnly> {
+    pub fn file_id(&self) -> InodeId {
+        self.inner.file.inode_id
+    }
+
     pub fn len(&self) -> u64 {
-        self.inner.0.len()
+        self.inner.file.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.0.is_empty()
+        self.inner.file.is_empty()
     }
 }
 
@@ -126,7 +141,7 @@ impl AsyncRead for FileHandle<ReadOnly> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let reader = &mut self.as_mut().inner.0;
+        let reader = &mut self.as_mut().inner.reader;
         Pin::new(reader).poll_read(cx, buf)
     }
 }
@@ -138,33 +153,44 @@ impl AsyncSeek for FileHandle<ReadOnly> {
         cx: &mut Context<'_>,
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
-        let reader = &mut self.as_mut().inner.0;
+        let reader = &mut self.as_mut().inner.reader;
         Pin::new(reader).poll_seek(cx, pos)
     }
 }
 
-#[repr(transparent)]
-pub struct ReadWrite(BlobWriter<()>);
+pub struct ReadWrite {
+    writer: BlobWriter<()>,
+    file_id: Option<InodeId>,
+    file: FileMut,
+}
 
 impl FileMode for ReadWrite {}
 
 impl FileHandle<ReadWrite> {
+    pub fn file_id(&self) -> Option<InodeId> {
+        self.inner.file_id
+    }
+
+    pub fn is_new(&self) -> bool {
+        self.inner.file_id.is_none()
+    }
+
     pub fn len(&self) -> u64 {
-        self.inner.0.len()
+        self.inner.writer.len()
     }
 
     pub async fn set_len(&mut self, new_len: u64) -> VfsResult<()> {
-        Ok(self.inner.0.set_len(new_len).await?)
+        Ok(self.inner.writer.set_len(new_len).await?)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.0.is_empty()
+        self.inner.writer.is_empty()
     }
 
     pub async fn commit(self) -> VfsResult<File> {
-        let blob = self.inner.0.finalize().await?;
-        let mut file = self.file.into_mut();
-        file.set_content(blob);
+        let blob = self.inner.writer.finalize().await?;
+        let mut file = self.inner.file;
+        file.set_content(blob.clone().into());
         file.set_last_modified(Utc::now());
         let file = file.freeze();
         todo!()
@@ -178,7 +204,7 @@ impl AsyncRead for FileHandle<ReadWrite> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.as_mut().inner.0).poll_read(cx, buf)
+        Pin::new(&mut self.as_mut().inner.writer).poll_read(cx, buf)
     }
 }
 
@@ -189,17 +215,17 @@ impl AsyncWrite for FileHandle<ReadWrite> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.as_mut().inner.0).poll_write(cx, buf)
+        Pin::new(&mut self.as_mut().inner.writer).poll_write(cx, buf)
     }
 
     #[inline]
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.as_mut().inner.0).poll_flush(cx)
+        Pin::new(&mut self.as_mut().inner.writer).poll_flush(cx)
     }
 
     #[inline]
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.as_mut().inner.0).poll_close(cx)
+        Pin::new(&mut self.as_mut().inner.writer).poll_close(cx)
     }
 }
 
@@ -210,6 +236,6 @@ impl AsyncSeek for FileHandle<ReadWrite> {
         cx: &mut Context<'_>,
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
-        Pin::new(&mut self.as_mut().inner.0).poll_seek(cx, pos)
+        Pin::new(&mut self.as_mut().inner.writer).poll_seek(cx, pos)
     }
 }
