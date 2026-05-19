@@ -6,7 +6,8 @@ pub mod path;
 use crate::ContentId;
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntityInner, RevisionHasher,
+    EditMode, Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntity, RawEntityInner,
+    RevisionHasher,
 };
 use crate::vfs::file::File;
 use blake3::Hash;
@@ -122,6 +123,16 @@ impl<T, I> TypedInode<T, I> {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
+
+    pub fn into_mut(self) -> InodeMut<T, I>
+    where
+        I: Clone,
+    {
+        InodeMut {
+            inode_id: self.inode_id,
+            entity: self.entity.into_mut(),
+        }
+    }
 }
 
 impl<T, I> Deref for TypedInode<T, I> {
@@ -142,6 +153,15 @@ pub struct InodeMut<T, I> {
 impl<T, I> InodeMut<T, I> {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
+    }
+}
+
+impl<T, I> InodeMut<T, I>
+where
+    EntityMut<T, I>: Freezable<T, I>,
+{
+    pub(crate) fn freeze(self) -> RawEntity<T, I, EditMode> {
+        self.entity.freeze()
     }
 }
 
@@ -211,10 +231,11 @@ impl<Mode: Read> Vfs<Mode> {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T, I>(&self, modified_inode: EntityMut<T, I>) -> VfsResult<TypedInode<T, I>>
+    pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<TypedInode<T, I>>
     where
         EntityMut<T, I>: Freezable<T, I>,
     {
+        let inode_id = modified_inode.inode_id;
         let inode = modified_inode.freeze();
         todo!()
     }
@@ -303,7 +324,7 @@ fn hash_entries(entries: &Vec<EntityKey>, hasher: &mut blake3::Hasher) {
 }
 
 pub type Container<T> = TypedInode<T, Vec<EntityKey>>;
-pub type ContainerMut<T> = EntityMut<T, Vec<EntityKey>>;
+pub type ContainerMut<T> = InodeMut<T, Vec<EntityKey>>;
 
 impl<T> Container<T> {
     pub(crate) fn entries(&self) -> &Vec<EntityKey> {
@@ -318,4 +339,3 @@ impl<T> ContainerMut<T> {
 }
 
 pub type Root = Container<RootKind>;
-pub type RootMut = ContainerMut<RootKind>;

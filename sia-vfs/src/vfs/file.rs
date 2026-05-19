@@ -1,9 +1,10 @@
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::blob::{Blob, BlobId};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::entity::{EntityMut, Freezable, RawEntityInner};
+use crate::vfs::entity::RawEntityInner;
 use crate::vfs::{
-    Container, InodeId, Name, Normalizer, Read, RevisionHasher, TypedInode, Vfs, VfsResult, Write,
+    Container, InodeId, InodeMut, Name, Normalizer, Read, RevisionHasher, TypedInode, Vfs,
+    VfsResult, Write,
 };
 use async_trait::async_trait;
 use blake3::Hash;
@@ -50,7 +51,7 @@ impl From<Blob> for BlobInfo {
 }
 
 pub type File = TypedInode<FileKind, BlobInfo>;
-pub type FileMut = EntityMut<FileKind, BlobInfo>;
+pub type FileMut = InodeMut<FileKind, BlobInfo>;
 
 impl File {
     pub fn len(&self) -> u64 {

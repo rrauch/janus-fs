@@ -76,6 +76,17 @@ impl<T, I> Entity<T, I> {
             Self::Wal(e) => e.inner(),
         }
     }
+
+    #[inline]
+    pub(crate) fn into_mut(self) -> EntityMut<T, I>
+    where
+        I: Clone,
+    {
+        match self {
+            Self::Synced(e) => e.into_mut(),
+            Self::Wal(e) => e.into_mut(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -160,7 +171,7 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
     }
 }
 
-impl<T: RevisionHasher<I, EditMode> + Normalizer<I>, I: Clone, Mode> RawEntity<T, I, Mode> {
+impl<T, I: Clone, Mode> RawEntity<T, I, Mode> {
     pub fn into_mut(self) -> EntityMut<T, I> {
         EntityMut(Arc::unwrap_or_clone(self.0).into_edit())
     }
