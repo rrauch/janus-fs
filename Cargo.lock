@@ -3499,6 +3499,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "chrono",
  "derive-where",
  "dotenv",
  "futures-io",
@@ -3508,6 +3509,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing-subscriber",
+ "typed-path",
+ "uuid",
  "zstd",
 ]
 
