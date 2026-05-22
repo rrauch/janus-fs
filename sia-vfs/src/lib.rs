@@ -7,11 +7,27 @@ use std::sync::Arc;
 
 pub mod blob;
 pub mod chunk;
+pub(crate) mod db;
 pub mod vfs;
 
 #[derive_where(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ContentId<T>(Arc<blake3::Hash>, PhantomData<T>);
+
+impl<T> ContentId<T> {
+    pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<ContentId<T>> {
+        let bytes = match input.try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return None,
+        };
+        Some(Self(Arc::new(blake3::Hash::from_bytes(bytes)), PhantomData))
+    }
+
+    pub(crate) fn zeroed() -> Self {
+        let bytes = [0u8; 32];
+        Self(Arc::new(blake3::Hash::from_bytes(bytes)), PhantomData)
+    }
+}
 
 impl<T> Deref for ContentId<T> {
     type Target = blake3::Hash;

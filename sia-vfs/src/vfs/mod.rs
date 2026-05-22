@@ -1,25 +1,33 @@
 pub mod directory;
-mod entity;
+pub mod entity;
 pub mod file;
 pub mod path;
 
 use crate::ContentId;
 use crate::blob::BlobId;
+use crate::db::{
+    DataError, Db, Error as DbError, Read as DbRead, ReadOnly as DbReadOnly,
+    ReadWrite as DbReadWrite, Transaction, TxScope, Write as DbWrite,
+};
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    DraftEntity, Entity, EntityKey, EntityMut, Freezable, Normalizer, RawEntityInner,
-    RevisionHasher,
+    DraftEntity, DraftMode, Entity, EntityId, EntityKey, EntityMut, EntityRow, Freezable,
+    Normalizer, RawEntityInner, RevisionHasher,
 };
 use crate::vfs::file::File;
 use blake3::Hash;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
-use futures_util::TryStream;
+use futures_util::{StreamExt, TryStream};
+use std::collections::VecDeque;
+use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use thiserror::Error;
+
+pub(crate) const ROOT_INODE_ID: InodeId = InodeId(1);
 
 #[derive(Debug, Error)]
 pub enum VfsError {
@@ -33,6 +41,12 @@ pub enum VfsError {
     MoveRootError,
     #[error("root cannot be copied")]
     CopyRootError,
+    #[error(transparent)]
+    DbError(#[from] DbError),
+    #[error("root is missing")]
+    MissingRoot,
+    #[error("other error: {0}")]
+    Other(String),
 }
 
 #[derive(Error, Debug)]
@@ -55,11 +69,23 @@ pub type VfsResult<T> = Result<T, VfsError>;
 #[repr(transparent)]
 pub struct InodeId(u64);
 
+impl InodeId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 impl Deref for InodeId {
     type Target = u64;
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl Display for InodeId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
     }
 }
 
@@ -248,6 +274,14 @@ impl<T, I> InodeMut<T, I, InodeId> {
 }
 
 impl<T, I, P> InodeMut<T, I, P> {
+    pub(super) fn new(parent: P, inode_id: InodeId, entity: EntityMut<T, I>) -> Self {
+        Self {
+            parent,
+            inode_id,
+            entity,
+        }
+    }
+
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
@@ -283,11 +317,11 @@ pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 
 #[derive(Debug)]
 struct Inner {
-    root: Mutex<Root>,
+    db: Db,
 }
 
-pub trait Read {}
-pub trait Write {}
+pub trait Read: Send + Sync + 'static {}
+pub trait Write: Send + Sync + 'static {}
 
 pub struct ReadOnly;
 
@@ -300,58 +334,93 @@ impl Write for ReadWrite {}
 
 impl<Mode: Read> Vfs<Mode> {
     #[inline]
-    pub fn root(&self) -> Root {
-        self.0
-            .root
-            .lock()
-            .expect("mutex not to be poisoned")
-            .clone()
+    pub async fn root(&self) -> VfsResult<Root> {
+        match self.inode_by_id(ROOT_INODE_ID).await? {
+            Some(Inode::Root(root)) => Ok(root),
+            _ => Err(VfsError::MissingRoot),
+        }
     }
 
     pub async fn inode_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Inode>> {
-        let root = self.root();
-        if inode_id == root.inode_id() {
-            return Ok(Some(root.into()));
-        }
-        todo!()
+        Ok(self.tx().await?.inode_by_id(inode_id).await?)
     }
 
     pub async fn list<T, P>(
         &self,
         inode: &Container<T, P>,
     ) -> VfsResult<impl TryStream<Ok = Inode, Error = VfsError> + Send + Unpin> {
-        if true {
-            todo!()
-        }
-        Ok(futures_util::stream::empty())
+        let parent_inode_id = inode.inode_id;
+        let this = self.clone();
+        let inode_ids = self
+            .tx()
+            .await?
+            .inode_ids_by_parent(parent_inode_id)
+            .await?;
+
+        Ok(futures_util::stream::try_unfold(
+            VecDeque::from(inode_ids),
+            move |mut remaining_inode_ids| {
+                let this = this.clone();
+                async move {
+                    let inode_id = match remaining_inode_ids.pop_front() {
+                        None => return Ok(None),
+                        Some(key) => key,
+                    };
+
+                    match this.inode_by_id(inode_id).await? {
+                        None => Err(DbError::DataError(DataError::InodeNotFound(inode_id)))?,
+                        Some(inode) => Ok(Some((inode, remaining_inode_ids))),
+                    }
+                }
+            },
+        )
+        .boxed())
+    }
+
+    pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
+        Ok(self.0.db.read().await?)
     }
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T, I, P>(
-        &self,
-        modified_inode: InodeMut<T, I, P>,
-    ) -> VfsResult<TypedInode<T, I, P>>
+    pub async fn update<T, I, P>(&self, modified_inode: InodeMut<T, I, P>) -> VfsResult<Inode>
     where
         EntityMut<T, I>: Freezable<T, I>,
+        EntityRow: From<DraftEntity<T, I>>,
     {
         let inode_id = modified_inode.inode_id;
+        let name = modified_inode.name().clone();
         let draft_entity = modified_inode.freeze();
-        todo!()
+        let mut tx = self.tx_rw().await?;
+        let (entity_id, entity_revision) = tx.create_entity_if_not_exist(draft_entity).await?;
+        tx.update_inode(inode_id, &name, entity_id, &entity_revision)
+            .await?;
+        let inode = tx
+            .inode_by_id(inode_id)
+            .await?
+            .ok_or_else(|| DbError::DataError(DataError::InodeNotFound(inode_id)))?;
+        tx.commit().await?;
+        Ok(inode)
     }
 
     pub async fn delete(&self, inode_id: InodeId) -> VfsResult<()> {
-        if inode_id == self.root().inode_id() {
+        if inode_id == ROOT_INODE_ID {
             return Err(VfsError::DeleteRootError);
         }
-        todo!()
+        let mut tx = self.tx_rw().await?;
+        tx.delete_inode(inode_id).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn mv<T, P>(&self, inode_id: InodeId, parent: &Container<T, P>) -> VfsResult<()> {
-        if inode_id == self.root().inode_id() {
+        if inode_id == ROOT_INODE_ID {
             return Err(VfsError::MoveRootError);
         }
-        todo!()
+        let mut tx = self.tx_rw().await?;
+        tx.move_inode(inode_id, parent.inode_id()).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn copy<T, P>(
@@ -359,10 +428,14 @@ impl<Mode: Read + Write> Vfs<Mode> {
         inode_id: InodeId,
         new_parent: &Container<T, P>,
     ) -> VfsResult<()> {
-        if inode_id == self.root().inode_id() {
+        if inode_id == ROOT_INODE_ID {
             return Err(VfsError::CopyRootError);
         }
         todo!()
+    }
+
+    pub(crate) async fn tx_rw(&self) -> VfsResult<Transaction<DbReadWrite>> {
+        Ok(self.0.db.write().await?)
     }
 }
 
@@ -396,6 +469,12 @@ pub struct RevisionKind;
 pub type Revision = ContentId<RevisionKind>;
 
 pub struct RootKind;
+
+impl AsDbType for RootKind {
+    fn db_type() -> &'static str {
+        "R"
+    }
+}
 
 impl<Mode> RevisionHasher<Vec<EntityKey>, Mode> for RootKind {
     fn hash(inner: &RawEntityInner<Self, Vec<EntityKey>, Mode>) -> Hash {
@@ -435,6 +514,26 @@ impl<T, P> Container<T, P> {
     pub(crate) fn entries(&self) -> &Vec<EntityKey> {
         self.entity.inner()
     }
+
+    fn serialize_entries(&self) -> Vec<u8> {
+        EntityKey::serialize(self.entries())
+    }
+
+    fn deserialize_entries(input: &[u8]) -> Result<Vec<EntityKey>, String> {
+        todo!()
+    }
+
+    pub(super) fn try_from_row(value: EntityRow) -> Result<Entity<T, Vec<EntityKey>>, String> {
+        let entries = Self::deserialize_entries(
+            value
+                .data
+                .as_ref()
+                .ok_or_else(|| "data is missing".to_string())?
+                .as_slice(),
+        )?;
+
+        (value, entries).try_into()
+    }
 }
 
 impl<T, P> ContainerMut<T, P> {
@@ -444,3 +543,256 @@ impl<T, P> ContainerMut<T, P> {
 }
 
 pub type Root = Container<RootKind, ()>;
+
+impl TryFrom<EntityRow> for Entity<RootKind, Vec<EntityKey>> {
+    type Error = String;
+
+    fn try_from(value: EntityRow) -> Result<Self, Self::Error> {
+        if value.entity_type != "R" {
+            return Err(format!(
+                "invalid entity_type; expected 'R' but got '{}'",
+                value.entity_type
+            ));
+        }
+
+        Container::<_, ()>::try_from_row(value)
+    }
+}
+
+pub(crate) type RootDraft = DraftEntity<RootKind, Vec<EntityKey>>;
+
+impl RootDraft {
+    pub(crate) fn new_root_draft() -> Self {
+        let now = Utc::now();
+        let name = Name::from_str("ROOT").unwrap();
+        Self::new(
+            EntityId::generate(),
+            Revision::zeroed(),
+            name,
+            now.clone(),
+            now,
+            vec![],
+            DraftMode,
+        )
+        .into_mut()
+        .freeze()
+    }
+}
+
+impl From<RootDraft> for EntityRow {
+    fn from(value: RootDraft) -> Self {
+        let data = EntityKey::serialize(value.inner());
+        Self::from((value, None::<BlobId>, Some(data)))
+    }
+}
+
+impl<C: TxScope> Transaction<C>
+where
+    Self: DbRead,
+{
+    pub(crate) async fn inode_by_id(
+        &mut self,
+        inode_id: InodeId,
+    ) -> Result<Option<Inode>, DbError> {
+        let id = inode_id.0 as i64;
+        let r = match sqlx::query!(
+            "SELECT inode_type, entity_id, entity_revision, parent FROM vfs WHERE inode_id = ?",
+            id
+        )
+        .fetch_optional(self.conn())
+        .await?
+        {
+            None => return Ok(None),
+            Some(r) => r,
+        };
+
+        let entity_id = EntityId::try_from(r.entity_id.as_slice())
+            .map_err(|e| DataError::ConversionError(e))?;
+
+        let revision = Revision::try_from_bytes(r.entity_revision)
+            .ok_or_else(|| DataError::ConversionError("invalid revision".to_string()))?;
+
+        let parent = r.parent.map(|id| InodeId(id as u64));
+
+        Ok(Some(match r.inode_type.as_str() {
+            "R" => Inode::Root(Root {
+                parent: (),
+                inode_id,
+                entity: self
+                    .entity_by_id_revision(&entity_id, &revision)
+                    .await?
+                    .ok_or_else(|| DataError::EntityNotFound {
+                        entity_id,
+                        revision,
+                    })?,
+            }),
+            "D" => Inode::Directory(Directory {
+                parent: parent
+                    .ok_or_else(|| DataError::ConversionError("parent is missing".to_string()))?,
+                inode_id,
+                entity: self
+                    .entity_by_id_revision(&entity_id, &revision)
+                    .await?
+                    .ok_or_else(|| DataError::EntityNotFound {
+                        entity_id,
+                        revision,
+                    })?,
+            }),
+            "F" => Inode::File(File {
+                parent: parent
+                    .ok_or_else(|| DataError::ConversionError("parent is missing".to_string()))?,
+                inode_id,
+                entity: self
+                    .entity_by_id_revision(&entity_id, &revision)
+                    .await?
+                    .ok_or_else(|| DataError::EntityNotFound {
+                        entity_id,
+                        revision,
+                    })?,
+            }),
+            other => {
+                return Err(DataError::ConversionError(format!(
+                    "unsupported inode_typ: {}",
+                    other
+                )))?;
+            }
+        }))
+    }
+
+    async fn inode_ids_by_parent(
+        &mut self,
+        parent_inode_id: InodeId,
+    ) -> Result<Vec<InodeId>, DbError> {
+        let parent_id = parent_inode_id.0 as i64;
+        Ok(
+            sqlx::query!("SELECT inode_id FROM vfs where parent = ?", parent_id)
+                .fetch_all(self.conn())
+                .await?
+                .into_iter()
+                .map(|r| InodeId(r.inode_id as u64))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+impl<C: TxScope> Transaction<C>
+where
+    Self: DbWrite,
+{
+    async fn delete_inode(&mut self, inode_id: InodeId) -> Result<u64, DbError> {
+        let inode_id = inode_id.0 as i64;
+
+        Ok(sqlx::query!("DELETE FROM vfs WHERE inode_id = ?", inode_id)
+            .execute(self.conn())
+            .await?
+            .rows_affected())
+    }
+
+    pub(super) async fn create_inode<T: AsDbType>(
+        &mut self,
+        name: &Name,
+        parent: InodeId,
+        entity_id: EntityId,
+        entity_revision: &Revision,
+    ) -> Result<InodeId, DbError> {
+        let inode_type = T::db_type();
+        let name = name.as_str();
+        let parent = parent.0 as i64;
+        let entity_id = entity_id.as_bytes().as_slice();
+        let entity_revision = entity_revision.as_slice();
+
+        let id = sqlx::query!(
+            "INSERT INTO vfs (inode_type, entity_id, entity_revision, name, parent) VALUES (?, ?, ?, ?, ?)",
+            inode_type,
+            entity_id,
+            entity_revision,
+            name,
+            parent
+        )
+        .execute(self.conn())
+        .await?
+        .last_insert_rowid();
+
+        Ok(InodeId(id as u64))
+    }
+
+    pub(crate) async fn update_inode(
+        &mut self,
+        inode_id: InodeId,
+        name: &Name,
+        entity_id: EntityId,
+        entity_revision: &Revision,
+    ) -> Result<(), DbError> {
+        let inode_id = inode_id.0 as i64;
+        let name = name.as_str();
+        let entity_id = entity_id.as_bytes().as_slice();
+        let entity_revision = entity_revision.as_slice();
+
+        let rows_affected = sqlx::query!(
+            "UPDATE vfs SET name = ?, entity_id = ?, entity_revision = ?, is_dirty = 0 WHERE inode_id = ?",
+            name,
+            entity_id,
+            entity_revision,
+            inode_id
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if rows_affected != 1 {
+            return Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: rows_affected,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    async fn move_inode(&mut self, inode_id: InodeId, parent_id: InodeId) -> Result<(), DbError> {
+        let inode_id = inode_id.0 as i64;
+        let parent_id = parent_id.0 as i64;
+
+        let rows_affected = sqlx::query!(
+            "UPDATE vfs SET parent = ? WHERE inode_id = ?",
+            parent_id,
+            inode_id
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if rows_affected != 1 {
+            return Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: rows_affected,
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+trait AsDbType {
+    fn db_type() -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::{Db, PageSize};
+    use tempfile::{tempdir, TempDir};
+
+    async fn new_db() -> anyhow::Result<(Db, TempDir)> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("vfs.sqlite");
+        let db = Db::new(path, 10, PageSize::default()).await?;
+        Ok((db, temp_dir))
+    }
+
+    #[tokio::test]
+    async fn bootstrap() -> anyhow::Result<()> {
+        let (db, _temp_dir) = new_db().await?;
+        println!("");
+        Ok(())
+    }
+}

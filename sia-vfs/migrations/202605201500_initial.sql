@@ -250,12 +250,15 @@ CREATE TABLE vfs
                                                                       LENGTH(TRIM(name)) = LENGTH(name) AND
                                                                       name NOT LIKE '%/%'),
     parent          INTEGER CHECK (parent IS NULL OR parent >= 1),
-    path            TEXT                              NOT NULL DEFAULT '__INVALID__',
+    path            TEXT,
+    is_dirty        BOOLEAN                           NOT NULL DEFAULT 0,
 
     FOREIGN KEY (entity_id, entity_revision) REFERENCES entity (id, revision),
     FOREIGN KEY (parent) REFERENCES vfs (inode_id) ON DELETE CASCADE,
     UNIQUE (parent, name)
 );
+
+CREATE INDEX vfs_path_idx ON vfs (path);
 
 -- Ensure the vfs id sequence starts at 1000
 INSERT INTO sqlite_sequence (name, seq)
@@ -267,6 +270,21 @@ CREATE TRIGGER vfs_insert_type_match
     BEFORE INSERT
     ON vfs
     FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type')
+    WHERE NEW.inode_type != (SELECT entity_type
+                             FROM entity
+                             WHERE id = NEW.entity_id
+                               AND revision = NEW.entity_revision);
+END;
+
+-- Ensure VFS inode type matches entity type (on update of entity reference)
+CREATE TRIGGER vfs_update_type_match
+    BEFORE UPDATE OF entity_id, entity_revision
+    ON vfs
+    FOR EACH ROW
+    WHEN OLD.entity_id IS NOT NEW.entity_id
+        OR OLD.entity_revision IS NOT NEW.entity_revision
 BEGIN
     SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type')
     WHERE NEW.inode_type != (SELECT entity_type
@@ -293,6 +311,16 @@ CREATE TRIGGER vfs_root_inode_id_insert
     WHEN (NEW.inode_type = 'R' AND NEW.inode_id != 1) OR (NEW.inode_type != 'R' AND NEW.inode_id = 1)
 BEGIN
     SELECT RAISE(ABORT, 'vfs: root must have inode_id 1');
+END;
+
+-- Ensure root cannot be deleted
+CREATE TRIGGER vfs_root_undeletable
+    BEFORE DELETE
+    ON vfs
+    FOR EACH ROW
+    WHEN OLD.inode_type = 'R'
+BEGIN
+    SELECT RAISE(ABORT, 'vfs: root cannot be deleted');
 END;
 
 -- Ensure only directories or root can be parents, and that only root has no parent (on insert)
@@ -376,18 +404,72 @@ BEGIN
                     AND inode_id = NEW.parent);
 END;
 
--- An inode's path is always updated automatically.
-
--- Mark the inode path for recalculation on insert
-CREATE TRIGGER vfs_update_inode_path_on_insert
+-- Mark the inodes parent as dirty on insert
+CREATE TRIGGER vfs_mark_inode_parent_on_insert
     AFTER INSERT
     ON vfs
     FOR EACH ROW
 BEGIN
     UPDATE vfs
-    SET path = '__RECALCULATE__'
+    SET is_dirty = 1
+    WHERE inode_id = NEW.parent
+      AND inode_id != NEW.inode_id;
+END;
+
+-- Mark the inodes parent as dirty on delete
+CREATE TRIGGER vfs_mark_inode_parent_on_delete
+    AFTER DELETE
+    ON vfs
+    FOR EACH ROW
+BEGIN
+    UPDATE vfs
+    SET is_dirty = 1
+    WHERE inode_id = OLD.parent;
+END;
+
+-- Mark inode as dirty if something significant changes
+CREATE TRIGGER vfs_mark_inode_parent_dirty_on_update
+    AFTER UPDATE OF name, parent, entity_id, entity_revision
+    ON vfs
+    FOR EACH ROW
+    WHEN OLD.name != NEW.name
+        OR OLD.parent IS NULL AND NEW.parent IS NOT NULL
+        OR OLD.parent IS NOT NULL AND NEW.parent IS NULL
+        OR OLD.parent != NEW.parent
+        OR OLD.entity_id != NEW.entity_id
+        OR OLD.entity_revision != NEW.entity_revision
+BEGIN
+    UPDATE vfs
+    SET is_dirty = 1
+    WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
+      AND inode_id != NEW.inode_id;
+END;
+
+-- Recursively mark all dirty inodes
+CREATE TRIGGER vfs_mark_dirty_inodes_on_update_recursive
+    AFTER UPDATE OF is_dirty
+    ON vfs
+    FOR EACH ROW
+    WHEN NEW.is_dirty = 1
+BEGIN
+    UPDATE vfs
+    SET is_dirty = 1
+    WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
+      AND inode_id != NEW.inode_id;
+END;
+
+-- Mark the inode path for recalculation on insert
+CREATE TRIGGER vfs_clear_inode_path_on_insert
+    AFTER INSERT
+    ON vfs
+    FOR EACH ROW
+BEGIN
+    UPDATE vfs
+    SET path = NULL
     WHERE inode_id = NEW.inode_id;
 END;
+
+-- An inode's path is always updated automatically.
 
 -- Mark the inode path for recalculation if name or parent changes
 CREATE TRIGGER vfs_update_inode_path_on_update
@@ -400,7 +482,7 @@ CREATE TRIGGER vfs_update_inode_path_on_update
         OR OLD.parent != NEW.parent
 BEGIN
     UPDATE vfs
-    SET path = '__RECALCULATE__'
+    SET path = NULL
     WHERE inode_id = NEW.inode_id;
 END;
 
@@ -409,25 +491,18 @@ CREATE TRIGGER vfs_update_inode_path_on_update_recursive
     AFTER UPDATE OF path
     ON vfs
     FOR EACH ROW
-    WHEN NEW.path = '__RECALCULATE__'
+    WHEN NEW.path IS NULL
 BEGIN
     UPDATE vfs
-    SET path = (SELECT CASE
-                           WHEN NEW.parent IS NULL THEN '/' ||
-                                                        CASE
-                                                            WHEN NEW.inode_type = 'D' THEN NEW.name || '/'
-                                                            ELSE NEW.name
-                                                            END
-                           ELSE (SELECT path FROM vfs WHERE inode_id = NEW.parent) ||
-                                CASE
-                                    WHEN NEW.inode_type = 'D' THEN NEW.name || '/'
-                                    ELSE NEW.name
-                                    END
-                           END)
+    SET path = CASE
+                   WHEN NEW.inode_type = 'R' THEN '/'
+                   WHEN (SELECT inode_type FROM vfs WHERE inode_id = NEW.parent) = 'R' THEN '/' || NEW.name
+                   ELSE (SELECT path FROM vfs WHERE inode_id = NEW.parent) || '/' || NEW.name
+        END
     WHERE inode_id = NEW.inode_id;
 
     UPDATE vfs
-    SET path = '__RECALCULATE__'
+    SET path = NULL
     WHERE parent = NEW.inode_id
       AND inode_id != NEW.inode_id;
 END;
@@ -544,6 +619,7 @@ CREATE TABLE sync_job
 CREATE TRIGGER single_sync_job_only
     BEFORE INSERT
     ON sync_job
+    FOR EACH ROW
     WHEN (SELECT COUNT(*)
           FROM sync_job) > 0
 BEGIN
@@ -553,6 +629,7 @@ END;
 CREATE TRIGGER sync_job_root_entity_type_insert
     BEFORE INSERT
     ON sync_job
+    FOR EACH ROW
     WHEN (SELECT entity_type
           FROM entity
           WHERE id = NEW.root_entity_id
@@ -577,6 +654,7 @@ END;
 CREATE TRIGGER sync_job_gc
     AFTER DELETE
     ON sync_job
+    FOR EACH ROW
     WHEN (SELECT COUNT(*)
           FROM sync_job) = 0
 BEGIN
