@@ -1,7 +1,7 @@
 CREATE TABLE entity
 (
     id              BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                                     LENGTH(id) = 16),
+                                                     LENGTH(id) = 32),
     ref_count       INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
     name            TEXT             NOT NULL CHECK (LENGTH(name) > 0 AND
                                                      LENGTH(name) <= 255 AND
@@ -12,7 +12,7 @@ CREATE TABLE entity
 
     blob_id         BLOB REFERENCES blob (id),
 
-    entity_type     TEXT             NOT NULL CHECK (entity_type IN ('R', 'D', 'F')),
+    entity_type     TEXT             NOT NULL CHECK (entity_type IN ('D', 'F')),
     mode            TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
     remote_location TEXT,
     data            BLOB,
@@ -236,7 +236,7 @@ END;
 CREATE TABLE vfs
 (
     inode_id   INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL CHECK (inode_id >= 1000 OR inode_id = 1),
-    inode_type TEXT                              NOT NULL CHECK (inode_type IN ('R', 'D', 'F')),
+    inode_type TEXT                              NOT NULL CHECK (inode_type IN ('D', 'F')),
     entity_id  BLOB                              NOT NULL,
     name       TEXT                              NOT NULL CHECK (LENGTH(name) > 0 AND
                                                                  LENGTH(name) <= 255 AND
@@ -248,10 +248,9 @@ CREATE TABLE vfs
 
     FOREIGN KEY (entity_id) REFERENCES entity (id),
     FOREIGN KEY (parent) REFERENCES vfs (inode_id) ON DELETE CASCADE,
-    UNIQUE (parent, name)
+    UNIQUE (parent, name),
+    UNIQUE (path)
 );
-
-CREATE INDEX vfs_path_idx ON vfs (path);
 
 -- Ensure the vfs id sequence starts at 1000
 INSERT INTO sqlite_sequence (name, seq)
@@ -293,14 +292,14 @@ BEGIN
     SELECT RAISE(ABORT, 'vfs: inode_id and inode_type cannot be changed');
 END;
 
--- Ensure root inode_id is 1
-CREATE TRIGGER vfs_root_inode_id_insert
+-- Ensure root inode_type is D
+CREATE TRIGGER vfs_root_inode_type_insert
     BEFORE INSERT
     ON vfs
     FOR EACH ROW
-    WHEN (NEW.inode_type = 'R' AND NEW.inode_id != 1) OR (NEW.inode_type != 'R' AND NEW.inode_id = 1)
+    WHEN NEW.inode_type != 'D' AND NEW.inode_id = 1
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: root must have inode_id 1');
+    SELECT RAISE(ABORT, 'vfs: root inode_type must be D');
 END;
 
 -- Ensure root cannot be deleted
@@ -308,39 +307,39 @@ CREATE TRIGGER vfs_root_undeletable
     BEFORE DELETE
     ON vfs
     FOR EACH ROW
-    WHEN OLD.inode_type = 'R'
+    WHEN OLD.inode_id = 1
 BEGIN
     SELECT RAISE(ABORT, 'vfs: root cannot be deleted');
 END;
 
--- Ensure only directories or root can be parents, and that only root has no parent (on insert)
+-- Ensure only directories can be parents, and that only root has no parent (on insert)
 CREATE TRIGGER vfs_parent_insert
     BEFORE INSERT
     ON vfs
     FOR EACH ROW
-    WHEN (NEW.inode_type = 'R' AND NEW.parent IS NOT NULL)
-        OR (NEW.inode_type != 'R' AND NEW.parent IS NULL)
-        OR (NEW.inode_type != 'R' AND NEW.parent IS NOT NULL AND
+    WHEN (NEW.inode_id = 1 AND NEW.parent IS NOT NULL)
+        OR (NEW.inode_id != 1 AND NEW.parent IS NULL)
+        OR (NEW.inode_id != 1 AND NEW.parent IS NOT NULL AND
             (SELECT inode_type
              FROM vfs
-             WHERE inode_id = NEW.parent) NOT IN ('R', 'D'))
+             WHERE inode_id = NEW.parent) != 'D')
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent of type R or D');
+    SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent directory');
 END;
 
--- Ensure only directories or root can be parents, and that only root has no parent (on update)
+-- Ensure only directories parents, and that only root has no parent (on update)
 CREATE TRIGGER vfs_parent_update
     BEFORE UPDATE
     ON vfs
     FOR EACH ROW
-    WHEN (NEW.inode_type = 'R' AND NEW.parent IS NOT NULL)
-        OR (NEW.inode_type != 'R' AND NEW.parent IS NULL)
-        OR (NEW.inode_type != 'R' AND NEW.parent IS NOT NULL AND
+    WHEN (NEW.inode_id = 1 AND NEW.parent IS NOT NULL)
+        OR (NEW.inode_id != 1 AND NEW.parent IS NULL)
+        OR (NEW.inode_id != 1 AND NEW.parent IS NOT NULL AND
             (SELECT inode_type
              FROM vfs
-             WHERE inode_id = NEW.parent) NOT IN ('R', 'D'))
+             WHERE inode_id = NEW.parent) != 'D')
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent of type R or D');
+    SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent directory');
 END;
 
 -- Prevent an inode from becoming its own parent (on insert)
@@ -484,8 +483,8 @@ CREATE TRIGGER vfs_update_inode_path_on_update_recursive
 BEGIN
     UPDATE vfs
     SET path = CASE
-                   WHEN NEW.inode_type = 'R' THEN '/'
-                   WHEN (SELECT inode_type FROM vfs WHERE inode_id = NEW.parent) = 'R' THEN '/' || NEW.name
+                   WHEN NEW.inode_id = 1 THEN '/'
+                   WHEN NEW.parent = 1 THEN '/' || NEW.name
                    ELSE (SELECT path FROM vfs WHERE inode_id = NEW.parent) || '/' || NEW.name
         END
     WHERE inode_id = NEW.inode_id;
@@ -615,9 +614,9 @@ CREATE TRIGGER sync_job_root_entity_type_insert
     FOR EACH ROW
     WHEN (SELECT entity_type
           FROM entity
-          WHERE id = NEW.root_entity_id) != 'R'
+          WHERE id = NEW.root_entity_id) != 'D'
 BEGIN
-    SELECT RAISE(ABORT, 'sync_job root must reference an entity of type R');
+    SELECT RAISE(ABORT, 'sync_job root must reference an entity of type D');
 END;
 
 CREATE TRIGGER sync_job_immutable
@@ -627,7 +626,7 @@ CREATE TRIGGER sync_job_immutable
     WHEN OLD.created <> NEW.created
         OR OLD.root_entity_id <> NEW.root_entity_id
 BEGIN
-    SELECT RAISE(ABORT, 'sync_job: created, root_entity_id and root_revision are immutable');
+    SELECT RAISE(ABORT, 'sync_job: created and root_entity_id are immutable');
 END;
 
 

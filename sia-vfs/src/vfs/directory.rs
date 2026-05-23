@@ -1,11 +1,10 @@
-use crate::blob::BlobId;
 use crate::db::{Error as DbError, Transaction, TxScope, Write as DbWrite};
 use crate::vfs::entity::{
     DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityRow, Freezable, Normalizer,
     RawEntityInner,
 };
 use crate::vfs::{
-    AsDbType, Container, Inode, InodeId, Name, Read, Vfs, VfsError, VfsResult, Write, hash_entries,
+    AsDbType, Inode, InodeId, InodeMut, Name, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
 };
 use blake3::{Hash, Hasher};
 use chrono::Utc;
@@ -29,18 +28,37 @@ impl<Mode> EntityHasher<Vec<EntityId>, Mode> for DirectoryKind {
     }
 }
 
+fn hash_entries(entries: &Vec<EntityId>, hasher: &mut Hasher) {
+    hasher.update(b"begin_entries:\nno_entries:");
+    hasher.update(&entries.len().to_be_bytes());
+    hasher.update(b"\nentries:");
+    for entry in entries {
+        hasher.update(b"entity_id:");
+        hasher.update(entry.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"\nend_entries");
+}
+
 impl Normalizer<Vec<EntityId>> for DirectoryKind {
     fn normalize(value: &mut Vec<EntityId>) {
         value.sort();
     }
 }
 
-pub type Directory = Container<DirectoryKind, InodeId>;
+pub type Directory = TypedInode<DirectoryKind, Vec<EntityId>>;
 
-type DirectoryDraft = DraftEntity<DirectoryKind, Vec<EntityId>>;
+impl Directory {
+    pub fn is_root(&self) -> bool {
+        self.parent.is_none()
+    }
+}
+
+pub(crate) type DirectoryMut = InodeMut<DirectoryKind, Vec<EntityId>>;
+pub(crate) type DirectoryDraft = DraftEntity<DirectoryKind, Vec<EntityId>>;
 
 impl DirectoryDraft {
-    fn new_directory_draft(name: Name) -> Self {
+    pub fn new_directory_draft(name: Name) -> Self {
         let now = Utc::now();
         Self::new(
             EntityId::zeroed(),
@@ -63,11 +81,7 @@ impl From<DirectoryDraft> for EntityRow {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn create_dir<M, T: EntityHasher<Vec<EntityId>, M>, P>(
-        &self,
-        parent: &Container<T, P>,
-        name: Name,
-    ) -> VfsResult<Directory> {
+    pub async fn create_dir(&self, parent: &Directory, name: Name) -> VfsResult<Directory> {
         let mut tx = self.tx_rw().await?;
         let inode_id = tx.create_dir(name, parent.inode_id()).await?;
         let dir = match tx.inode_by_id(inode_id).await? {
@@ -95,7 +109,9 @@ impl TryFrom<EntityRow> for Entity<DirectoryKind, Vec<EntityId>> {
             ));
         }
 
-        Container::<_, ()>::try_from_row(value)
+        //todo: deserialize entries
+        todo!()
+        //(value, entries).try_into()
     }
 }
 

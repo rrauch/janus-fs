@@ -251,10 +251,10 @@ impl<T: EntityHasher<I, DraftMode> + Normalizer<I>, I> Freezable<T, I> for Entit
     }
 }
 
-pub(crate) struct EntityKind;
-pub(crate) type EntityId = ContentId<EntityKind>;
+pub struct EntityKind;
+pub type EntityId = ContentId<EntityKind>;
 
-pub trait EntityHasher<I, Mode>: Sized {
+pub(crate) trait EntityHasher<I, Mode>: Sized {
     fn hash(inner: &RawEntityInner<Self, I, Mode>) -> blake3::Hash;
 }
 
@@ -301,7 +301,7 @@ where
             .transpose()?
             .map(|e| {
                 e.try_into()
-                    .map_err(|e| DataError::ConversionError("invalid row".into()))
+                    .map_err(|_| DataError::ConversionError("invalid row".into()))
             })
             .transpose()?)
     }
