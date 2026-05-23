@@ -88,12 +88,7 @@ impl TryFrom<EntityRow> for Entity<FileKind, BlobInfo> {
             ));
         }
 
-        let blob_id = value
-            .blob_id
-            .as_ref()
-            .ok_or_else(|| "blob_id is missing".to_string())?;
-
-        let blob_info = BlobInfo::deserialize(
+        /*let blob_info = BlobInfo::deserialize(
             value
                 .data
                 .as_ref()
@@ -108,7 +103,9 @@ impl TryFrom<EntityRow> for Entity<FileKind, BlobInfo> {
             ));
         }
 
-        (value, blob_info).try_into()
+        (value, blob_info).try_into()*/
+
+        todo!()
     }
 }
 

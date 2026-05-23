@@ -10,18 +10,10 @@ CREATE TABLE entity
     created         TIMESTAMP        NOT NULL,
     last_modified   TIMESTAMP        NOT NULL,
 
-    blob_id         BLOB REFERENCES blob (id),
-
     entity_type     TEXT             NOT NULL CHECK (entity_type IN ('D', 'F')),
     mode            TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
     remote_location TEXT,
     data            BLOB,
-
-    -- Make sure Files (and only Files) have a blob_id
-    CHECK (
-        (entity_type = 'F' AND blob_id IS NOT NULL) OR
-        (entity_type != 'F' AND blob_id IS NULL)
-        ),
 
     -- Make sure synced entities have a remote_location
     CHECK (
@@ -30,7 +22,6 @@ CREATE TABLE entity
         )
 );
 
-CREATE INDEX entity_blob_id_idx ON entity (blob_id);
 CREATE INDEX entity_mode_idx ON entity (mode);
 
 -- allows only mode transition or change of ref_count
@@ -41,7 +32,6 @@ CREATE TRIGGER entity_update_only_local_to_synced_or_refcount
     WHEN OLD.mode IS NOT NEW.mode
         OR OLD.remote_location IS NOT NEW.remote_location
         OR OLD.data IS NOT NEW.data
-        OR OLD.blob_id IS NOT NEW.blob_id
         OR OLD.id IS NOT NEW.id
         OR OLD.name IS NOT NEW.name
         OR OLD.created IS NOT NEW.created
@@ -58,7 +48,6 @@ BEGIN
             AND OLD.created = NEW.created
             AND OLD.last_modified = NEW.last_modified
             AND OLD.entity_type = NEW.entity_type
-            AND OLD.blob_id IS NEW.blob_id
             AND OLD.data IS NEW.data
         );
 END;
@@ -74,25 +63,65 @@ BEGIN
     DELETE FROM entity WHERE id = NEW.id;
 END;
 
--- blob ref_count
+
+CREATE TABLE entity_references
+(
+    entity_id     BLOB NOT NULL REFERENCES entity (id) ON DELETE CASCADE,
+    ref_type      TEXT NOT NULL CHECK (ref_type IN ('E', 'B')),
+    target_entity BLOB REFERENCES entity (id),
+    target_blob   BLOB REFERENCES blob (id),
+
+    CHECK (
+        (ref_type = 'E' AND target_entity IS NOT NULL AND target_blob IS NULL) OR
+        (ref_type = 'B' AND target_entity IS NULL AND target_blob IS NOT NULL)
+        )
+);
+
+CREATE TRIGGER entity_references_no_update
+    BEFORE UPDATE
+    ON entity_references
+    FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'entity_references: updates are not allowed');
+END;
+
+-- entity-blob ref_count
 CREATE TRIGGER entity_insert_blob_refcount
     AFTER INSERT
-    ON entity
+    ON entity_references
     FOR EACH ROW
-    WHEN NEW.blob_id IS NOT NULL
+    WHEN NEW.target_blob IS NOT NULL
 BEGIN
-    UPDATE blob SET ref_count = ref_count + 1 WHERE id = NEW.blob_id;
+    UPDATE blob SET ref_count = ref_count + 1 WHERE id = NEW.target_blob;
 END;
 
 CREATE TRIGGER entity_delete_blob_refcount
     AFTER DELETE
-    ON entity
+    ON entity_references
     FOR EACH ROW
-    WHEN OLD.blob_id IS NOT NULL
+    WHEN OLD.target_blob IS NOT NULL
 BEGIN
-    UPDATE blob SET ref_count = ref_count - 1 WHERE id = OLD.blob_id;
+    UPDATE blob SET ref_count = ref_count - 1 WHERE id = OLD.target_blob;
 END;
 
+-- entity-entity ref_count
+CREATE TRIGGER entity_insert_entity_refcount
+    AFTER INSERT
+    ON entity_references
+    FOR EACH ROW
+    WHEN NEW.target_entity IS NOT NULL
+BEGIN
+    UPDATE entity SET ref_count = ref_count + 1 WHERE id = NEW.target_entity;
+END;
+
+CREATE TRIGGER entity_delete_entity_refcount
+    AFTER DELETE
+    ON entity_references
+    FOR EACH ROW
+    WHEN OLD.target_entity IS NOT NULL
+BEGIN
+    UPDATE entity SET ref_count = ref_count - 1 WHERE id = OLD.target_entity;
+END;
 
 CREATE TABLE blob
 (
@@ -251,6 +280,9 @@ CREATE TABLE vfs
     UNIQUE (parent, name),
     UNIQUE (path)
 );
+
+CREATE INDEX vfs_parent_idx ON vfs (parent);
+CREATE INDEX vfs_is_dirty_idx ON vfs (is_dirty) WHERE is_dirty = 1;
 
 -- Ensure the vfs id sequence starts at 1000
 INSERT INTO sqlite_sequence (name, seq)
@@ -422,8 +454,8 @@ CREATE TRIGGER vfs_mark_inode_parent_dirty_on_update
     ON vfs
     FOR EACH ROW
     WHEN OLD.name != NEW.name
-        OR OLD.parent IS NULL AND NEW.parent IS NOT NULL
-        OR OLD.parent IS NOT NULL AND NEW.parent IS NULL
+        OR (OLD.parent IS NULL AND NEW.parent IS NOT NULL)
+        OR (OLD.parent IS NOT NULL AND NEW.parent IS NULL)
         OR OLD.parent != NEW.parent
         OR OLD.entity_id != NEW.entity_id
 BEGIN
@@ -433,17 +465,18 @@ BEGIN
       AND inode_id != NEW.inode_id;
 END;
 
--- Recursively mark all dirty inodes
+-- Recursively mark all dirty inodes where necessary
 CREATE TRIGGER vfs_mark_dirty_inodes_on_update_recursive
     AFTER UPDATE OF is_dirty
     ON vfs
     FOR EACH ROW
-    WHEN NEW.is_dirty = 1
+    WHEN NEW.is_dirty = 1 AND OLD.is_dirty != 1
 BEGIN
     UPDATE vfs
     SET is_dirty = 1
     WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
-      AND inode_id != NEW.inode_id;
+      AND inode_id != NEW.inode_id
+      AND is_dirty != 1;
 END;
 
 -- Mark the inode path for recalculation on insert
@@ -465,8 +498,8 @@ CREATE TRIGGER vfs_update_inode_path_on_update
     ON vfs
     FOR EACH ROW
     WHEN OLD.name != NEW.name
-        OR OLD.parent IS NULL AND NEW.parent IS NOT NULL
-        OR OLD.parent IS NOT NULL AND NEW.parent IS NULL
+        OR (OLD.parent IS NULL AND NEW.parent IS NOT NULL)
+        OR (OLD.parent IS NOT NULL AND NEW.parent IS NULL)
         OR OLD.parent != NEW.parent
 BEGIN
     UPDATE vfs

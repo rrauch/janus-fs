@@ -1,7 +1,7 @@
 use crate::db::{Error as DbError, Transaction, TxScope, Write as DbWrite};
 use crate::vfs::entity::{
-    DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityRow, Freezable, Normalizer,
-    RawEntityInner,
+    DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityRef, EntityRow, Freezable,
+    Normalizer, RawEntityInner,
 };
 use crate::vfs::{
     AsDbType, Inode, InodeId, InodeMut, Name, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
@@ -73,7 +73,7 @@ impl DirectoryDraft {
     }
 }
 
-impl From<DirectoryDraft> for EntityRow {
+impl From<DirectoryDraft> for (EntityRow, Vec<EntityRef>) {
     fn from(value: DirectoryDraft) -> Self {
         //Self::from((value, None::<BlobId>, Some(data)))
         todo!()

@@ -276,7 +276,7 @@ where
         let id_ref = id.as_bytes().as_slice();
 
         Ok(sqlx::query!(
-            "SELECT name, created as \"created: i64\", last_modified as \"last_modified: i64\", mode, entity_type, blob_id, remote_location, data FROM entity WHERE id = ?",
+            "SELECT name, created as \"created: i64\", last_modified as \"last_modified: i64\", mode, entity_type, remote_location, data FROM entity WHERE id = ?",
             id_ref,
         )
             .fetch_optional(self.conn())
@@ -293,7 +293,6 @@ where
                         other => return Err(DataError::ConversionError(format!("invalid mode: {}", other).into()))?,
                     },
                     entity_type: r.entity_type.into(),
-                    blob_id: r.blob_id.map(|b| BlobId::try_from_bytes(b).ok_or_else(|| DataError::ConversionError("invalid blob_id".into()))).transpose()?,
                     remote_location: r.remote_location,
                     data: r.data,
                 })
@@ -314,9 +313,13 @@ pub(crate) struct EntityRow {
     pub last_modified: DateTime<Utc>,
     pub mode: Mode,
     pub entity_type: Cow<'static, str>,
-    pub blob_id: Option<BlobId>,
     pub remote_location: Option<String>,
     pub data: Option<Vec<u8>>,
+}
+
+pub(crate) enum EntityRef {
+    Blob(BlobId),
+    Entity(EntityId),
 }
 
 pub(super) enum Mode {
@@ -324,10 +327,8 @@ pub(super) enum Mode {
     Local,
 }
 
-impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<BlobId>, Option<Vec<u8>>)>
-    for EntityRow
-{
-    fn from((entity, blob_id, data): (DraftEntity<T, I>, Option<BlobId>, Option<Vec<u8>>)) -> Self {
+impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<Vec<u8>>)> for EntityRow {
+    fn from((entity, data): (DraftEntity<T, I>, Option<Vec<u8>>)) -> Self {
         let id = entity.entity_id().clone();
         let value = entity.into_inner();
 
@@ -338,7 +339,6 @@ impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<BlobId>, Option<Vec<
             last_modified: value.last_modified,
             mode: Mode::Local,
             entity_type: T::db_type().into(),
-            blob_id,
             remote_location: None,
             data,
         }
@@ -384,7 +384,7 @@ where
         draft_entity: DraftEntity<T, I>,
     ) -> Result<EntityId, DbError>
     where
-        EntityRow: From<DraftEntity<T, I>>,
+        (EntityRow, Vec<EntityRef>): From<DraftEntity<T, I>>,
     {
         let id = draft_entity.entity_id();
         let id_slice = id.as_bytes().as_slice();
@@ -402,13 +402,12 @@ where
 
         // entity does not exist yet, creating from scratch
 
-        let row = EntityRow::from(draft_entity);
+        let (row, refs): (EntityRow, Vec<EntityRef>) = draft_entity.into();
 
         let id = row.id.as_bytes().as_slice();
         let name = row.name.as_str();
         let created = row.created.timestamp();
         let last_modified = row.last_modified.timestamp();
-        let blob_id = row.blob_id.as_ref().map(|id| id.as_slice());
         let entity_type = row.entity_type.as_ref();
         let mode = match row.mode {
             Mode::Local => "L",
@@ -418,17 +417,31 @@ where
         let data = row.data.as_ref().map(|d| d.as_slice());
 
         sqlx::query!(
-            "INSERT INTO entity (id, name, created, last_modified, blob_id, entity_type, mode, remote_location, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO entity (id, name, created, last_modified, entity_type, mode, remote_location, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             id,
             name,
             created,
             last_modified,
-            blob_id,
             entity_type,
             mode,
             remote_location,
             data,
         ).execute(self.conn()).await?;
+
+        for entity_ref in refs {
+            let id = row.id.as_slice();
+            let (ref_type, target_entity, target_blob) = match &entity_ref {
+                EntityRef::Blob(blob_id) => ("B", None, Some(blob_id.as_slice())),
+                EntityRef::Entity(entity_id) => ("E", Some(entity_id.as_slice()), None),
+            };
+            sqlx::query!(
+                "INSERT INTO entity_references (entity_id, ref_type, target_entity, target_blob) VALUES (?, ?, ?, ?)",
+                id,
+                ref_type,
+                target_entity,
+                target_blob,
+            ).execute(self.conn()).await?;
+        }
 
         Ok(row.id)
     }

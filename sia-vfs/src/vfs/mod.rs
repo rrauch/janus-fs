@@ -10,7 +10,8 @@ use crate::db::{
 };
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    DraftEntity, Entity, EntityHasher, EntityId, EntityMut, EntityRow, Freezable, Normalizer,
+    DraftEntity, Entity, EntityHasher, EntityId, EntityMut, EntityRef, EntityRow, Freezable,
+    Normalizer,
 };
 use crate::vfs::file::File;
 use chrono::{DateTime, Utc};
@@ -373,7 +374,7 @@ impl<Mode: Read + Write> Vfs<Mode> {
     pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<Inode>
     where
         EntityMut<T, I>: Freezable<T, I>,
-        EntityRow: From<DraftEntity<T, I>>,
+        (EntityRow, Vec<EntityRef>): From<DraftEntity<T, I>>,
     {
         let inode_id = modified_inode.inode_id;
         let name = modified_inode.name().clone();
