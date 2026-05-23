@@ -3,7 +3,6 @@ pub mod entity;
 pub mod file;
 pub mod path;
 
-use crate::ContentId;
 use crate::blob::BlobId;
 use crate::db::{
     DataError, Db, Error as DbError, Read as DbRead, ReadOnly as DbReadOnly,
@@ -11,8 +10,8 @@ use crate::db::{
 };
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    DraftEntity, DraftMode, Entity, EntityId, EntityKey, EntityMut, EntityRow, Freezable,
-    Normalizer, RawEntityInner, RevisionHasher,
+    DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityMut, EntityRow, Freezable,
+    Normalizer, RawEntityInner,
 };
 use crate::vfs::file::File;
 use blake3::Hash;
@@ -392,9 +391,8 @@ impl<Mode: Read + Write> Vfs<Mode> {
         let name = modified_inode.name().clone();
         let draft_entity = modified_inode.freeze();
         let mut tx = self.tx_rw().await?;
-        let (entity_id, entity_revision) = tx.create_entity_if_not_exist(draft_entity).await?;
-        tx.update_inode(inode_id, &name, entity_id, &entity_revision)
-            .await?;
+        let entity_id = tx.create_entity_if_not_exist(draft_entity).await?;
+        tx.update_inode(inode_id, &name, &entity_id).await?;
         let inode = tx
             .inode_by_id(inode_id)
             .await?
@@ -465,9 +463,6 @@ fn check_valid_filename(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-pub struct RevisionKind;
-pub type Revision = ContentId<RevisionKind>;
-
 pub struct RootKind;
 
 impl AsDbType for RootKind {
@@ -476,8 +471,8 @@ impl AsDbType for RootKind {
     }
 }
 
-impl<Mode> RevisionHasher<Vec<EntityKey>, Mode> for RootKind {
-    fn hash(inner: &RawEntityInner<Self, Vec<EntityKey>, Mode>) -> Hash {
+impl<Mode> EntityHasher<Vec<EntityId>, Mode> for RootKind {
+    fn hash(inner: &RawEntityInner<Self, Vec<EntityId>, Mode>) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[root_revision]");
         hasher.update(b"begin:\n");
         inner.hash_metadata(&mut hasher);
@@ -487,43 +482,41 @@ impl<Mode> RevisionHasher<Vec<EntityKey>, Mode> for RootKind {
     }
 }
 
-impl Normalizer<Vec<EntityKey>> for RootKind {
-    fn normalize(value: &mut Vec<EntityKey>) {
+impl Normalizer<Vec<EntityId>> for RootKind {
+    fn normalize(value: &mut Vec<EntityId>) {
         value.sort();
     }
 }
 
-fn hash_entries(entries: &Vec<EntityKey>, hasher: &mut blake3::Hasher) {
+fn hash_entries(entries: &Vec<EntityId>, hasher: &mut blake3::Hasher) {
     hasher.update(b"begin_entries:\nno_entries:");
     hasher.update(&entries.len().to_be_bytes());
     hasher.update(b"\nentries:");
     for entry in entries {
         hasher.update(b"entity_id:");
-        hasher.update(entry.entity_id.as_bytes());
-        hasher.update(b"\nrevision:");
-        hasher.update(entry.revision.as_ref());
+        hasher.update(entry.as_bytes());
         hasher.update(b"\n");
     }
     hasher.update(b"\nend_entries");
 }
 
-pub type Container<T, P> = TypedInode<T, Vec<EntityKey>, P>;
-pub type ContainerMut<T, P> = InodeMut<T, Vec<EntityKey>, P>;
+pub type Container<T, P> = TypedInode<T, Vec<EntityId>, P>;
+pub type ContainerMut<T, P> = InodeMut<T, Vec<EntityId>, P>;
 
 impl<T, P> Container<T, P> {
-    pub(crate) fn entries(&self) -> &Vec<EntityKey> {
+    pub(crate) fn entries(&self) -> &Vec<EntityId> {
         self.entity.inner()
     }
 
     fn serialize_entries(&self) -> Vec<u8> {
-        EntityKey::serialize(self.entries())
-    }
-
-    fn deserialize_entries(input: &[u8]) -> Result<Vec<EntityKey>, String> {
         todo!()
     }
 
-    pub(super) fn try_from_row(value: EntityRow) -> Result<Entity<T, Vec<EntityKey>>, String> {
+    fn deserialize_entries(input: &[u8]) -> Result<Vec<EntityId>, String> {
+        todo!()
+    }
+
+    pub(super) fn try_from_row(value: EntityRow) -> Result<Entity<T, Vec<EntityId>>, String> {
         let entries = Self::deserialize_entries(
             value
                 .data
@@ -537,14 +530,14 @@ impl<T, P> Container<T, P> {
 }
 
 impl<T, P> ContainerMut<T, P> {
-    fn entries_mut(&mut self) -> &mut Vec<EntityKey> {
+    fn entries_mut(&mut self) -> &mut Vec<EntityId> {
         self.inner_mut()
     }
 }
 
 pub type Root = Container<RootKind, ()>;
 
-impl TryFrom<EntityRow> for Entity<RootKind, Vec<EntityKey>> {
+impl TryFrom<EntityRow> for Entity<RootKind, Vec<EntityId>> {
     type Error = String;
 
     fn try_from(value: EntityRow) -> Result<Self, Self::Error> {
@@ -559,15 +552,14 @@ impl TryFrom<EntityRow> for Entity<RootKind, Vec<EntityKey>> {
     }
 }
 
-pub(crate) type RootDraft = DraftEntity<RootKind, Vec<EntityKey>>;
+pub(crate) type RootDraft = DraftEntity<RootKind, Vec<EntityId>>;
 
 impl RootDraft {
     pub(crate) fn new_root_draft() -> Self {
         let now = Utc::now();
         let name = Name::from_str("ROOT").unwrap();
         Self::new(
-            EntityId::generate(),
-            Revision::zeroed(),
+            EntityId::zeroed(),
             name,
             now.clone(),
             now,
@@ -581,8 +573,8 @@ impl RootDraft {
 
 impl From<RootDraft> for EntityRow {
     fn from(value: RootDraft) -> Self {
-        let data = EntityKey::serialize(value.inner());
-        Self::from((value, None::<BlobId>, Some(data)))
+        todo!()
+        //Self::from((value, None::<BlobId>, Some(data)))
     }
 }
 
@@ -596,7 +588,7 @@ where
     ) -> Result<Option<Inode>, DbError> {
         let id = inode_id.0 as i64;
         let r = match sqlx::query!(
-            "SELECT inode_type, entity_id, entity_revision, parent FROM vfs WHERE inode_id = ?",
+            "SELECT inode_type, entity_id, parent FROM vfs WHERE inode_id = ?",
             id
         )
         .fetch_optional(self.conn())
@@ -606,11 +598,8 @@ where
             Some(r) => r,
         };
 
-        let entity_id = EntityId::try_from(r.entity_id.as_slice())
-            .map_err(|e| DataError::ConversionError(e))?;
-
-        let revision = Revision::try_from_bytes(r.entity_revision)
-            .ok_or_else(|| DataError::ConversionError("invalid revision".to_string()))?;
+        let entity_id = EntityId::try_from_bytes(r.entity_id)
+            .ok_or_else(|| DataError::ConversionError("Invalid entity id".into()))?;
 
         let parent = r.parent.map(|id| InodeId(id as u64));
 
@@ -619,42 +608,32 @@ where
                 parent: (),
                 inode_id,
                 entity: self
-                    .entity_by_id_revision(&entity_id, &revision)
+                    .entity_by_id(&entity_id)
                     .await?
-                    .ok_or_else(|| DataError::EntityNotFound {
-                        entity_id,
-                        revision,
-                    })?,
+                    .ok_or_else(|| DataError::EntityNotFound(entity_id))?,
             }),
             "D" => Inode::Directory(Directory {
                 parent: parent
-                    .ok_or_else(|| DataError::ConversionError("parent is missing".to_string()))?,
+                    .ok_or_else(|| DataError::ConversionError("parent is missing".into()))?,
                 inode_id,
                 entity: self
-                    .entity_by_id_revision(&entity_id, &revision)
+                    .entity_by_id(&entity_id)
                     .await?
-                    .ok_or_else(|| DataError::EntityNotFound {
-                        entity_id,
-                        revision,
-                    })?,
+                    .ok_or_else(|| DataError::EntityNotFound(entity_id))?,
             }),
             "F" => Inode::File(File {
                 parent: parent
-                    .ok_or_else(|| DataError::ConversionError("parent is missing".to_string()))?,
+                    .ok_or_else(|| DataError::ConversionError("parent is missing".into()))?,
                 inode_id,
                 entity: self
-                    .entity_by_id_revision(&entity_id, &revision)
+                    .entity_by_id(&entity_id)
                     .await?
-                    .ok_or_else(|| DataError::EntityNotFound {
-                        entity_id,
-                        revision,
-                    })?,
+                    .ok_or_else(|| DataError::EntityNotFound(entity_id))?,
             }),
             other => {
-                return Err(DataError::ConversionError(format!(
-                    "unsupported inode_typ: {}",
-                    other
-                )))?;
+                return Err(DataError::ConversionError(
+                    format!("unsupported inode_typ: {}", other).into(),
+                ))?;
             }
         }))
     }
@@ -693,19 +672,16 @@ where
         name: &Name,
         parent: InodeId,
         entity_id: EntityId,
-        entity_revision: &Revision,
     ) -> Result<InodeId, DbError> {
         let inode_type = T::db_type();
         let name = name.as_str();
         let parent = parent.0 as i64;
         let entity_id = entity_id.as_bytes().as_slice();
-        let entity_revision = entity_revision.as_slice();
 
         let id = sqlx::query!(
-            "INSERT INTO vfs (inode_type, entity_id, entity_revision, name, parent) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO vfs (inode_type, entity_id, name, parent) VALUES (?, ?, ?, ?)",
             inode_type,
             entity_id,
-            entity_revision,
             name,
             parent
         )
@@ -720,19 +696,16 @@ where
         &mut self,
         inode_id: InodeId,
         name: &Name,
-        entity_id: EntityId,
-        entity_revision: &Revision,
+        entity_id: &EntityId,
     ) -> Result<(), DbError> {
         let inode_id = inode_id.0 as i64;
         let name = name.as_str();
         let entity_id = entity_id.as_bytes().as_slice();
-        let entity_revision = entity_revision.as_slice();
 
         let rows_affected = sqlx::query!(
-            "UPDATE vfs SET name = ?, entity_id = ?, entity_revision = ?, is_dirty = 0 WHERE inode_id = ?",
+            "UPDATE vfs SET name = ?, entity_id = ?, is_dirty = 0 WHERE inode_id = ?",
             name,
             entity_id,
-            entity_revision,
             inode_id
         )
         .execute(self.conn())
@@ -780,7 +753,7 @@ trait AsDbType {
 #[cfg(test)]
 mod tests {
     use crate::db::{Db, PageSize};
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     async fn new_db() -> anyhow::Result<(Db, TempDir)> {
         let temp_dir = tempdir()?;

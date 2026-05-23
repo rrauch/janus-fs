@@ -142,10 +142,9 @@ where
             .fetch_optional(self.conn())
             .await?
             .map(|r| -> Result<InodeId, DbError> {
-                Ok(InodeId::new(
-                    u64::try_from(r.inode_id)
-                        .map_err(|e| DataError::ConversionError(e.to_string()))?,
-                ))
+                Ok(InodeId::new(u64::try_from(r.inode_id).map_err(|e| {
+                    DataError::ConversionError(e.to_string().into())
+                })?))
             })
             .transpose()
     }

@@ -1,11 +1,12 @@
-use crate::vfs::entity::{DraftEntity, EntityId, EntityKey, EntityMut, EntityRow, Freezable};
-use crate::vfs::{ContainerMut, Inode, InodeId, Revision, RootDraft, RootKind};
+use crate::vfs::entity::{DraftEntity, EntityId, EntityMut, EntityRow, Freezable};
+use crate::vfs::{ContainerMut, Inode, InodeId, RootDraft};
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Connection, Error as SqlxError};
 use sqlx::{Pool, Transaction as SqlxTransaction};
 use sqlx::{Sqlite, SqliteConnection};
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -35,12 +36,9 @@ pub enum DbStateError {
 #[derive(Error, Debug)]
 pub enum DataError {
     #[error("conversion failed: {0}")]
-    ConversionError(String),
-    #[error("entity not found: {entity_id} @ {revision}")]
-    EntityNotFound {
-        entity_id: EntityId,
-        revision: Revision,
-    },
+    ConversionError(Cow<'static, str>),
+    #[error("entity not found: {0}")]
+    EntityNotFound(EntityId),
     #[error("inode {0} not found")]
     InodeNotFound(InodeId),
     #[error("wrong number of rows affected: {actual} != {expected}")]
@@ -127,55 +125,47 @@ impl Transaction<ReadWrite> {
     }
 
     async fn process_dirty_inode(&mut self, inode_id: InodeId) -> Result<(), Error> {
-        let (name, entity_id, revision) = match self
+        let (name, entity_id) = match self
             .inode_by_id(inode_id)
             .await?
             .ok_or_else(|| DataError::InodeNotFound(inode_id))?
         {
             Inode::Root(root) => {
                 let name = root.name().clone();
-                let (entity_id, revision) = self.update_container(root.into_mut()).await?;
-                (name, entity_id, revision)
+                let entity_id = self.update_container(root.into_mut()).await?;
+                (name, entity_id)
             }
             Inode::Directory(dir) => {
                 let name = dir.name().clone();
-                let (entity_id, revision) = self.update_container(dir.into_mut()).await?;
-                (name, entity_id, revision)
+                let entity_id = self.update_container(dir.into_mut()).await?;
+                (name, entity_id)
             }
             Inode::File(_) => {
                 return Err(DataError::DirtyFile(inode_id))?;
             }
         };
-        self.update_inode(inode_id, &name, entity_id, &revision)
-            .await?;
+        self.update_inode(inode_id, &name, &entity_id).await?;
         Ok(())
     }
 
     async fn update_container<T, P>(
         &mut self,
         mut container: ContainerMut<T, P>,
-    ) -> Result<(EntityId, Revision), Error>
+    ) -> Result<EntityId, Error>
     where
-        EntityMut<T, Vec<EntityKey>>: Freezable<T, Vec<EntityKey>>,
-        EntityRow: From<DraftEntity<T, Vec<EntityKey>>>,
+        EntityMut<T, Vec<EntityId>>: Freezable<T, Vec<EntityId>>,
+        EntityRow: From<DraftEntity<T, Vec<EntityId>>>,
     {
         let parent_id = *container.inode_id().deref() as i64;
-        let entries = sqlx::query!(
-            "SELECT entity_id, entity_revision FROM vfs WHERE parent = ?",
-            parent_id
-        )
-        .fetch_all(self.conn())
-        .await?
-        .into_iter()
-        .map(|r| -> Result<EntityKey, Error> {
-            Ok(EntityKey::new(
-                EntityId::try_from(r.entity_id.as_slice()).map_err(DataError::ConversionError)?,
-                Revision::try_from_bytes(r.entity_revision).ok_or_else(|| {
-                    DataError::ConversionError("invalid revision bytes".to_string())
-                })?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let entries = sqlx::query!("SELECT entity_id FROM vfs WHERE parent = ?", parent_id)
+            .fetch_all(self.conn())
+            .await?
+            .into_iter()
+            .map(|r| -> Result<EntityId, Error> {
+                Ok(EntityId::try_from_bytes(r.entity_id)
+                    .ok_or_else(|| DataError::ConversionError("invalid entity id".into()))?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         container.set_inner(entries);
         self.create_entity_if_not_exist(container.freeze()).await
     }
@@ -205,13 +195,18 @@ impl Transaction<ReadWrite> {
             // empty vfs, create new root
             let root = RootDraft::new_root_draft();
             let name = root.name().clone();
-            let (entity_id, revision) = self.create_entity_if_not_exist(root).await?;
+            let entity_id = self.create_entity_if_not_exist(root).await?;
 
-            let entity_id = entity_id.as_bytes().as_slice();
-            let revision = revision.as_slice();
+            let entity_id = entity_id.as_slice();
             let name = name.as_str();
 
-            sqlx::query!("INSERT INTO vfs (inode_id, inode_type, entity_id, entity_revision, name) VALUES (1, 'R', ?, ?, ?)", entity_id, revision, name).execute(self.conn()).await?;
+            sqlx::query!(
+                "INSERT INTO vfs (inode_id, inode_type, entity_id, name) VALUES (1, 'R', ?, ?)",
+                entity_id,
+                name
+            )
+            .execute(self.conn())
+            .await?;
         }
         Ok(())
     }

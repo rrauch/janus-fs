@@ -1,25 +1,21 @@
 CREATE TABLE entity
 (
-    id              BLOB      NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                              LENGTH(id) = 16),
-    revision        BLOB      NOT NULL CHECK (TYPEOF(revision) = 'blob' AND
-                                              LENGTH(revision) = 32),
-    ref_count       INTEGER   NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
-    name            TEXT      NOT NULL CHECK (LENGTH(name) > 0 AND
-                                              LENGTH(name) <= 255 AND
-                                              LENGTH(TRIM(name)) = LENGTH(name) AND
-                                              name NOT LIKE '%/%'),
-    created         TIMESTAMP NOT NULL,
-    last_modified   TIMESTAMP NOT NULL,
+    id              BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                                     LENGTH(id) = 16),
+    ref_count       INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    name            TEXT             NOT NULL CHECK (LENGTH(name) > 0 AND
+                                                     LENGTH(name) <= 255 AND
+                                                     LENGTH(TRIM(name)) = LENGTH(name) AND
+                                                     name NOT LIKE '%/%'),
+    created         TIMESTAMP        NOT NULL,
+    last_modified   TIMESTAMP        NOT NULL,
 
     blob_id         BLOB REFERENCES blob (id),
 
-    entity_type     TEXT      NOT NULL CHECK (entity_type IN ('R', 'D', 'F')),
-    mode            TEXT      NOT NULL CHECK (mode IN ('S', 'L')),
+    entity_type     TEXT             NOT NULL CHECK (entity_type IN ('R', 'D', 'F')),
+    mode            TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
     remote_location TEXT,
     data            BLOB,
-
-    PRIMARY KEY (id, revision),
 
     -- Make sure Files (and only Files) have a blob_id
     CHECK (
@@ -47,7 +43,6 @@ CREATE TRIGGER entity_update_only_local_to_synced_or_refcount
         OR OLD.data IS NOT NEW.data
         OR OLD.blob_id IS NOT NEW.blob_id
         OR OLD.id IS NOT NEW.id
-        OR OLD.revision IS NOT NEW.revision
         OR OLD.name IS NOT NEW.name
         OR OLD.created IS NOT NEW.created
         OR OLD.last_modified IS NOT NEW.last_modified
@@ -59,7 +54,6 @@ BEGIN
             AND OLD.remote_location IS NULL
             AND NEW.remote_location IS NOT NULL
             AND OLD.id = NEW.id
-            AND OLD.revision = NEW.revision
             AND OLD.name = NEW.name
             AND OLD.created = NEW.created
             AND OLD.last_modified = NEW.last_modified
@@ -77,7 +71,7 @@ CREATE TRIGGER entity_gc_on_local_zero_refcount
     WHEN NEW.ref_count = 0
         AND NEW.mode = 'L'
 BEGIN
-    DELETE FROM entity WHERE id = NEW.id AND revision = NEW.revision;
+    DELETE FROM entity WHERE id = NEW.id;
 END;
 
 -- blob ref_count
@@ -241,19 +235,18 @@ END;
 
 CREATE TABLE vfs
 (
-    inode_id        INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL CHECK (inode_id >= 1000 OR inode_id = 1),
-    inode_type      TEXT                              NOT NULL CHECK (inode_type IN ('R', 'D', 'F')),
-    entity_id       BLOB                              NOT NULL,
-    entity_revision BLOB                              NOT NULL,
-    name            TEXT                              NOT NULL CHECK (LENGTH(name) > 0 AND
-                                                                      LENGTH(name) <= 255 AND
-                                                                      LENGTH(TRIM(name)) = LENGTH(name) AND
-                                                                      name NOT LIKE '%/%'),
-    parent          INTEGER CHECK (parent IS NULL OR parent >= 1),
-    path            TEXT,
-    is_dirty        BOOLEAN                           NOT NULL DEFAULT 0,
+    inode_id   INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL CHECK (inode_id >= 1000 OR inode_id = 1),
+    inode_type TEXT                              NOT NULL CHECK (inode_type IN ('R', 'D', 'F')),
+    entity_id  BLOB                              NOT NULL,
+    name       TEXT                              NOT NULL CHECK (LENGTH(name) > 0 AND
+                                                                 LENGTH(name) <= 255 AND
+                                                                 LENGTH(TRIM(name)) = LENGTH(name) AND
+                                                                 name NOT LIKE '%/%'),
+    parent     INTEGER CHECK (parent IS NULL OR parent >= 1),
+    path       TEXT,
+    is_dirty   BOOLEAN                           NOT NULL DEFAULT 0,
 
-    FOREIGN KEY (entity_id, entity_revision) REFERENCES entity (id, revision),
+    FOREIGN KEY (entity_id) REFERENCES entity (id),
     FOREIGN KEY (parent) REFERENCES vfs (inode_id) ON DELETE CASCADE,
     UNIQUE (parent, name)
 );
@@ -274,23 +267,20 @@ BEGIN
     SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type')
     WHERE NEW.inode_type != (SELECT entity_type
                              FROM entity
-                             WHERE id = NEW.entity_id
-                               AND revision = NEW.entity_revision);
+                             WHERE id = NEW.entity_id);
 END;
 
 -- Ensure VFS inode type matches entity type (on update of entity reference)
 CREATE TRIGGER vfs_update_type_match
-    BEFORE UPDATE OF entity_id, entity_revision
+    BEFORE UPDATE OF entity_id
     ON vfs
     FOR EACH ROW
     WHEN OLD.entity_id IS NOT NEW.entity_id
-        OR OLD.entity_revision IS NOT NEW.entity_revision
 BEGIN
     SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type')
     WHERE NEW.inode_type != (SELECT entity_type
                              FROM entity
-                             WHERE id = NEW.entity_id
-                               AND revision = NEW.entity_revision);
+                             WHERE id = NEW.entity_id);
 END;
 
 -- Ensure inode_id & inode_type cannot be changed
@@ -429,7 +419,7 @@ END;
 
 -- Mark inode as dirty if something significant changes
 CREATE TRIGGER vfs_mark_inode_parent_dirty_on_update
-    AFTER UPDATE OF name, parent, entity_id, entity_revision
+    AFTER UPDATE OF name, parent, entity_id
     ON vfs
     FOR EACH ROW
     WHEN OLD.name != NEW.name
@@ -437,7 +427,6 @@ CREATE TRIGGER vfs_mark_inode_parent_dirty_on_update
         OR OLD.parent IS NOT NULL AND NEW.parent IS NULL
         OR OLD.parent != NEW.parent
         OR OLD.entity_id != NEW.entity_id
-        OR OLD.entity_revision != NEW.entity_revision
 BEGIN
     UPDATE vfs
     SET is_dirty = 1
@@ -515,8 +504,7 @@ CREATE TRIGGER vfs_insert_entity_refcount
 BEGIN
     UPDATE entity
     SET ref_count = ref_count + 1
-    WHERE id = NEW.entity_id
-      AND revision = NEW.entity_revision;
+    WHERE id = NEW.entity_id;
 END;
 
 -- Decrement entity ref_count when a VFS inode is deleted
@@ -527,27 +515,23 @@ CREATE TRIGGER vfs_delete_entity_refcount
 BEGIN
     UPDATE entity
     SET ref_count = ref_count - 1
-    WHERE id = OLD.entity_id
-      AND revision = OLD.entity_revision;
+    WHERE id = OLD.entity_id;
 END;
 
--- Handle re-pointing a VFS inode to a different entity revision
+-- Handle re-pointing a VFS inode to a different entity
 CREATE TRIGGER vfs_update_entity_refcount
-    AFTER UPDATE OF entity_id, entity_revision
+    AFTER UPDATE OF entity_id
     ON vfs
     FOR EACH ROW
     WHEN OLD.entity_id IS NOT NEW.entity_id
-        OR OLD.entity_revision IS NOT NEW.entity_revision
 BEGIN
     UPDATE entity
-    SET ref_count = ref_count - 1
-    WHERE id = OLD.entity_id
-      AND revision = OLD.entity_revision;
+    SET ref_count = ref_count + 1
+    WHERE id = NEW.entity_id;
 
     UPDATE entity
-    SET ref_count = ref_count + 1
-    WHERE id = NEW.entity_id
-      AND revision = NEW.entity_revision;
+    SET ref_count = ref_count - 1
+    WHERE id = OLD.entity_id;
 END;
 
 CREATE TABLE temp_file_handle
@@ -606,14 +590,13 @@ CREATE TABLE sync_job
 (
     created         TIMESTAMP NOT NULL,
     root_entity_id  BLOB      NOT NULL,
-    root_revision   BLOB      NOT NULL,
     synced_blobs    INTEGER   NOT NULL DEFAULT 0 CHECK (synced_blobs >= 0),
     synced_chunks   INTEGER   NOT NULL DEFAULT 0 CHECK (synced_chunks >= 0),
     synced_entities INTEGER   NOT NULL DEFAULT 0 CHECK (synced_entities >= 0),
     uploaded_data   INTEGER   NOT NULL DEFAULT 0 CHECK (uploaded_data >= 0),
     num_uploads     INTEGER   NOT NULL DEFAULT 0 CHECK (num_uploads >= 0),
 
-    FOREIGN KEY (root_entity_id, root_revision) REFERENCES entity (id, revision)
+    FOREIGN KEY (root_entity_id) REFERENCES entity (id)
 );
 
 CREATE TRIGGER single_sync_job_only
@@ -632,8 +615,7 @@ CREATE TRIGGER sync_job_root_entity_type_insert
     FOR EACH ROW
     WHEN (SELECT entity_type
           FROM entity
-          WHERE id = NEW.root_entity_id
-            AND revision = NEW.root_revision) != 'R'
+          WHERE id = NEW.root_entity_id) != 'R'
 BEGIN
     SELECT RAISE(ABORT, 'sync_job root must reference an entity of type R');
 END;
@@ -644,7 +626,6 @@ CREATE TRIGGER sync_job_immutable
     FOR EACH ROW
     WHEN OLD.created <> NEW.created
         OR OLD.root_entity_id <> NEW.root_entity_id
-        OR OLD.root_revision <> NEW.root_revision
 BEGIN
     SELECT RAISE(ABORT, 'sync_job: created, root_entity_id and root_revision are immutable');
 END;
@@ -669,8 +650,7 @@ CREATE TRIGGER sync_job_insert_refcount
 BEGIN
     UPDATE entity
     SET ref_count = ref_count + 1
-    WHERE id = NEW.root_entity_id
-      AND revision = NEW.root_revision;
+    WHERE id = NEW.root_entity_id;
 END;
 
 -- Decrement entity ref_count when sync_job is deleted
@@ -681,26 +661,24 @@ CREATE TRIGGER sync_job_delete_refcount
 BEGIN
     UPDATE entity
     SET ref_count = ref_count - 1
-    WHERE id = OLD.root_entity_id
-      AND revision = OLD.root_revision;
+    WHERE id = OLD.root_entity_id;
 END;
 
 CREATE TABLE sync_job_queue
 (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    type            TEXT                              NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
-    blob_id         BLOB REFERENCES blob (id),
-    chunk_id        BLOB REFERENCES chunk (id),
-    entity_id       BLOB,
-    entity_revision BLOB,
-    estimated_size  INTEGER                           NOT NULL CHECK (estimated_size > 0),
+    id             INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    type           TEXT                              NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
+    blob_id        BLOB REFERENCES blob (id),
+    chunk_id       BLOB REFERENCES chunk (id),
+    entity_id      BLOB,
+    estimated_size INTEGER                           NOT NULL CHECK (estimated_size > 0),
 
-    FOREIGN KEY (entity_id, entity_revision) REFERENCES entity (id, revision),
+    FOREIGN KEY (entity_id) REFERENCES entity (id),
 
     CHECK (
-        (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_revision IS NULL) OR
-        (type = 'C' AND blob_id IS NULL AND chunk_id IS NOT NULL AND entity_id IS NULL AND entity_revision IS NULL) OR
-        (type = 'E' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NOT NULL AND entity_revision IS NOT NULL)
+        (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL) OR
+        (type = 'C' AND blob_id IS NULL AND chunk_id IS NOT NULL AND entity_id IS NULL) OR
+        (type = 'E' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NOT NULL)
         )
 );
 
@@ -766,12 +744,11 @@ CREATE TRIGGER sync_job_queue_entity_insert_refcount
     AFTER INSERT
     ON sync_job_queue
     FOR EACH ROW
-    WHEN NEW.entity_id IS NOT NULL AND NEW.entity_revision IS NOT NULL
+    WHEN NEW.entity_id IS NOT NULL
 BEGIN
     UPDATE entity
     SET ref_count = ref_count + 1
-    WHERE id = NEW.entity_id
-      AND revision = NEW.entity_revision;
+    WHERE id = NEW.entity_id;
 END;
 
 -- Decrement entity ref_count when sync_job_queue row is deleted
@@ -779,10 +756,9 @@ CREATE TRIGGER sync_job_queue_entity_delete_refcount
     AFTER DELETE
     ON sync_job_queue
     FOR EACH ROW
-    WHEN OLD.entity_id IS NOT NULL AND OLD.entity_revision IS NOT NULL
+    WHEN OLD.entity_id IS NOT NULL
 BEGIN
     UPDATE entity
     SET ref_count = ref_count - 1
-    WHERE id = OLD.entity_id
-      AND revision = OLD.entity_revision;
+    WHERE id = OLD.entity_id;
 END;

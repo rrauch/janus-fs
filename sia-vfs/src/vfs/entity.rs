@@ -3,16 +3,13 @@ use crate::blob::BlobId;
 use crate::db::{
     DataError, Error as DbError, Read as DbRead, Transaction, TxScope, Write as DbWrite,
 };
-use crate::vfs::{AsDbType, Name, Revision};
+use crate::vfs::{AsDbType, Name};
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
 use std::borrow::Cow;
-use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
-use uuid::Uuid;
 
 #[derive_where(Debug, Clone; I)]
 pub enum Entity<T, I> {
@@ -22,18 +19,10 @@ pub enum Entity<T, I> {
 
 impl<T, I> Entity<T, I> {
     #[inline]
-    pub fn entity_id(&self) -> EntityId {
+    pub fn entity_id(&self) -> &EntityId {
         match self {
             Self::Synced(e) => e.entity_id(),
             Self::Local(e) => e.entity_id(),
-        }
-    }
-
-    #[inline]
-    pub fn revision(&self) -> &Revision {
-        match self {
-            Self::Synced(e) => e.revision(),
-            Self::Local(e) => e.revision(),
         }
     }
 
@@ -77,13 +66,6 @@ impl<T, I> Entity<T, I> {
         }
     }
 
-    pub fn to_key(&self) -> EntityKey {
-        EntityKey {
-            entity_id: self.entity_id(),
-            revision: self.revision().clone(),
-        }
-    }
-
     #[inline]
     pub(crate) fn inner(&self) -> &I {
         match self {
@@ -104,24 +86,6 @@ impl<T, I> Entity<T, I> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntityKey {
-    pub(super) entity_id: EntityId,
-    pub(super) revision: Revision,
-}
-
-impl EntityKey {
-    pub(crate) fn new(entity_id: EntityId, revision: Revision) -> Self {
-        Self {
-            entity_id,
-            revision,
-        }
-    }
-    pub(super) fn serialize(entities: &Vec<EntityKey>) -> Vec<u8> {
-        todo!()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SyncedMode {
     remote_location: String,
@@ -136,12 +100,11 @@ pub type LocalEntity<T, I> = RawEntity<T, I, LocalMode>;
 pub type DraftEntity<T, I> = RawEntity<T, I, DraftMode>;
 
 #[derive_where(Debug, Clone; I, Mode)]
-pub struct RawEntity<T, I, Mode>(Arc<RawEntityInner<T, I, Mode>>);
+pub struct RawEntity<T, I, Mode>(Arc<(EntityId, RawEntityInner<T, I, Mode>)>);
 
 impl<T, I, Mode> RawEntity<T, I, Mode> {
     pub(super) fn new(
         entity_id: EntityId,
-        revision: Revision,
         name: Name,
         created: DateTime<Utc>,
         last_modified: DateTime<Utc>,
@@ -149,8 +112,6 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
         mode: Mode,
     ) -> Self {
         let inner = RawEntityInner {
-            entity_id,
-            revision,
             name,
             created,
             last_modified,
@@ -159,7 +120,7 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
             _phantom: PhantomData,
         };
 
-        Self(Arc::new(inner))
+        Self(Arc::new((entity_id, inner)))
     }
 
     pub(super) fn into_inner(self) -> RawEntityInner<T, I, Mode>
@@ -167,14 +128,13 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
         I: Clone,
         Mode: Clone,
     {
-        Arc::unwrap_or_clone(self.0)
+        let (_, inner) = Arc::unwrap_or_clone(self.0);
+        inner
     }
 }
 
 #[derive_where(Debug, Clone; I, Mode)]
 pub(crate) struct RawEntityInner<T, I, Mode> {
-    entity_id: EntityId,
-    revision: Revision,
     name: Name,
     created: DateTime<Utc>,
     last_modified: DateTime<Utc>,
@@ -186,9 +146,7 @@ pub(crate) struct RawEntityInner<T, I, Mode> {
 
 impl<T, I, Mode> RawEntityInner<T, I, Mode> {
     pub(crate) fn hash_metadata(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(b"begin_metadata:\nentity_id:");
-        hasher.update(self.entity_id.as_bytes());
-        hasher.update(b"\nname:");
+        hasher.update(b"begin_metadata:\nname:");
         hasher.update(self.name.as_bytes());
         hasher.update(b"\ncreated:");
         hasher.update(&self.created.timestamp().to_be_bytes());
@@ -201,8 +159,6 @@ impl<T, I, Mode> RawEntityInner<T, I, Mode> {
 impl<T, I, Mode> RawEntityInner<T, I, Mode> {
     fn into_draft(self) -> RawEntityInner<T, I, DraftMode> {
         RawEntityInner {
-            entity_id: self.entity_id,
-            revision: self.revision,
             name: self.name,
             created: self.created,
             last_modified: self.last_modified,
@@ -214,34 +170,29 @@ impl<T, I, Mode> RawEntityInner<T, I, Mode> {
 }
 
 impl<T, I, Mode> RawEntity<T, I, Mode> {
-    pub fn entity_id(&self) -> EntityId {
-        self.0.entity_id
+    pub fn entity_id(&self) -> &EntityId {
+        &self.0.0
     }
-
-    pub fn revision(&self) -> &Revision {
-        &self.0.revision
-    }
-
     pub fn name(&self) -> &Name {
-        &self.0.name
+        &self.0.1.name
     }
 
     pub fn created(&self) -> &DateTime<Utc> {
-        &self.0.created
+        &self.0.1.created
     }
 
     pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.0.last_modified
+        &self.0.1.last_modified
     }
 
     pub fn inner(&self) -> &I {
-        &self.0.inner
+        &self.0.1.inner
     }
 }
 
 impl<T, I> RawEntity<T, I, SyncedMode> {
     pub fn remote_location(&self) -> &String {
-        &self.0.mode.remote_location
+        &self.0.1.mode.remote_location
     }
 }
 
@@ -255,10 +206,6 @@ impl<T, I: Clone, Mode: Clone> RawEntity<T, I, Mode> {
 pub struct EntityMut<T, I>(RawEntityInner<T, I, DraftMode>);
 
 impl<T, I> EntityMut<T, I> {
-    pub fn entity_id(&self) -> EntityId {
-        self.0.entity_id
-    }
-
     pub fn name(&self) -> &Name {
         &self.0.name
     }
@@ -296,43 +243,18 @@ pub trait Freezable<T, I> {
     fn freeze(self) -> DraftEntity<T, I>;
 }
 
-impl<T: RevisionHasher<I, DraftMode> + Normalizer<I>, I> Freezable<T, I> for EntityMut<T, I> {
+impl<T: EntityHasher<I, DraftMode> + Normalizer<I>, I> Freezable<T, I> for EntityMut<T, I> {
     fn freeze(mut self) -> DraftEntity<T, I> {
         T::normalize(&mut self.0.inner);
-        self.0.revision = ContentId::new_internal(T::hash(&self.0));
-        RawEntity(Arc::new(self.0))
+        let entity_id = ContentId::new_internal(T::hash(&self.0));
+        RawEntity(Arc::new((entity_id, self.0)))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub(crate) struct EntityId(Uuid);
+pub(crate) struct EntityKind;
+pub(crate) type EntityId = ContentId<EntityKind>;
 
-impl EntityId {
-    pub(crate) fn try_from(bytes: &[u8]) -> Result<Self, String> {
-        Ok(Self(Uuid::from_slice(bytes).map_err(|e| e.to_string())?))
-    }
-
-    pub(super) fn generate() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl Deref for EntityId {
-    type Target = Uuid;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Display for EntityId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.0, f)
-    }
-}
-
-pub trait RevisionHasher<I, Mode>: Sized {
+pub trait EntityHasher<I, Mode>: Sized {
     fn hash(inner: &RawEntityInner<Self, I, Mode>) -> blake3::Hash;
 }
 
@@ -344,38 +266,34 @@ impl<C: TxScope> Transaction<C>
 where
     Self: DbRead,
 {
-    pub(super) async fn entity_by_id_revision<T, I>(
+    pub(super) async fn entity_by_id<T, I>(
         &mut self,
         id: &EntityId,
-        revision: &Revision,
     ) -> Result<Option<Entity<T, I>>, DbError>
     where
         Entity<T, I>: TryFrom<EntityRow>,
     {
         let id_ref = id.as_bytes().as_slice();
-        let revision_ref = revision.as_slice();
 
         Ok(sqlx::query!(
-            "SELECT name, created as \"created: i64\", last_modified as \"last_modified: i64\", mode, entity_type, blob_id, remote_location, data FROM entity WHERE id = ? AND revision = ?",
+            "SELECT name, created as \"created: i64\", last_modified as \"last_modified: i64\", mode, entity_type, blob_id, remote_location, data FROM entity WHERE id = ?",
             id_ref,
-            revision_ref
         )
             .fetch_optional(self.conn())
             .await?
             .map(|r| -> Result<EntityRow, DbError> {
                 Ok(EntityRow {
                     id: id.clone(),
-                    revision: revision.clone(),
-                    name: Name::from_str(r.name.as_str()).map_err(|e| DataError::ConversionError(e.to_string()))?,
-                    created: DateTime::<Utc>::from_timestamp(r.created, 0).ok_or_else(|| DataError::ConversionError("invalid created timestamp".to_string()))?,
-                    last_modified: DateTime::<Utc>::from_timestamp(r.last_modified, 0).ok_or_else(|| DataError::ConversionError("invalid created timestamp".to_string()))?,
+                    name: Name::from_str(r.name.as_str()).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
+                    created: DateTime::<Utc>::from_timestamp(r.created, 0).ok_or_else(|| DataError::ConversionError("invalid created timestamp".into()))?,
+                    last_modified: DateTime::<Utc>::from_timestamp(r.last_modified, 0).ok_or_else(|| DataError::ConversionError("invalid created timestamp".into()))?,
                     mode: match r.mode.as_str() {
                         "L" => Mode::Local,
                         "S" => Mode::Synced,
-                        other => return Err(DataError::ConversionError(format!("invalid mode: {}", other)))?,
+                        other => return Err(DataError::ConversionError(format!("invalid mode: {}", other).into()))?,
                     },
                     entity_type: r.entity_type.into(),
-                    blob_id: r.blob_id.map(|b| BlobId::try_from_bytes(b).ok_or_else(|| DataError::ConversionError("invalid blob_id".to_string()))).transpose()?,
+                    blob_id: r.blob_id.map(|b| BlobId::try_from_bytes(b).ok_or_else(|| DataError::ConversionError("invalid blob_id".into()))).transpose()?,
                     remote_location: r.remote_location,
                     data: r.data,
                 })
@@ -383,7 +301,7 @@ where
             .transpose()?
             .map(|e| {
                 e.try_into()
-                    .map_err(|e| DataError::ConversionError("".to_string()))
+                    .map_err(|e| DataError::ConversionError("invalid row".into()))
             })
             .transpose()?)
     }
@@ -391,7 +309,6 @@ where
 
 pub(crate) struct EntityRow {
     pub id: EntityId,
-    pub revision: Revision,
     pub name: Name,
     pub created: DateTime<Utc>,
     pub last_modified: DateTime<Utc>,
@@ -411,11 +328,11 @@ impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<BlobId>, Option<Vec<
     for EntityRow
 {
     fn from((entity, blob_id, data): (DraftEntity<T, I>, Option<BlobId>, Option<Vec<u8>>)) -> Self {
+        let id = entity.entity_id().clone();
         let value = entity.into_inner();
 
         Self {
-            id: value.entity_id,
-            revision: value.revision,
+            id,
             name: value.name,
             created: value.created,
             last_modified: value.last_modified,
@@ -439,7 +356,6 @@ impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
                     .ok_or_else(|| "remote_location is missing".to_string())?;
                 Entity::Synced(SyncedEntity::new(
                     value.id,
-                    value.revision,
                     value.name,
                     value.created,
                     value.last_modified,
@@ -449,7 +365,6 @@ impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
             }
             Mode::Local => Entity::Local(LocalEntity::new(
                 value.id,
-                value.revision,
                 value.name,
                 value.created,
                 value.last_modified,
@@ -467,27 +382,22 @@ where
     pub(crate) async fn create_entity_if_not_exist<T, I>(
         &mut self,
         draft_entity: DraftEntity<T, I>,
-    ) -> Result<(EntityId, Revision), DbError>
+    ) -> Result<EntityId, DbError>
     where
         EntityRow: From<DraftEntity<T, I>>,
     {
         let id = draft_entity.entity_id();
         let id_slice = id.as_bytes().as_slice();
-        let revision = draft_entity.revision().as_slice();
         if sqlx::query!(
-            "SELECT EXISTS(SELECT 1 FROM entity WHERE id = ? AND revision = ?) as \"entity_exists: bool\"",
+            "SELECT EXISTS(SELECT 1 FROM entity WHERE id = ?) as \"entity_exists: bool\"",
             id_slice,
-            revision
         )
         .fetch_one(self.conn())
         .await?
         .entity_exists
         {
             // entity already exists
-            return Ok((
-                id,
-                draft_entity.revision().clone(),
-            ));
+            return Ok(id.clone());
         }
 
         // entity does not exist yet, creating from scratch
@@ -495,7 +405,6 @@ where
         let row = EntityRow::from(draft_entity);
 
         let id = row.id.as_bytes().as_slice();
-        let revision = row.revision.as_slice();
         let name = row.name.as_str();
         let created = row.created.timestamp();
         let last_modified = row.last_modified.timestamp();
@@ -509,9 +418,8 @@ where
         let data = row.data.as_ref().map(|d| d.as_slice());
 
         sqlx::query!(
-            "INSERT INTO entity (id, revision, name, created, last_modified, blob_id, entity_type, mode, remote_location, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO entity (id, name, created, last_modified, blob_id, entity_type, mode, remote_location, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id,
-            revision,
             name,
             created,
             last_modified,
@@ -522,6 +430,6 @@ where
             data,
         ).execute(self.conn()).await?;
 
-        Ok((row.id, row.revision))
+        Ok(row.id)
     }
 }

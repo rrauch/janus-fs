@@ -3,7 +3,7 @@ use crate::blob::{Blob, BlobId};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
 use crate::vfs::entity::{Entity, EntityRow, RawEntityInner};
 use crate::vfs::{
-    Container, InodeId, InodeMut, Name, Normalizer, Read, RevisionHasher, TypedInode, Vfs,
+    Container, InodeId, InodeMut, Name, Normalizer, Read, EntityHasher, TypedInode, Vfs,
     VfsResult, Write,
 };
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 pub struct FileKind;
 
-impl<Mode> RevisionHasher<BlobInfo, Mode> for FileKind {
+impl<Mode> EntityHasher<BlobInfo, Mode> for FileKind {
     fn hash(inner: &RawEntityInner<Self, BlobInfo, Mode>) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_revision]");
         hasher.update(b"begin:\n");
