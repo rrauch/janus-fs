@@ -1,4 +1,8 @@
-use crate::vfs::{InodeId, Name, NameError, Read, Vfs, VfsResult, check_valid_filename};
+use crate::db::{DataError, Error as DbError, Read as DbRead, Transaction, TxScope};
+use crate::vfs::{
+    InodeId, Name, NameError, ROOT_INODE_ID, Read, Vfs, VfsResult, check_valid_filename,
+};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use thiserror::Error;
@@ -69,6 +73,18 @@ impl VfsPath {
     }
 }
 
+impl AsRef<str> for VfsPath {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Display for VfsPath {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
 impl FromStr for VfsPath {
     type Err = VfsPathError;
 
@@ -90,9 +106,9 @@ impl TryFrom<String> for VfsPath {
 impl<Mode: Read> Vfs<Mode> {
     pub async fn inode_id_by_path(&self, path: &VfsPath) -> VfsResult<Option<InodeId>> {
         if path.is_root() {
-            return Ok(Some(self.root().inode_id()));
+            return Ok(Some(ROOT_INODE_ID));
         }
-        todo!()
+        Ok(self.tx().await?.inode_id_by_path(path).await?)
     }
 }
 
@@ -114,4 +130,22 @@ fn sanitize_path(path: &Utf8UnixPath) -> Result<Utf8UnixPathBuf, VfsPathError> {
     })?;
 
     Ok(normalized)
+}
+
+impl<C: TxScope> Transaction<C>
+where
+    Self: DbRead,
+{
+    async fn inode_id_by_path(&mut self, path: &VfsPath) -> Result<Option<InodeId>, DbError> {
+        let path = path.as_ref();
+        sqlx::query!("SELECT inode_id FROM vfs WHERE path = ?", path)
+            .fetch_optional(self.conn())
+            .await?
+            .map(|r| -> Result<InodeId, DbError> {
+                Ok(InodeId::new(u64::try_from(r.inode_id).map_err(|e| {
+                    DataError::ConversionError(e.to_string().into())
+                })?))
+            })
+            .transpose()
+    }
 }

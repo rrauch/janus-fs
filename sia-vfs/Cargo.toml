@@ -21,7 +21,10 @@ derive-where = { version = "1.6", features = ["zeroize", "serde"] }
 lz4_flex = { version = "0.13", optional = true }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
 thiserror = "2"
+tracing = "0.1"
+twox-hash = { version = "2.1", features = ["xxhash3_64", "std"] }
 typed-path = "0.12"
 uuid = { version = "1.23", features = ["v7"] }
 zstd = { version = "0.13", optional = true }
@@ -29,5 +32,11 @@ zstd = { version = "0.13", optional = true }
 [dev-dependencies]
 anyhow = "1.0"
 dotenv = "0.15"
+tempfile = "3"
 tokio = { version = "1.51", features = ["full"] }
 tracing-subscriber = "0.3"
+
+[build-dependencies]
+anyhow = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+tokio = { workspace = true, features = ["full"] }

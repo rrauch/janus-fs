@@ -1,10 +1,10 @@
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::blob::{Blob, BlobId};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::entity::RawEntityInner;
+use crate::vfs::directory::Directory;
+use crate::vfs::entity::{Entity, EntityRow, RawEntityInner};
 use crate::vfs::{
-    Container, InodeId, InodeMut, Name, Normalizer, Read, RevisionHasher, TypedInode, Vfs,
-    VfsResult, Write,
+    EntityHasher, InodeId, InodeMut, Name, Normalizer, Read, TypedInode, Vfs, VfsResult, Write,
 };
 use async_trait::async_trait;
 use blake3::Hash;
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 pub struct FileKind;
 
-impl<Mode> RevisionHasher<BlobInfo, Mode> for FileKind {
+impl<Mode> EntityHasher<BlobInfo, Mode> for FileKind {
     fn hash(inner: &RawEntityInner<Self, BlobInfo, Mode>) -> Hash {
         let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_revision]");
         hasher.update(b"begin:\n");
@@ -41,6 +41,16 @@ pub struct BlobInfo {
     len: u64,
 }
 
+impl BlobInfo {
+    fn serialize(&self) -> Vec<u8> {
+        todo!()
+    }
+
+    fn deserialize(input: &[u8]) -> Result<Self, String> {
+        todo!()
+    }
+}
+
 impl From<Blob> for BlobInfo {
     fn from(value: Blob) -> Self {
         Self {
@@ -50,8 +60,8 @@ impl From<Blob> for BlobInfo {
     }
 }
 
-pub type File = TypedInode<FileKind, BlobInfo, InodeId>;
-pub type FileMut = InodeMut<FileKind, BlobInfo, InodeId>;
+pub type File = TypedInode<FileKind, BlobInfo>;
+pub type FileMut = InodeMut<FileKind, BlobInfo>;
 
 impl File {
     pub fn len(&self) -> u64 {
@@ -64,6 +74,38 @@ impl File {
 
     pub(crate) fn blob_id(&self) -> &BlobId {
         &self.inner().blob_id
+    }
+}
+
+impl TryFrom<EntityRow> for Entity<FileKind, BlobInfo> {
+    type Error = String;
+
+    fn try_from(value: EntityRow) -> Result<Self, Self::Error> {
+        if value.entity_type != "F" {
+            return Err(format!(
+                "invalid entity_type; expected 'F' but got '{}'",
+                value.entity_type
+            ));
+        }
+
+        /*let blob_info = BlobInfo::deserialize(
+            value
+                .data
+                .as_ref()
+                .ok_or_else(|| "data is missing".to_string())?
+                .as_slice(),
+        )?;
+
+        if &blob_info.blob_id != blob_id {
+            return Err(format!(
+                "blob_id mismatch: {} != {}",
+                blob_id, blob_info.blob_id
+            ));
+        }
+
+        (value, blob_info).try_into()*/
+
+        todo!()
     }
 }
 
@@ -84,9 +126,9 @@ impl<Mode: Read + Write> Vfs<Mode> {
         todo!()
     }
 
-    pub async fn create_file<T, P>(
+    pub async fn create_file(
         &self,
-        parent: &Container<T, P>,
+        parent: &Directory,
         name: Name,
     ) -> VfsResult<FileHandle<ReadWrite>> {
         todo!()
