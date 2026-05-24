@@ -1,3 +1,4 @@
+use flatbuffers_build::BuilderOptions;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 use std::path::Path;
@@ -34,5 +35,10 @@ fn main() -> anyhow::Result<()> {
         db_file.clone().into_os_string().into_string().unwrap()
     );
     println!("cargo:rerun-if-changed=migrations");
+
+    // flatbuffers code generation
+    BuilderOptions::new_with_files(["schemas/entity.fbs"]).compile()?;
+    println!("cargo:rerun-if-changed=schemas");
+
     Ok(())
 }

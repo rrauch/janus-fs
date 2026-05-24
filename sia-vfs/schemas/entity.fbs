@@ -1,0 +1,34 @@
+namespace vfs.entity;
+
+struct ContentId {
+  bytes: [ubyte:32];
+}
+
+struct Uuid {
+  bytes: [ubyte:16];
+}
+
+table File {
+  len: uint64;
+  blob_id: ContentId (required);
+}
+
+struct DirectoryEntry {
+  id: Uuid;
+  revision: ContentId;
+}
+
+table Directory {
+  entries: [DirectoryEntry];
+}
+
+union EntityBody { File, Directory }
+
+table Entity {
+  name: string (required);
+  created: int64;
+  last_modified: int64;
+  body: EntityBody;
+}
+
+root_type Entity;

@@ -128,3 +128,9 @@ impl<T> ContentId<T> {
         Self(hash.into(), PhantomData)
     }
 }
+
+#[allow(warnings)]
+#[rustfmt::skip]
+mod gen_flatbuffers {
+    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
+}

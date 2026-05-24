@@ -19,6 +19,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 bytes = "1"
 chrono = "0.4"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
+flatbuffers = "=25.12.19"
 lz4_flex = { version = "0.13", optional = true }
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
@@ -39,5 +40,6 @@ tracing-subscriber = "0.3"
 
 [build-dependencies]
 anyhow = { workspace = true }
+flatbuffers-build = { version = "=0.2.4", features = ["vendored"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 tokio = { workspace = true, features = ["full"] }
