@@ -10,12 +10,54 @@ pub mod chunk;
 pub(crate) mod db;
 pub mod vfs;
 
+#[derive_where(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct TypedUuid<T>(uuid::Uuid, PhantomData<T>);
+
+impl<T> TypedUuid<T> {
+    pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<Self> {
+        let bytes = match input.try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return None,
+        };
+        Some(Self(uuid::Uuid::from_bytes(bytes), PhantomData))
+    }
+
+    pub(crate) fn generate() -> Self {
+        Self(uuid::Uuid::now_v7(), PhantomData)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_bytes().as_slice()
+    }
+}
+
+impl<T> Deref for TypedUuid<T> {
+    type Target = uuid::Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> AsRef<[u8]> for TypedUuid<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl<T> Display for TypedUuid<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
 #[derive_where(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ContentId<T>(Arc<blake3::Hash>, PhantomData<T>);
 
 impl<T> ContentId<T> {
-    pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<ContentId<T>> {
+    pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<Self> {
         let bytes = match input.try_into() {
             Ok(bytes) => bytes,
             Err(_) => return None,

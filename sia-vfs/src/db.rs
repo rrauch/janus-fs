@@ -1,5 +1,5 @@
 use crate::vfs::directory::{DirectoryDraft, DirectoryMut};
-use crate::vfs::entity::EntityId;
+use crate::vfs::entity::{EntityId, EntityKey};
 use crate::vfs::{Inode, InodeId, Name};
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
@@ -39,8 +39,8 @@ pub enum DbStateError {
 pub enum DataError {
     #[error("conversion failed: {0}")]
     ConversionError(Cow<'static, str>),
-    #[error("entity not found: {0}")]
-    EntityNotFound(EntityId),
+    #[error("entity not found: {0:?}")]
+    EntityNotFound(EntityKey),
     #[error("inode {0} not found")]
     InodeNotFound(InodeId),
     #[error("wrong number of rows affected: {actual} != {expected}")]
@@ -127,25 +127,25 @@ impl Transaction<ReadWrite> {
     }
 
     async fn process_dirty_inode(&mut self, inode_id: InodeId) -> Result<(), Error> {
-        let (name, entity_id) = match self
+        let (name, entity_key) = match self
             .inode_by_id(inode_id)
             .await?
             .ok_or_else(|| DataError::InodeNotFound(inode_id))?
         {
             Inode::Directory(dir) => {
                 let name = dir.name().clone();
-                let entity_id = self.update_directory(dir.into_mut()).await?;
-                (name, entity_id)
+                let entity_key = self.update_directory(dir.into_mut()).await?;
+                (name, entity_key)
             }
             Inode::File(_) => {
                 return Err(DataError::DirtyFile(inode_id))?;
             }
         };
-        self.update_inode(inode_id, &name, &entity_id).await?;
+        self.update_inode(inode_id, &name, &entity_key).await?;
         Ok(())
     }
 
-    async fn update_directory(&mut self, mut dir: DirectoryMut) -> Result<EntityId, Error> {
+    async fn update_directory(&mut self, mut dir: DirectoryMut) -> Result<EntityKey, Error> {
         let parent_id = *dir.inode_id().deref() as i64;
         let entries = sqlx::query!("SELECT entity_id FROM vfs WHERE parent = ?", parent_id)
             .fetch_all(self.conn())
@@ -185,14 +185,16 @@ impl Transaction<ReadWrite> {
             // empty vfs, create new root
             let root = DirectoryDraft::new_directory_draft(Name::from_str("ROOT").unwrap());
             let name = root.name().clone();
-            let entity_id = self.create_entity_if_not_exist(root).await?;
+            let entity_key = self.create_entity_if_not_exist(root).await?;
 
-            let entity_id = entity_id.as_slice();
+            let entity_id = entity_key.id().as_slice();
+            let entity_rev = entity_key.revision().as_slice();
             let name = name.as_str();
 
             sqlx::query!(
-                "INSERT INTO vfs (inode_id, inode_type, entity_id, name) VALUES (1, 'D', ?, ?)",
+                "INSERT INTO vfs (inode_id, inode_type, entity_id, entity_rev, name) VALUES (1, 'D', ?, ?, ?)",
                 entity_id,
+                entity_rev,
                 name
             )
             .execute(self.conn())

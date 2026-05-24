@@ -1,7 +1,7 @@
 use crate::db::{Error as DbError, Transaction, TxScope, Write as DbWrite};
 use crate::vfs::entity::{
     DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityRef, EntityRow, Freezable,
-    Normalizer, RawEntityInner,
+    Normalizer, RawEntityInner, Revision,
 };
 use crate::vfs::{
     AsDbType, Inode, InodeId, InodeMut, Name, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
@@ -61,9 +61,10 @@ impl DirectoryDraft {
     pub fn new_directory_draft(name: Name) -> Self {
         let now = Utc::now();
         Self::new(
-            EntityId::zeroed(),
+            EntityId::generate(),
+            Revision::zeroed(),
             name,
-            now.clone(),
+            now,
             now,
             vec![],
             DraftMode,

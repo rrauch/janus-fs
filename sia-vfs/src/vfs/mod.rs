@@ -10,8 +10,8 @@ use crate::db::{
 };
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    DraftEntity, Entity, EntityHasher, EntityId, EntityMut, EntityRef, EntityRow, Freezable,
-    Normalizer,
+    DraftEntity, Entity, EntityHasher, EntityId, EntityKey, EntityMut, EntityRef, EntityRow,
+    Freezable, Normalizer, Revision,
 };
 use crate::vfs::file::File;
 use chrono::{DateTime, Utc};
@@ -458,7 +458,7 @@ where
     ) -> Result<Option<Inode>, DbError> {
         let id = inode_id.0 as i64;
         let r = match sqlx::query!(
-            "SELECT inode_type, entity_id, parent FROM vfs WHERE inode_id = ?",
+            "SELECT inode_type, entity_id, entity_rev, parent FROM vfs WHERE inode_id = ?",
             id
         )
         .fetch_optional(self.conn())
@@ -468,8 +468,12 @@ where
             Some(r) => r,
         };
 
-        let entity_id = EntityId::try_from_bytes(r.entity_id)
-            .ok_or_else(|| DataError::ConversionError("Invalid entity id".into()))?;
+        let entity_key = EntityKey::new(
+            EntityId::try_from_bytes(r.entity_id)
+                .ok_or_else(|| DataError::ConversionError("Invalid entity id".into()))?,
+            Revision::try_from_bytes(r.entity_rev)
+                .ok_or_else(|| DataError::ConversionError("Invalid entity revision".into()))?,
+        );
 
         let parent = r.parent.map(|id| InodeId(id as u64));
 
@@ -478,17 +482,17 @@ where
                 parent,
                 inode_id,
                 entity: self
-                    .entity_by_id(&entity_id)
+                    .entity_by_key(&entity_key)
                     .await?
-                    .ok_or_else(|| DataError::EntityNotFound(entity_id))?,
+                    .ok_or_else(|| DataError::EntityNotFound(entity_key))?,
             }),
             "F" => Inode::File(File {
                 parent,
                 inode_id,
                 entity: self
-                    .entity_by_id(&entity_id)
+                    .entity_by_key(&entity_key)
                     .await?
-                    .ok_or_else(|| DataError::EntityNotFound(entity_id))?,
+                    .ok_or_else(|| DataError::EntityNotFound(entity_key))?,
             }),
             other => {
                 return Err(DataError::ConversionError(
@@ -531,17 +535,19 @@ where
         &mut self,
         name: &Name,
         parent: InodeId,
-        entity_id: EntityId,
+        entity_key: EntityKey,
     ) -> Result<InodeId, DbError> {
         let inode_type = T::db_type();
         let name = name.as_str();
         let parent = parent.0 as i64;
-        let entity_id = entity_id.as_bytes().as_slice();
+        let entity_id = entity_key.id().as_slice();
+        let entity_rev = entity_key.revision().as_slice();
 
         let id = sqlx::query!(
-            "INSERT INTO vfs (inode_type, entity_id, name, parent) VALUES (?, ?, ?, ?)",
+            "INSERT INTO vfs (inode_type, entity_id, entity_rev, name, parent) VALUES (?, ?, ?, ?, ?)",
             inode_type,
             entity_id,
+            entity_rev,
             name,
             parent
         )
@@ -556,16 +562,18 @@ where
         &mut self,
         inode_id: InodeId,
         name: &Name,
-        entity_id: &EntityId,
+        entity_key: &EntityKey,
     ) -> Result<(), DbError> {
         let inode_id = inode_id.0 as i64;
         let name = name.as_str();
-        let entity_id = entity_id.as_bytes().as_slice();
+        let entity_id = entity_key.id().as_slice();
+        let entity_rev = entity_key.revision().as_slice();
 
         let rows_affected = sqlx::query!(
-            "UPDATE vfs SET name = ?, entity_id = ?, is_dirty = 0 WHERE inode_id = ?",
+            "UPDATE vfs SET name = ?, entity_id = ?, entity_rev = ?, is_dirty = 0 WHERE inode_id = ?",
             name,
             entity_id,
+            entity_rev,
             inode_id
         )
         .execute(self.conn())
@@ -625,7 +633,6 @@ mod tests {
     #[tokio::test]
     async fn bootstrap() -> anyhow::Result<()> {
         let (db, _temp_dir) = new_db().await?;
-        println!("");
         Ok(())
     }
 }
