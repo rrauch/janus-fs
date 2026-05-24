@@ -315,7 +315,7 @@ where
         let rev_ref = key.revision.as_slice();
 
         Ok(sqlx::query!(
-            "SELECT name, created as \"created: i64\", last_modified as \"last_modified: i64\", mode, entity_type, remote_location, data FROM entity WHERE id = ? and revision = ?",
+            "SELECT name, mode, entity_type, remote_location, data FROM entity WHERE id = ? and revision = ?",
             id_ref,
             rev_ref,
         )
@@ -326,8 +326,6 @@ where
                     id: key.id.clone(),
                     revision: key.revision.clone(),
                     name: Name::from_str(r.name.as_str()).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
-                    created: DateTime::<Utc>::from_timestamp(r.created, 0).ok_or_else(|| DataError::ConversionError("invalid created timestamp".into()))?,
-                    last_modified: DateTime::<Utc>::from_timestamp(r.last_modified, 0).ok_or_else(|| DataError::ConversionError("invalid created timestamp".into()))?,
                     mode: match r.mode.as_str() {
                         "L" => Mode::Local,
                         "S" => Mode::Synced,
@@ -351,8 +349,6 @@ pub(crate) struct EntityRow {
     pub id: EntityId,
     pub revision: Revision,
     pub name: Name,
-    pub created: DateTime<Utc>,
-    pub last_modified: DateTime<Utc>,
     pub mode: Mode,
     pub entity_type: Cow<'static, str>,
     pub remote_location: Option<String>,
@@ -379,8 +375,6 @@ impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<Vec<u8>>)> for Entit
             id,
             revision,
             name: value.name,
-            created: value.created,
-            last_modified: value.last_modified,
             mode: Mode::Local,
             entity_type: T::db_type().into(),
             remote_location: None,
@@ -402,8 +396,8 @@ impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
                     value.id,
                     value.revision,
                     value.name,
-                    value.created,
-                    value.last_modified,
+                    Utc::now(), //todo: remove
+                    Utc::now(), //todo: remove
                     inner,
                     SyncedMode { remote_location },
                 ))
@@ -412,8 +406,8 @@ impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
                 value.id,
                 value.revision,
                 value.name,
-                value.created,
-                value.last_modified,
+                Utc::now(), //todo: remove
+                Utc::now(), //todo: remove
                 inner,
                 LocalMode,
             )),
@@ -459,8 +453,6 @@ where
         let id = row.id.as_slice();
         let rev = row.revision.as_slice();
         let name = row.name.as_str();
-        let created = row.created.timestamp();
-        let last_modified = row.last_modified.timestamp();
         let entity_type = row.entity_type.as_ref();
         let mode = match row.mode {
             Mode::Local => "L",
@@ -470,18 +462,18 @@ where
         let data = row.data.as_ref().map(|d| d.as_slice());
 
         sqlx::query!(
-            "INSERT INTO entity (id, revision, name, created, last_modified, entity_type, mode, remote_location, data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO entity (id, revision, name, entity_type, mode, remote_location, data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)",
             id,
             rev,
             name,
-            created,
-            last_modified,
             entity_type,
             mode,
             remote_location,
             data,
-        ).execute(self.conn()).await?;
+        )
+        .execute(self.conn())
+        .await?;
 
         for entity_ref in refs {
             let id = row.id.as_slice();

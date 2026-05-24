@@ -1,19 +1,17 @@
 CREATE TABLE entity
 (
-    id              BLOB      NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                              LENGTH(id) = 16),
-    revision        BLOB      NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                              LENGTH(id) = 32),
-    ref_count       INTEGER   NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
-    name            TEXT      NOT NULL CHECK (LENGTH(name) > 0 AND
-                                              LENGTH(name) <= 255 AND
-                                              LENGTH(TRIM(name)) = LENGTH(name) AND
-                                              name NOT LIKE '%/%'),
-    created         TIMESTAMP NOT NULL,
-    last_modified   TIMESTAMP NOT NULL,
+    id              BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                            LENGTH(id) = 16),
+    revision        BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                            LENGTH(id) = 32),
+    ref_count       INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    name            TEXT    NOT NULL CHECK (LENGTH(name) > 0 AND
+                                            LENGTH(name) <= 255 AND
+                                            LENGTH(TRIM(name)) = LENGTH(name) AND
+                                            name NOT LIKE '%/%'),
 
-    entity_type     TEXT      NOT NULL CHECK (entity_type IN ('D', 'F')),
-    mode            TEXT      NOT NULL CHECK (mode IN ('S', 'L')),
+    entity_type     TEXT    NOT NULL CHECK (entity_type IN ('D', 'F')),
+    mode            TEXT    NOT NULL CHECK (mode IN ('S', 'L')),
     remote_location TEXT,
     data            BLOB,
 
@@ -39,8 +37,6 @@ CREATE TRIGGER entity_update_only_local_to_synced_or_refcount
         OR OLD.id IS NOT NEW.id
         OR OLD.revision IS NOT NEW.revision
         OR OLD.name IS NOT NEW.name
-        OR OLD.created IS NOT NEW.created
-        OR OLD.last_modified IS NOT NEW.last_modified
         OR OLD.entity_type IS NOT NEW.entity_type
 BEGIN
     SELECT RAISE(ABORT, 'entity update: only L->S mode transition allowed')
@@ -51,8 +47,6 @@ BEGIN
             AND OLD.id = NEW.id
             AND OLD.revision = NEW.revision
             AND OLD.name = NEW.name
-            AND OLD.created = NEW.created
-            AND OLD.last_modified = NEW.last_modified
             AND OLD.entity_type = NEW.entity_type
             AND OLD.data IS NEW.data
         );
@@ -275,17 +269,17 @@ END;
 
 CREATE TABLE vfs
 (
-    inode_id   INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL CHECK (inode_id >= 1000 OR inode_id = 1),
-    inode_type TEXT                              NOT NULL CHECK (inode_type IN ('D', 'F')),
-    entity_id  BLOB                              NOT NULL,
-    entity_rev BLOB                              NOT NULL,
-    name       TEXT                              NOT NULL CHECK (LENGTH(name) > 0 AND
-                                                                 LENGTH(name) <= 255 AND
-                                                                 LENGTH(TRIM(name)) = LENGTH(name) AND
-                                                                 name NOT LIKE '%/%'),
+    inode_id   INTEGER PRIMARY KEY NOT NULL CHECK (inode_id >= 1000 OR inode_id = 1),
+    inode_type TEXT                NOT NULL CHECK (inode_type IN ('D', 'F')),
+    entity_id  BLOB                NOT NULL,
+    entity_rev BLOB                NOT NULL,
+    name       TEXT                NOT NULL CHECK (LENGTH(name) > 0 AND
+                                                   LENGTH(name) <= 255 AND
+                                                   LENGTH(TRIM(name)) = LENGTH(name) AND
+                                                   name NOT LIKE '%/%'),
     parent     INTEGER CHECK (parent IS NULL OR parent >= 1),
     path       TEXT,
-    is_dirty   BOOLEAN                           NOT NULL DEFAULT 0,
+    is_dirty   BOOLEAN             NOT NULL DEFAULT 0,
 
     FOREIGN KEY (entity_id, entity_rev) REFERENCES entity (id, revision),
     FOREIGN KEY (parent) REFERENCES vfs (inode_id) ON DELETE CASCADE,
@@ -296,11 +290,6 @@ CREATE TABLE vfs
 
 CREATE INDEX vfs_parent_idx ON vfs (parent);
 CREATE INDEX vfs_is_dirty_idx ON vfs (is_dirty) WHERE is_dirty = 1;
-
--- Ensure the vfs id sequence starts at 1000
-INSERT INTO sqlite_sequence (name, seq)
-VALUES ('vfs', 999);
-
 
 -- Ensure VFS inode type matches entity type (on insert)
 CREATE TRIGGER vfs_insert_type_match
