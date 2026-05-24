@@ -31,7 +31,7 @@ impl VfsPath {
     }
 
     pub fn join(&self, name: &Name) -> VfsPath {
-        Self(Arc::new(self.0.as_path().join(name.as_str())))
+        Self(Arc::new(self.0.as_path().join(name.as_ref())))
     }
 
     pub fn is_root(&self) -> bool {
@@ -39,7 +39,7 @@ impl VfsPath {
         str == "/" || str.is_empty()
     }
 
-    pub fn split(&self) -> (VfsPath, Option<Name>) {
+    pub fn split(&self) -> (VfsPath, Option<&Name>) {
         (
             self.0
                 .parent()
@@ -53,7 +53,7 @@ impl VfsPath {
                 .unwrap_or_else(|| ROOT_PATH.clone()),
             self.0
                 .file_name()
-                .map(|n| Name::from_str(n).expect("name to be valid")),
+                .map(|n| n.try_into().expect("name to be valid")),
         )
     }
 
@@ -65,8 +65,8 @@ impl VfsPath {
             .enumerate()
             .scan(root, |path, (n, name)| {
                 if n > 0 {
-                    let name = Name::from_str(name.as_str()).expect("name to be valid");
-                    *path = path.join(&name);
+                    let name = name.as_str().try_into().expect("name to be valid");
+                    *path = path.join(name);
                 }
                 Some(path.clone())
             })

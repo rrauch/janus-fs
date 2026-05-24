@@ -4,11 +4,11 @@ use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{Entity, EntityRow, RawEntityInner};
 use crate::vfs::{
-    EntityHasher, InodeId, InodeMut, Name, Normalizer, Read, TypedInode, Vfs, VfsResult, Write,
+    EntityHasher, InodeId, InodeMut, Name, Normalizer, Read, Timestamp, TypedInode, Vfs, VfsResult,
+    Write,
 };
 use async_trait::async_trait;
 use blake3::Hash;
-use chrono::Utc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -129,7 +129,7 @@ impl<Mode: Read + Write> Vfs<Mode> {
     pub async fn create_file(
         &self,
         parent: &Directory,
-        name: Name,
+        name: &Name,
     ) -> VfsResult<FileHandle<ReadWrite>> {
         todo!()
     }
@@ -234,7 +234,7 @@ impl FileHandle<ReadWrite> {
         let blob = self.inner.writer.finalize().await?;
         let mut file = self.inner.file;
         file.set_content(blob.clone().into());
-        file.set_last_modified(Utc::now());
+        file.set_last_modified(Timestamp::now());
         let file = file.freeze();
         todo!()
     }

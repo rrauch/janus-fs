@@ -14,12 +14,13 @@ use crate::vfs::entity::{
     Freezable, Normalizer, Revision,
 };
 use crate::vfs::file::File;
+use bytemuck::TransparentWrapper;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
+use std::borrow::{Borrow, Cow};
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 use twox_hash::XxHash3_64;
@@ -89,21 +90,117 @@ impl Display for InodeId {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Timestamp(DateTime<Utc>);
+
+impl Timestamp {
+    pub fn now() -> Self {
+        Self(Utc::now())
+    }
+    pub fn from_millis(millis: i64) -> Option<Self> {
+        DateTime::<Utc>::from_timestamp_millis(millis).map(Self)
+    }
+
+    pub fn to_millis(&self) -> i64 {
+        self.0.timestamp_millis()
+    }
+}
+
+impl From<DateTime<Utc>> for Timestamp {
+    fn from(value: DateTime<Utc>) -> Self {
+        Self(DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis()).unwrap())
+    }
+}
+
+impl From<Timestamp> for DateTime<Utc> {
+    fn from(value: Timestamp) -> Self {
+        value.0
+    }
+}
+
+impl Display for Timestamp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl Deref for Timestamp {
+    type Target = DateTime<Utc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[repr(transparent)]
-pub struct Name(String);
+pub struct OwnedName(Cow<'static, str>);
 
-impl FromStr for Name {
-    type Err = NameError;
+impl Borrow<Name> for OwnedName {
+    fn borrow(&self) -> &Name {
+        Name::wrap_ref(self.0.as_ref())
+    }
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        check_valid_filename(s)?;
-        Ok(Name(s.to_string()))
+impl TryFrom<String> for OwnedName {
+    type Error = NameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        check_valid_filename(value.as_str())?;
+        Ok(Self(value.into()))
+    }
+}
+
+impl TryFrom<&'static str> for OwnedName {
+    type Error = NameError;
+
+    fn try_from(value: &'static str) -> Result<Self, Self::Error> {
+        check_valid_filename(value)?;
+        Ok(Self(value.into()))
+    }
+}
+
+impl TryFrom<Cow<'static, str>> for OwnedName {
+    type Error = NameError;
+
+    fn try_from(value: Cow<'static, str>) -> Result<Self, Self::Error> {
+        check_valid_filename(value.as_ref())?;
+        Ok(Self(value))
+    }
+}
+
+impl Deref for OwnedName {
+    type Target = Name;
+
+    fn deref(&self) -> &Self::Target {
+        self.borrow()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, TransparentWrapper)]
+#[repr(transparent)]
+pub struct Name(str);
+
+impl ToOwned for Name {
+    type Owned = OwnedName;
+
+    fn to_owned(&self) -> Self::Owned {
+        OwnedName(self.0.to_string().into())
+    }
+}
+
+impl<'a> TryFrom<&'a str> for &'a Name {
+    type Error = NameError;
+
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        check_valid_filename(value)?;
+        Ok(Name::wrap_ref(value))
     }
 }
 
 impl Deref for Name {
-    type Target = String;
+    type Target = str;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -164,7 +261,7 @@ impl Inode {
     }
 
     #[inline]
-    pub fn created(&self) -> &DateTime<Utc> {
+    pub fn created(&self) -> &Timestamp {
         match self {
             Self::Directory(i) => i.created(),
             Self::File(i) => i.created(),
@@ -172,7 +269,7 @@ impl Inode {
     }
 
     #[inline]
-    pub fn last_modified(&self) -> &DateTime<Utc> {
+    pub fn last_modified(&self) -> &Timestamp {
         match self {
             Self::Directory(i) => i.last_modified(),
             Self::File(i) => i.last_modified(),
@@ -347,7 +444,7 @@ impl<Mode: Read + Write> Vfs<Mode> {
         (EntityRow, Vec<EntityRef>): From<DraftEntity<T, I>>,
     {
         let inode_id = modified_inode.inode_id;
-        let name = modified_inode.name().clone();
+        let name = modified_inode.name().to_owned();
         let draft_entity = modified_inode.freeze();
         let mut tx = self.tx_rw().await?;
         let entity_id = tx.create_entity_if_not_exist(draft_entity).await?;
@@ -494,7 +591,7 @@ where
     ) -> Result<InodeId, DbError> {
         let inode_type = T::db_type();
         let inode_id = InodeId::from_entity_id(entity_key.id());
-        let name = name.as_str();
+        let name = name.as_ref();
         let parent = parent.0 as i64;
         let entity_id = entity_key.id().as_slice();
         let entity_rev = entity_key.revision().as_slice();
@@ -522,7 +619,7 @@ where
         entity_key: &EntityKey,
     ) -> Result<(), DbError> {
         let inode_id = inode_id.0 as i64;
-        let name = name.as_str();
+        let name = name.as_ref();
         let entity_id = entity_key.id().as_slice();
         let entity_rev = entity_key.revision().as_slice();
 

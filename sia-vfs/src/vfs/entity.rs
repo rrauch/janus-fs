@@ -2,13 +2,11 @@ use crate::blob::BlobId;
 use crate::db::{
     DataError, Error as DbError, Read as DbRead, Transaction, TxScope, Write as DbWrite,
 };
-use crate::vfs::{AsDbType, Name};
+use crate::vfs::{AsDbType, Name, OwnedName, Timestamp};
 use crate::{ContentId, TypedUuid};
-use chrono::{DateTime, Utc};
 use derive_where::derive_where;
 use std::borrow::Cow;
 use std::marker::PhantomData;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive_where(Debug, Clone; I)]
@@ -35,7 +33,7 @@ impl<T, I> Entity<T, I> {
     }
 
     #[inline]
-    pub fn created(&self) -> &DateTime<Utc> {
+    pub fn created(&self) -> &Timestamp {
         match self {
             Self::Synced(e) => e.created(),
             Self::Local(e) => e.created(),
@@ -43,7 +41,7 @@ impl<T, I> Entity<T, I> {
     }
 
     #[inline]
-    pub fn last_modified(&self) -> &DateTime<Utc> {
+    pub fn last_modified(&self) -> &Timestamp {
         match self {
             Self::Synced(e) => e.last_modified(),
             Self::Local(e) => e.last_modified(),
@@ -106,9 +104,9 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
     pub(super) fn new(
         entity_id: EntityId,
         revision: Revision,
-        name: Name,
-        created: DateTime<Utc>,
-        last_modified: DateTime<Utc>,
+        name: OwnedName,
+        created: Timestamp,
+        last_modified: Timestamp,
         inner: I,
         mode: Mode,
     ) -> Self {
@@ -138,9 +136,9 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
 #[derive_where(Debug, Clone; I, Mode)]
 pub(crate) struct RawEntityInner<T, I, Mode> {
     id: EntityId,
-    name: Name,
-    created: DateTime<Utc>,
-    last_modified: DateTime<Utc>,
+    name: OwnedName,
+    created: Timestamp,
+    last_modified: Timestamp,
     //extended_attributes: HashMap<String, Bytes>,
     pub(super) inner: I,
     mode: Mode,
@@ -188,11 +186,11 @@ impl<T, I, Mode> RawEntity<T, I, Mode> {
         &self.0.1.name
     }
 
-    pub fn created(&self) -> &DateTime<Utc> {
+    pub fn created(&self) -> &Timestamp {
         &self.0.1.created
     }
 
-    pub fn last_modified(&self) -> &DateTime<Utc> {
+    pub fn last_modified(&self) -> &Timestamp {
         &self.0.1.last_modified
     }
 
@@ -225,19 +223,19 @@ impl<T, I> EntityMut<T, I> {
         &self.0.name
     }
 
-    pub fn set_name(&mut self, new: Name) {
+    pub fn set_name(&mut self, new: OwnedName) {
         self.0.name = new;
     }
 
-    pub fn created(&self) -> &DateTime<Utc> {
+    pub fn created(&self) -> &Timestamp {
         &self.0.created
     }
 
-    pub fn last_modified(&self) -> &DateTime<Utc> {
+    pub fn last_modified(&self) -> &Timestamp {
         &self.0.last_modified
     }
 
-    pub fn set_last_modified(&mut self, new: DateTime<Utc>) {
+    pub fn set_last_modified(&mut self, new: Timestamp) {
         self.0.last_modified = new;
     }
 
@@ -325,7 +323,7 @@ where
                 Ok(EntityRow {
                     id: key.id.clone(),
                     revision: key.revision.clone(),
-                    name: Name::from_str(r.name.as_str()).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
+                    name: OwnedName::try_from(r.name).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
                     mode: match r.mode.as_str() {
                         "L" => Mode::Local,
                         "S" => Mode::Synced,
@@ -348,7 +346,7 @@ where
 pub(crate) struct EntityRow {
     pub id: EntityId,
     pub revision: Revision,
-    pub name: Name,
+    pub name: OwnedName,
     pub mode: Mode,
     pub entity_type: Cow<'static, str>,
     pub remote_location: Option<String>,
@@ -396,8 +394,8 @@ impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
                     value.id,
                     value.revision,
                     value.name,
-                    Utc::now(), //todo: remove
-                    Utc::now(), //todo: remove
+                    Timestamp::now(), //todo: remove
+                    Timestamp::now(), //todo: remove
                     inner,
                     SyncedMode { remote_location },
                 ))
@@ -406,8 +404,8 @@ impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
                 value.id,
                 value.revision,
                 value.name,
-                Utc::now(), //todo: remove
-                Utc::now(), //todo: remove
+                Timestamp::now(), //todo: remove
+                Timestamp::now(), //todo: remove
                 inner,
                 LocalMode,
             )),
@@ -452,7 +450,7 @@ where
         let (row, refs): (EntityRow, Vec<EntityRef>) = draft_entity.into();
         let id = row.id.as_slice();
         let rev = row.revision.as_slice();
-        let name = row.name.as_str();
+        let name = row.name.as_ref();
         let entity_type = row.entity_type.as_ref();
         let mode = match row.mode {
             Mode::Local => "L",

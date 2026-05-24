@@ -4,10 +4,10 @@ use crate::vfs::entity::{
     Freezable, Normalizer, RawEntityInner, Revision,
 };
 use crate::vfs::{
-    AsDbType, Inode, InodeId, InodeMut, Name, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
+    AsDbType, Inode, InodeId, InodeMut, Name, OwnedName, Read, Timestamp, TypedInode, Vfs,
+    VfsError, VfsResult, Write,
 };
 use blake3::{Hash, Hasher};
-use chrono::Utc;
 use futures_util::{StreamExt, TryStream};
 use std::collections::VecDeque;
 
@@ -66,8 +66,8 @@ pub(crate) type DirectoryMut = InodeMut<DirectoryKind, Vec<EntityKey>>;
 pub(crate) type DirectoryDraft = DraftEntity<DirectoryKind, Vec<EntityKey>>;
 
 impl DirectoryDraft {
-    pub fn new_directory_draft(name: Name) -> Self {
-        let now = Utc::now();
+    pub fn new_directory_draft(name: OwnedName) -> Self {
+        let now = Timestamp::now();
         Self::new(
             EntityId::generate(),
             Revision::zeroed(),
@@ -90,7 +90,7 @@ impl From<DirectoryDraft> for (EntityRow, Vec<EntityRef>) {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn create_dir(&self, parent: &Directory, name: Name) -> VfsResult<Directory> {
+    pub async fn create_dir(&self, parent: &Directory, name: &Name) -> VfsResult<Directory> {
         let mut tx = self.tx_rw().await?;
         let inode_id = tx.create_dir(name, parent.inode_id()).await?;
         let dir = match tx.inode_by_id(inode_id).await? {
@@ -160,10 +160,10 @@ where
 {
     async fn create_dir(
         &mut self,
-        name: Name,
+        name: &Name,
         parent_inode_id: InodeId,
     ) -> Result<InodeId, DbError> {
-        let entity = DirectoryDraft::new_directory_draft(name.clone());
+        let entity = DirectoryDraft::new_directory_draft(name.to_owned());
         let entity_id = self.create_entity_if_not_exist(entity).await?;
         Ok(self
             .create_inode::<DirectoryKind>(&name, parent_inode_id, entity_id)
