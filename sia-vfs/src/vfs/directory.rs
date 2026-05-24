@@ -1,13 +1,15 @@
-use crate::db::{Error as DbError, Transaction, TxScope, Write as DbWrite};
+use crate::db::{DataError, Error as DbError, Transaction, TxScope, Write as DbWrite};
 use crate::vfs::entity::{
-    DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityRef, EntityRow, Freezable,
-    Normalizer, RawEntityInner, Revision,
+    DraftEntity, DraftMode, Entity, EntityHasher, EntityId, EntityKey, EntityRef, EntityRow,
+    Freezable, Normalizer, RawEntityInner, Revision,
 };
 use crate::vfs::{
     AsDbType, Inode, InodeId, InodeMut, Name, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
 };
 use blake3::{Hash, Hasher};
 use chrono::Utc;
+use futures_util::{StreamExt, TryStream};
+use std::collections::VecDeque;
 
 pub struct DirectoryKind;
 
@@ -17,8 +19,8 @@ impl AsDbType for DirectoryKind {
     }
 }
 
-impl<Mode> EntityHasher<Vec<EntityId>, Mode> for DirectoryKind {
-    fn hash(inner: &RawEntityInner<Self, Vec<EntityId>, Mode>) -> Hash {
+impl<Mode> EntityHasher<Vec<EntityKey>, Mode> for DirectoryKind {
+    fn hash(inner: &RawEntityInner<Self, Vec<EntityKey>, Mode>) -> Hash {
         let mut hasher = Hasher::new_derive_key("[sia-vfs]/[v0]/[directory_revision]");
         hasher.update(b"begin:\n");
         inner.hash_metadata(&mut hasher);
@@ -28,34 +30,40 @@ impl<Mode> EntityHasher<Vec<EntityId>, Mode> for DirectoryKind {
     }
 }
 
-fn hash_entries(entries: &Vec<EntityId>, hasher: &mut Hasher) {
+fn hash_entries(entries: &Vec<EntityKey>, hasher: &mut Hasher) {
     hasher.update(b"begin_entries:\nno_entries:");
     hasher.update(&entries.len().to_be_bytes());
     hasher.update(b"\nentries:");
     for entry in entries {
         hasher.update(b"entity_id:");
-        hasher.update(entry.as_bytes());
+        hasher.update(entry.id().as_slice());
+        hasher.update(b"\nentity_revision:");
+        hasher.update(entry.revision().as_slice());
         hasher.update(b"\n");
     }
     hasher.update(b"\nend_entries");
 }
 
-impl Normalizer<Vec<EntityId>> for DirectoryKind {
-    fn normalize(value: &mut Vec<EntityId>) {
+impl Normalizer<Vec<EntityKey>> for DirectoryKind {
+    fn normalize(value: &mut Vec<EntityKey>) {
         value.sort();
     }
 }
 
-pub type Directory = TypedInode<DirectoryKind, Vec<EntityId>>;
+pub type Directory = TypedInode<DirectoryKind, Vec<EntityKey>>;
 
 impl Directory {
     pub fn is_root(&self) -> bool {
         self.parent.is_none()
     }
+
+    pub(crate) fn entries(&self) -> &[EntityKey] {
+        self.inner().as_slice()
+    }
 }
 
-pub(crate) type DirectoryMut = InodeMut<DirectoryKind, Vec<EntityId>>;
-pub(crate) type DirectoryDraft = DraftEntity<DirectoryKind, Vec<EntityId>>;
+pub(crate) type DirectoryMut = InodeMut<DirectoryKind, Vec<EntityKey>>;
+pub(crate) type DirectoryDraft = DraftEntity<DirectoryKind, Vec<EntityKey>>;
 
 impl DirectoryDraft {
     pub fn new_directory_draft(name: Name) -> Self {
@@ -97,9 +105,39 @@ impl<Mode: Read + Write> Vfs<Mode> {
         tx.commit().await?;
         Ok(dir)
     }
+
+    pub async fn list(
+        &self,
+        dir: &Directory,
+    ) -> VfsResult<impl TryStream<Ok = Inode, Error = VfsError> + Send + Unpin> {
+        let this = self.clone();
+
+        Ok(futures_util::stream::try_unfold(
+            VecDeque::from_iter(
+                dir.entries()
+                    .iter()
+                    .map(|e| InodeId::from_entity_id(e.id())),
+            ),
+            move |mut remaining_inode_ids| {
+                let this = this.clone();
+                async move {
+                    let inode_id = match remaining_inode_ids.pop_front() {
+                        None => return Ok(None),
+                        Some(key) => key,
+                    };
+
+                    match this.inode_by_id(inode_id).await? {
+                        None => Err(DbError::DataError(DataError::InodeNotFound(inode_id)))?,
+                        Some(inode) => Ok(Some((inode, remaining_inode_ids))),
+                    }
+                }
+            },
+        )
+        .boxed())
+    }
 }
 
-impl TryFrom<EntityRow> for Entity<DirectoryKind, Vec<EntityId>> {
+impl TryFrom<EntityRow> for Entity<DirectoryKind, Vec<EntityKey>> {
     type Error = String;
 
     fn try_from(value: EntityRow) -> Result<Self, Self::Error> {

@@ -3512,6 +3512,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "twox-hash",
  "typed-path",
  "uuid",
  "zstd",

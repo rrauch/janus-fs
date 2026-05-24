@@ -16,14 +16,13 @@ use crate::vfs::entity::{
 use crate::vfs::file::File;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
-use futures_util::{StreamExt, TryStream};
-use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
+use twox_hash::XxHash3_64;
 
 pub(crate) const ROOT_INODE_ID: InodeId = InodeId(1);
 
@@ -70,6 +69,9 @@ pub struct InodeId(u64);
 impl InodeId {
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
+    }
+    pub(crate) fn from_entity_id(entity_id: &EntityId) -> Self {
+        Self(XxHash3_64::oneshot(entity_id.as_slice()))
     }
 }
 
@@ -333,38 +335,6 @@ impl<Mode: Read> Vfs<Mode> {
         Ok(self.tx().await?.inode_by_id(inode_id).await?)
     }
 
-    pub async fn list(
-        &self,
-        dir: &Directory,
-    ) -> VfsResult<impl TryStream<Ok = Inode, Error = VfsError> + Send + Unpin> {
-        let parent_inode_id = dir.inode_id;
-        let this = self.clone();
-        let inode_ids = self
-            .tx()
-            .await?
-            .inode_ids_by_parent(parent_inode_id)
-            .await?;
-
-        Ok(futures_util::stream::try_unfold(
-            VecDeque::from(inode_ids),
-            move |mut remaining_inode_ids| {
-                let this = this.clone();
-                async move {
-                    let inode_id = match remaining_inode_ids.pop_front() {
-                        None => return Ok(None),
-                        Some(key) => key,
-                    };
-
-                    match this.inode_by_id(inode_id).await? {
-                        None => Err(DbError::DataError(DataError::InodeNotFound(inode_id)))?,
-                        Some(inode) => Ok(Some((inode, remaining_inode_ids))),
-                    }
-                }
-            },
-        )
-        .boxed())
-    }
-
     pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
         Ok(self.0.db.read().await?)
     }
@@ -501,21 +471,6 @@ where
             }
         }))
     }
-
-    async fn inode_ids_by_parent(
-        &mut self,
-        parent_inode_id: InodeId,
-    ) -> Result<Vec<InodeId>, DbError> {
-        let parent_id = parent_inode_id.0 as i64;
-        Ok(
-            sqlx::query!("SELECT inode_id FROM vfs where parent = ?", parent_id)
-                .fetch_all(self.conn())
-                .await?
-                .into_iter()
-                .map(|r| InodeId(r.inode_id as u64))
-                .collect::<Vec<_>>(),
-        )
-    }
 }
 
 impl<C: TxScope> Transaction<C>
@@ -538,13 +493,16 @@ where
         entity_key: EntityKey,
     ) -> Result<InodeId, DbError> {
         let inode_type = T::db_type();
+        let inode_id = InodeId::from_entity_id(entity_key.id());
         let name = name.as_str();
         let parent = parent.0 as i64;
         let entity_id = entity_key.id().as_slice();
         let entity_rev = entity_key.revision().as_slice();
 
-        let id = sqlx::query!(
-            "INSERT INTO vfs (inode_type, entity_id, entity_rev, name, parent) VALUES (?, ?, ?, ?, ?)",
+        let id = inode_id.0 as i64;
+        sqlx::query!(
+            "INSERT INTO vfs (inode_id, inode_type, entity_id, entity_rev, name, parent) VALUES (?, ?, ?, ?, ?, ?)",
+            id,
             inode_type,
             entity_id,
             entity_rev,
@@ -552,10 +510,9 @@ where
             parent
         )
         .execute(self.conn())
-        .await?
-        .last_insert_rowid();
+        .await?;
 
-        Ok(InodeId(id as u64))
+        Ok(inode_id)
     }
 
     pub(crate) async fn update_inode(

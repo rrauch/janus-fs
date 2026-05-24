@@ -1,5 +1,5 @@
 use crate::vfs::directory::{DirectoryDraft, DirectoryMut};
-use crate::vfs::entity::{EntityId, EntityKey};
+use crate::vfs::entity::{EntityId, EntityKey, Revision};
 use crate::vfs::{Inode, InodeId, Name};
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
@@ -147,15 +147,22 @@ impl Transaction<ReadWrite> {
 
     async fn update_directory(&mut self, mut dir: DirectoryMut) -> Result<EntityKey, Error> {
         let parent_id = *dir.inode_id().deref() as i64;
-        let entries = sqlx::query!("SELECT entity_id FROM vfs WHERE parent = ?", parent_id)
-            .fetch_all(self.conn())
-            .await?
-            .into_iter()
-            .map(|r| -> Result<EntityId, Error> {
-                Ok(EntityId::try_from_bytes(r.entity_id)
-                    .ok_or_else(|| DataError::ConversionError("invalid entity id".into()))?)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let entries = sqlx::query!(
+            "SELECT entity_id, entity_rev FROM vfs WHERE parent = ?",
+            parent_id
+        )
+        .fetch_all(self.conn())
+        .await?
+        .into_iter()
+        .map(|r| -> Result<EntityKey, Error> {
+            Ok(EntityKey::new(
+                EntityId::try_from_bytes(r.entity_id)
+                    .ok_or_else(|| DataError::ConversionError("invalid entity id".into()))?,
+                Revision::try_from_bytes(r.entity_rev)
+                    .ok_or_else(|| DataError::ConversionError("invalid entity revision".into()))?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
         dir.set_inner(entries);
         self.create_entity_if_not_exist(dir.freeze()).await
     }

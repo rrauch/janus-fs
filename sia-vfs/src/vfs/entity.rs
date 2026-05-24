@@ -273,7 +273,7 @@ pub struct EntityKey {
 }
 
 impl EntityKey {
-    pub(super) fn new(id: EntityId, revision: Revision) -> Self {
+    pub(crate) fn new(id: EntityId, revision: Revision) -> Self {
         Self { id, revision }
     }
 
