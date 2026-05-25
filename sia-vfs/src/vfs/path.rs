@@ -108,6 +108,15 @@ impl<Mode: Read> Vfs<Mode> {
         if path.is_root() {
             return Ok(Some(ROOT_INODE_ID));
         }
+
+        Ok(self
+            .cache()
+            .path_cache()
+            .try_get_with_by_ref(path, async { self._inode_id_by_path(path).await })
+            .await?)
+    }
+
+    async fn _inode_id_by_path(&self, path: &VfsPath) -> VfsResult<Option<InodeId>> {
         Ok(self.tx().await?.inode_id_by_path(path).await?)
     }
 
