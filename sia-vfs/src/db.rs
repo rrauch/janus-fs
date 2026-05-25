@@ -176,8 +176,6 @@ impl Transaction<ReadWrite> {
             .execute(self.conn())
             .await?;
 
-        sqlx::query!("VACUUM").execute(self.conn()).await?;
-
         Ok(())
     }
 

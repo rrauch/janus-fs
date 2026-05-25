@@ -2,8 +2,8 @@ CREATE TABLE entity
 (
     id              BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
                                             LENGTH(id) = 16),
-    revision        BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                            LENGTH(id) = 32),
+    revision        BLOB    NOT NULL CHECK (TYPEOF(revision) = 'blob' AND
+                                            LENGTH(revision) = 32),
     ref_count       INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
     name            TEXT    NOT NULL CHECK (LENGTH(name) > 0 AND
                                             LENGTH(name) <= 255 AND

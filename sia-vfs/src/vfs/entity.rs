@@ -17,7 +17,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use yoke::{Yoke, Yokeable};
 
-#[derive_where(Debug, Clone)]
+#[derive_where(Debug, Clone, PartialEq, Eq)]
 pub enum Entity<T: EntityHandler> {
     Synced(SyncedEntity<T>),
     Local(LocalEntity<T>),
@@ -89,13 +89,13 @@ impl<T: EntityHandler> Entity<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncedMode {
     remote_location: String,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalMode;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftMode;
 
 pub type SyncedEntity<T> = RawEntity<T, SyncedMode>;
@@ -146,7 +146,7 @@ pub trait EntityHandler: Sized {
     fn references(entity: &RawEntityInner<Self>) -> Vec<EntityRef<'_>>;
 }
 
-#[derive_where(Debug)]
+#[derive_where(Debug, PartialEq, Eq)]
 pub(super) struct RawEntityInner<T: EntityHandler> {
     revision: Revision,
     created: Timestamp,
@@ -183,7 +183,7 @@ impl<T: EntityHandler> RawEntityInner<T> {
     }
 }
 
-#[derive(Yokeable, Debug)]
+#[derive(Yokeable, Debug, PartialEq, Eq)]
 struct Metadata<'a> {
     id: &'a EntityId,
     name: &'a Name,
@@ -229,7 +229,7 @@ impl<T: EntityHandler> RawEntityInner<T> {
     }
 }
 
-#[derive_where(Debug, Clone; Mode)]
+#[derive_where(Debug, Clone, PartialEq, Eq; Mode)]
 pub struct RawEntity<T: EntityHandler, Mode>(Arc<(RawEntityInner<T>, Mode)>);
 
 impl<T: EntityHandler, Mode> RawEntity<T, Mode> {

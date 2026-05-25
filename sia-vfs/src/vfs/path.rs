@@ -1,6 +1,6 @@
 use crate::db::{DataError, Error as DbError, Read as DbRead, Transaction, TxScope};
 use crate::vfs::{
-    InodeId, Name, NameError, ROOT_INODE_ID, Read, Vfs, VfsResult, check_valid_filename,
+    Inode, InodeId, Name, NameError, ROOT_INODE_ID, Read, Vfs, VfsResult, check_valid_filename,
 };
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -109,6 +109,14 @@ impl<Mode: Read> Vfs<Mode> {
             return Ok(Some(ROOT_INODE_ID));
         }
         Ok(self.tx().await?.inode_id_by_path(path).await?)
+    }
+
+    pub async fn inode_by_path(&self, path: &VfsPath) -> VfsResult<Option<Inode>> {
+        Ok(if let Some(inode_id) = self.inode_id_by_path(path).await? {
+            self.inode_by_id(inode_id).await?
+        } else {
+            None
+        })
     }
 }
 
