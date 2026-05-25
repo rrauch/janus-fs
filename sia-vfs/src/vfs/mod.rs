@@ -10,12 +10,15 @@ use crate::db::{
 };
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    DraftEntity, Entity, EntityHasher, EntityId, EntityKey, EntityMut, EntityRef, EntityRow,
-    Freezable, Normalizer, Revision,
+    DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
 };
 use crate::vfs::file::File;
+use crate::vfs::path::VfsPath;
+use bytemuck::TransparentWrapper;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
+use std::borrow::{Borrow, Cow};
+use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -68,10 +71,12 @@ pub struct InodeId(u64);
 
 impl InodeId {
     pub(crate) fn new(value: u64) -> Self {
-        Self(value)
+        // SQLite's INTEGER is a signed 64-bit value, so clear the top bit
+        // to keep the value within i64's non-negative range (0..=i64::MAX).
+        Self(value & 0x7FFF_FFFF_FFFF_FFFF)
     }
     pub(crate) fn from_entity_id(entity_id: &EntityId) -> Self {
-        Self(XxHash3_64::oneshot(entity_id.as_slice()))
+        Self::new(XxHash3_64::oneshot(entity_id.as_slice()))
     }
 }
 
@@ -89,21 +94,117 @@ impl Display for InodeId {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Timestamp(DateTime<Utc>);
+
+impl Timestamp {
+    pub fn now() -> Self {
+        Self(Utc::now())
+    }
+    pub fn from_millis(millis: i64) -> Option<Self> {
+        DateTime::<Utc>::from_timestamp_millis(millis).map(Self)
+    }
+
+    pub fn to_millis(&self) -> i64 {
+        self.0.timestamp_millis()
+    }
+}
+
+impl From<DateTime<Utc>> for Timestamp {
+    fn from(value: DateTime<Utc>) -> Self {
+        Self(DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis()).unwrap())
+    }
+}
+
+impl From<Timestamp> for DateTime<Utc> {
+    fn from(value: Timestamp) -> Self {
+        value.0
+    }
+}
+
+impl Display for Timestamp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl Deref for Timestamp {
+    type Target = DateTime<Utc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[repr(transparent)]
-pub struct Name(String);
+pub struct OwnedName(Cow<'static, str>);
 
-impl FromStr for Name {
-    type Err = NameError;
+impl Borrow<Name> for OwnedName {
+    fn borrow(&self) -> &Name {
+        Name::wrap_ref(self.0.as_ref())
+    }
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        check_valid_filename(s)?;
-        Ok(Name(s.to_string()))
+impl TryFrom<String> for OwnedName {
+    type Error = NameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        check_valid_filename(value.as_str())?;
+        Ok(Self(value.into()))
+    }
+}
+
+impl TryFrom<&'static str> for OwnedName {
+    type Error = NameError;
+
+    fn try_from(value: &'static str) -> Result<Self, Self::Error> {
+        check_valid_filename(value)?;
+        Ok(Self(value.into()))
+    }
+}
+
+impl TryFrom<Cow<'static, str>> for OwnedName {
+    type Error = NameError;
+
+    fn try_from(value: Cow<'static, str>) -> Result<Self, Self::Error> {
+        check_valid_filename(value.as_ref())?;
+        Ok(Self(value))
+    }
+}
+
+impl Deref for OwnedName {
+    type Target = Name;
+
+    fn deref(&self) -> &Self::Target {
+        self.borrow()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, TransparentWrapper)]
+#[repr(transparent)]
+pub struct Name(str);
+
+impl ToOwned for Name {
+    type Owned = OwnedName;
+
+    fn to_owned(&self) -> Self::Owned {
+        OwnedName(self.0.to_string().into())
+    }
+}
+
+impl<'a> TryFrom<&'a str> for &'a Name {
+    type Error = NameError;
+
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        check_valid_filename(value)?;
+        Ok(Name::wrap_ref(value))
     }
 }
 
 impl Deref for Name {
-    type Target = String;
+    type Target = str;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -116,10 +217,22 @@ impl AsRef<str> for Name {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inode {
     File(File),
     Directory(Directory),
+}
+
+impl Ord for Inode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id().cmp(&other.id())
+    }
+}
+
+impl PartialOrd for Inode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Inode {
@@ -148,6 +261,14 @@ impl Inode {
     }
 
     #[inline]
+    pub fn path(&self) -> &VfsPath {
+        match self {
+            Self::Directory(i) => i.path(),
+            Self::File(i) => i.path(),
+        }
+    }
+
+    #[inline]
     pub fn len(&self) -> Option<u64> {
         match self {
             Self::Directory(_) => None,
@@ -164,7 +285,7 @@ impl Inode {
     }
 
     #[inline]
-    pub fn created(&self) -> &DateTime<Utc> {
+    pub fn created(&self) -> &Timestamp {
         match self {
             Self::Directory(i) => i.created(),
             Self::File(i) => i.created(),
@@ -172,7 +293,7 @@ impl Inode {
     }
 
     #[inline]
-    pub fn last_modified(&self) -> &DateTime<Utc> {
+    pub fn last_modified(&self) -> &Timestamp {
         match self {
             Self::Directory(i) => i.last_modified(),
             Self::File(i) => i.last_modified(),
@@ -188,10 +309,26 @@ impl Inode {
     }
 
     #[inline]
+    pub fn as_directory(&self) -> Option<&Directory> {
+        match self {
+            Self::Directory(dir) => Some(dir),
+            Self::File(i) => None,
+        }
+    }
+
+    #[inline]
     pub fn is_file(&self) -> bool {
         match self {
             Self::Directory(_) => false,
-            Self::File(i) => true,
+            Self::File(_) => true,
+        }
+    }
+
+    #[inline]
+    pub fn as_file(&self) -> Option<&File> {
+        match self {
+            Self::Directory(_) => None,
+            Self::File(file) => Some(file),
         }
     }
 
@@ -216,26 +353,28 @@ impl From<Directory> for Inode {
     }
 }
 
-#[derive_where(Debug, Clone; I)]
-pub struct TypedInode<T, I> {
+#[derive_where(Debug, Clone, PartialEq, Eq)]
+pub struct TypedInode<T: EntityHandler> {
     parent: Option<InodeId>,
     inode_id: InodeId,
-    entity: Entity<T, I>,
+    path: VfsPath,
+    entity: Entity<T>,
 }
 
-impl<T, I> TypedInode<T, I> {
+impl<T: EntityHandler> TypedInode<T> {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    pub fn path(&self) -> &VfsPath {
+        &self.path
     }
 
     pub fn parent_id(&self) -> Option<InodeId> {
         self.parent
     }
 
-    pub fn into_mut(self) -> InodeMut<T, I>
-    where
-        I: Clone,
-    {
+    pub fn into_mut(self) -> InodeMut<T> {
         InodeMut {
             parent: self.parent,
             inode_id: self.inode_id,
@@ -244,8 +383,8 @@ impl<T, I> TypedInode<T, I> {
     }
 }
 
-impl<T, I> Deref for TypedInode<T, I> {
-    type Target = Entity<T, I>;
+impl<T: EntityHandler> Deref for TypedInode<T> {
+    type Target = Entity<T>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -253,15 +392,15 @@ impl<T, I> Deref for TypedInode<T, I> {
     }
 }
 
-#[derive_where(Debug; I)]
-pub struct InodeMut<T, I> {
+#[derive_where(Debug)]
+pub struct InodeMut<T: EntityHandler> {
     parent: Option<InodeId>,
     inode_id: InodeId,
-    entity: EntityMut<T, I>,
+    entity: EntityMut<T>,
 }
 
-impl<T, I> InodeMut<T, I> {
-    pub(super) fn new(parent: Option<InodeId>, inode_id: InodeId, entity: EntityMut<T, I>) -> Self {
+impl<T: EntityHandler> InodeMut<T> {
+    pub(super) fn new(parent: Option<InodeId>, inode_id: InodeId, entity: EntityMut<T>) -> Self {
         Self {
             parent,
             inode_id,
@@ -275,19 +414,14 @@ impl<T, I> InodeMut<T, I> {
     pub fn parent_id(&self) -> Option<InodeId> {
         self.parent
     }
-}
 
-impl<T, I> InodeMut<T, I>
-where
-    EntityMut<T, I>: Freezable<T, I>,
-{
-    pub(crate) fn freeze(self) -> DraftEntity<T, I> {
+    pub(crate) fn freeze(self) -> DraftEntity<T> {
         self.entity.freeze()
     }
 }
 
-impl<T, I> Deref for InodeMut<T, I> {
-    type Target = EntityMut<T, I>;
+impl<T: EntityHandler> Deref for InodeMut<T> {
+    type Target = EntityMut<T>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -295,7 +429,7 @@ impl<T, I> Deref for InodeMut<T, I> {
     }
 }
 
-impl<T, I> DerefMut for InodeMut<T, I> {
+impl<T: EntityHandler> DerefMut for InodeMut<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.entity
     }
@@ -304,6 +438,12 @@ impl<T, I> DerefMut for InodeMut<T, I> {
 #[derive_where(Debug, Clone)]
 #[repr(transparent)]
 pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
+
+impl<Mode> Vfs<Mode> {
+    pub(crate) fn new(db: Db) -> Self {
+        Self(Arc::new(Inner { db }), PhantomData)
+    }
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -341,13 +481,9 @@ impl<Mode: Read> Vfs<Mode> {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<Inode>
-    where
-        EntityMut<T, I>: Freezable<T, I>,
-        (EntityRow, Vec<EntityRef>): From<DraftEntity<T, I>>,
-    {
+    pub async fn update<T: EntityHandler>(&self, modified_inode: InodeMut<T>) -> VfsResult<Inode> {
         let inode_id = modified_inode.inode_id;
-        let name = modified_inode.name().clone();
+        let name = modified_inode.name().to_owned();
         let draft_entity = modified_inode.freeze();
         let mut tx = self.tx_rw().await?;
         let entity_id = tx.create_entity_if_not_exist(draft_entity).await?;
@@ -428,7 +564,7 @@ where
     ) -> Result<Option<Inode>, DbError> {
         let id = inode_id.0 as i64;
         let r = match sqlx::query!(
-            "SELECT inode_type, entity_id, entity_rev, parent FROM vfs WHERE inode_id = ?",
+            "SELECT inode_type, path, entity_id, entity_rev, parent FROM vfs WHERE inode_id = ?",
             id
         )
         .fetch_optional(self.conn())
@@ -446,11 +582,18 @@ where
         );
 
         let parent = r.parent.map(|id| InodeId(id as u64));
+        let path = r
+            .path
+            .map(|p| VfsPath::from_str(p.as_str()))
+            .transpose()
+            .map_err(|e| DataError::ConversionError(format!("vfs path error: {}", e).into()))?
+            .ok_or_else(|| DataError::ConversionError("inode path is missing".into()))?;
 
         Ok(Some(match r.inode_type.as_str() {
             "D" => Inode::Directory(Directory {
                 parent,
                 inode_id,
+                path,
                 entity: self
                     .entity_by_key(&entity_key)
                     .await?
@@ -459,6 +602,7 @@ where
             "F" => Inode::File(File {
                 parent,
                 inode_id,
+                path,
                 entity: self
                     .entity_by_key(&entity_key)
                     .await?
@@ -486,7 +630,7 @@ where
             .rows_affected())
     }
 
-    pub(super) async fn create_inode<T: AsDbType>(
+    pub(super) async fn create_inode<T: EntityHandler>(
         &mut self,
         name: &Name,
         parent: InodeId,
@@ -494,7 +638,7 @@ where
     ) -> Result<InodeId, DbError> {
         let inode_type = T::db_type();
         let inode_id = InodeId::from_entity_id(entity_key.id());
-        let name = name.as_str();
+        let name = name.as_ref();
         let parent = parent.0 as i64;
         let entity_id = entity_key.id().as_slice();
         let entity_rev = entity_key.revision().as_slice();
@@ -509,8 +653,8 @@ where
             name,
             parent
         )
-        .execute(self.conn())
-        .await?;
+            .execute(self.conn())
+            .await?;
 
         Ok(inode_id)
     }
@@ -522,7 +666,7 @@ where
         entity_key: &EntityKey,
     ) -> Result<(), DbError> {
         let inode_id = inode_id.0 as i64;
-        let name = name.as_str();
+        let name = name.as_ref();
         let entity_id = entity_key.id().as_slice();
         let entity_rev = entity_key.revision().as_slice();
 
@@ -533,9 +677,9 @@ where
             entity_rev,
             inode_id
         )
-        .execute(self.conn())
-        .await?
-        .rows_affected();
+            .execute(self.conn())
+            .await?
+            .rows_affected();
 
         if rows_affected != 1 {
             return Err(DataError::UnexpectedAffectedRows {
@@ -571,13 +715,15 @@ where
     }
 }
 
-trait AsDbType {
-    fn db_type() -> &'static str;
-}
-
 #[cfg(test)]
 mod tests {
     use crate::db::{Db, PageSize};
+    use crate::vfs::directory::Directory;
+    use crate::vfs::path::VfsPath;
+    use crate::vfs::{Inode, InodeId, Name, ReadWrite, Vfs, VfsError};
+    use anyhow::bail;
+    use futures_util::TryStreamExt;
+    use std::str::FromStr;
     use tempfile::{TempDir, tempdir};
 
     async fn new_db() -> anyhow::Result<(Db, TempDir)> {
@@ -587,9 +733,113 @@ mod tests {
         Ok((db, temp_dir))
     }
 
+    async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
+        let (db, temp_dir) = new_db().await?;
+        Ok((Vfs::new(db), temp_dir))
+    }
+
     #[tokio::test]
     async fn bootstrap() -> anyhow::Result<()> {
         let (db, _temp_dir) = new_db().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let root = vfs.root().await?;
+        assert_eq!(root.inode_id(), InodeId(1));
+        let root_path = VfsPath::from_str("/")?;
+        assert_eq!(root.path(), &root_path);
+        let by_path = vfs.inode_id_by_path(&root_path).await?.unwrap();
+        assert_eq!(root.inode_id, by_path);
+        let entries = vfs.list(&root).await?.try_collect::<Vec<_>>().await?;
+        assert!(entries.is_empty());
+        Ok(())
+    }
+
+    async fn create_dirs(vfs: &Vfs<ReadWrite>, parent: &Directory) -> anyhow::Result<()> {
+        let dir_name: &Name = "dir_1".try_into()?;
+        let dir = vfs.create_dir(&parent, dir_name).await?;
+        assert_eq!(dir.name(), dir_name);
+        let parent_inodes = vec![Inode::Directory(dir.clone())];
+        let entries = vfs
+            .list(&vfs.root().await?)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(&entries, &parent_inodes);
+
+        let subdir1_name: &Name = "subdir_1".try_into()?;
+        let subdir1 = vfs.create_dir(&dir, subdir1_name).await?;
+        assert_eq!(subdir1.name(), subdir1_name);
+
+        let subdir2_name: &Name = "subdir_2".try_into()?;
+        let subdir2 = vfs.create_dir(&dir, subdir2_name).await?;
+        assert_eq!(subdir2.name(), subdir2_name);
+
+        let mut dir1_inodes = vec![
+            Inode::Directory(subdir1.clone()),
+            Inode::Directory(subdir2.clone()),
+        ];
+        dir1_inodes.sort();
+
+        assert_eq!(&entries, &parent_inodes);
+        let mut entries = vfs
+            .list(
+                vfs.inode_by_path(&dir.path())
+                    .await?
+                    .unwrap()
+                    .as_directory()
+                    .unwrap(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        entries.sort();
+        assert_eq!(&entries, &dir1_inodes);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_directories() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+        create_dirs(&vfs, &vfs.root().await?).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+        create_dirs(&vfs, &vfs.root().await?).await?;
+        let path = VfsPath::from_str("/dir_1")?;
+        let dir1 = vfs.inode_by_path(&path).await?.unwrap();
+        vfs.delete(dir1.id()).await?;
+        assert_eq!(vfs.inode_by_path(&path).await?, None);
+        assert!(
+            vfs.list(&vfs.root().await?)
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_undeletable() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+        let root = vfs.root().await?;
+
+        match vfs.delete(root.inode_id).await {
+            Err(VfsError::DeleteRootError) => {}
+            _ => bail!("root should not be deletable"),
+        }
+
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use crate::db::{DataError, Error as DbError, Read as DbRead, Transaction, TxScope};
 use crate::vfs::{
-    InodeId, Name, NameError, ROOT_INODE_ID, Read, Vfs, VfsResult, check_valid_filename,
+    Inode, InodeId, Name, NameError, ROOT_INODE_ID, Read, Vfs, VfsResult, check_valid_filename,
 };
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -31,7 +31,7 @@ impl VfsPath {
     }
 
     pub fn join(&self, name: &Name) -> VfsPath {
-        Self(Arc::new(self.0.as_path().join(name.as_str())))
+        Self(Arc::new(self.0.as_path().join(name.as_ref())))
     }
 
     pub fn is_root(&self) -> bool {
@@ -39,7 +39,7 @@ impl VfsPath {
         str == "/" || str.is_empty()
     }
 
-    pub fn split(&self) -> (VfsPath, Option<Name>) {
+    pub fn split(&self) -> (VfsPath, Option<&Name>) {
         (
             self.0
                 .parent()
@@ -53,7 +53,7 @@ impl VfsPath {
                 .unwrap_or_else(|| ROOT_PATH.clone()),
             self.0
                 .file_name()
-                .map(|n| Name::from_str(n).expect("name to be valid")),
+                .map(|n| n.try_into().expect("name to be valid")),
         )
     }
 
@@ -65,8 +65,8 @@ impl VfsPath {
             .enumerate()
             .scan(root, |path, (n, name)| {
                 if n > 0 {
-                    let name = Name::from_str(name.as_str()).expect("name to be valid");
-                    *path = path.join(&name);
+                    let name = name.as_str().try_into().expect("name to be valid");
+                    *path = path.join(name);
                 }
                 Some(path.clone())
             })
@@ -109,6 +109,14 @@ impl<Mode: Read> Vfs<Mode> {
             return Ok(Some(ROOT_INODE_ID));
         }
         Ok(self.tx().await?.inode_id_by_path(path).await?)
+    }
+
+    pub async fn inode_by_path(&self, path: &VfsPath) -> VfsResult<Option<Inode>> {
+        Ok(if let Some(inode_id) = self.inode_id_by_path(path).await? {
+            self.inode_by_id(inode_id).await?
+        } else {
+            None
+        })
     }
 }
 

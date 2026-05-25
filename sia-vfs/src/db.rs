@@ -1,6 +1,6 @@
-use crate::vfs::directory::{DirectoryDraft, DirectoryMut};
+use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
-use crate::vfs::{Inode, InodeId, Name};
+use crate::vfs::{Inode, InodeId, OwnedName};
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -11,7 +11,6 @@ use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -133,7 +132,7 @@ impl Transaction<ReadWrite> {
             .ok_or_else(|| DataError::InodeNotFound(inode_id))?
         {
             Inode::Directory(dir) => {
-                let name = dir.name().clone();
+                let name = dir.name().to_owned();
                 let entity_key = self.update_directory(dir.into_mut()).await?;
                 (name, entity_key)
             }
@@ -163,7 +162,7 @@ impl Transaction<ReadWrite> {
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-        dir.set_inner(entries);
+        dir.set_body(DirectoryBody::new(entries));
         self.create_entity_if_not_exist(dir.freeze()).await
     }
 
@@ -177,8 +176,6 @@ impl Transaction<ReadWrite> {
             .execute(self.conn())
             .await?;
 
-        sqlx::query!("VACUUM").execute(self.conn()).await?;
-
         Ok(())
     }
 
@@ -190,13 +187,13 @@ impl Transaction<ReadWrite> {
             == 0
         {
             // empty vfs, create new root
-            let root = DirectoryDraft::new_directory_draft(Name::from_str("ROOT").unwrap());
-            let name = root.name().clone();
+            let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap());
+            let name = root.name().to_owned();
             let entity_key = self.create_entity_if_not_exist(root).await?;
 
             let entity_id = entity_key.id().as_slice();
             let entity_rev = entity_key.revision().as_slice();
-            let name = name.as_str();
+            let name = name.as_ref();
 
             sqlx::query!(
                 "INSERT INTO vfs (inode_id, inode_type, entity_id, entity_rev, name) VALUES (1, 'D', ?, ?, ?)",
