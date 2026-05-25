@@ -2,20 +2,28 @@ use crate::blob::BlobId;
 use crate::db::{
     DataError, Error as DbError, Read as DbRead, Transaction, TxScope, Write as DbWrite,
 };
-use crate::vfs::{AsDbType, Name, OwnedName, Timestamp};
+use crate::gen_flatbuffers::vfs::entity::{
+    DirectoryEntry as FlatDirEntry, Entity as FlatEntity, EntityBody as FlatEntityBody,
+    EntityBuilder,
+};
+use crate::vfs::{Name, NameError, OwnedName, Timestamp};
 use crate::{ContentId, TypedUuid};
 use derive_where::derive_where;
+use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
 use std::borrow::Cow;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use thiserror::Error;
+use yoke::{Yoke, Yokeable};
 
-#[derive_where(Debug, Clone; I)]
-pub enum Entity<T, I> {
-    Synced(SyncedEntity<T, I>),
-    Local(LocalEntity<T, I>),
+#[derive_where(Debug, Clone)]
+pub enum Entity<T: EntityHandler> {
+    Synced(SyncedEntity<T>),
+    Local(LocalEntity<T>),
 }
 
-impl<T, I> Entity<T, I> {
+impl<T: EntityHandler> Entity<T> {
     #[inline]
     pub fn entity_id(&self) -> &EntityId {
         match self {
@@ -65,18 +73,15 @@ impl<T, I> Entity<T, I> {
     }
 
     #[inline]
-    pub(crate) fn inner(&self) -> &I {
+    pub(crate) fn body(&self) -> &<T::Body as Yokeable<'_>>::Output {
         match self {
-            Self::Synced(e) => e.inner(),
-            Self::Local(e) => e.inner(),
+            Self::Synced(e) => e.body(),
+            Self::Local(e) => e.body(),
         }
     }
 
     #[inline]
-    pub(crate) fn into_mut(self) -> EntityMut<T, I>
-    where
-        I: Clone,
-    {
+    pub(crate) fn into_mut(self) -> EntityMut<T> {
         match self {
             Self::Synced(e) => e.into_mut(),
             Self::Local(e) => e.into_mut(),
@@ -93,182 +98,320 @@ pub struct LocalMode;
 #[derive(Debug, Clone)]
 pub struct DraftMode;
 
-pub type SyncedEntity<T, I> = RawEntity<T, I, SyncedMode>;
-pub type LocalEntity<T, I> = RawEntity<T, I, LocalMode>;
-pub type DraftEntity<T, I> = RawEntity<T, I, DraftMode>;
+pub type SyncedEntity<T> = RawEntity<T, SyncedMode>;
+pub type LocalEntity<T> = RawEntity<T, LocalMode>;
+pub type DraftEntity<T> = RawEntity<T, DraftMode>;
 
-#[derive_where(Debug, Clone; I, Mode)]
-pub struct RawEntity<T, I, Mode>(Arc<(Revision, RawEntityInner<T, I, Mode>)>);
-
-impl<T, I, Mode> RawEntity<T, I, Mode> {
-    pub(super) fn new(
-        entity_id: EntityId,
-        revision: Revision,
-        name: OwnedName,
-        created: Timestamp,
-        last_modified: Timestamp,
-        inner: I,
-        mode: Mode,
-    ) -> Self {
-        let inner = RawEntityInner {
-            id: entity_id,
-            name,
-            created,
-            last_modified,
-            inner,
-            mode,
-            _phantom: PhantomData,
-        };
-
-        Self(Arc::new((revision, inner)))
-    }
-
-    pub(super) fn into_inner(self) -> RawEntityInner<T, I, Mode>
-    where
-        I: Clone,
-        Mode: Clone,
-    {
-        let (_, inner) = Arc::unwrap_or_clone(self.0);
-        inner
-    }
+#[derive(Debug, Error)]
+pub enum EntityError {
+    #[error(transparent)]
+    InvalidFlatbuffer(#[from] InvalidFlatbuffer),
+    #[error("revision mismatch: [{expected}] != [{actual}]")]
+    RevisionMismatch {
+        expected: Revision,
+        actual: Revision,
+    },
+    #[error(transparent)]
+    NameError(#[from] NameError),
+    #[error("invalid timestamp")]
+    TimestampError,
+    #[error("expected directory entity")]
+    ExpectedDirectory,
+    #[error("expected file entity")]
+    ExpectedFile,
+    #[error("bytemuck error: {0}")]
+    BytemuckError(String),
+    #[error("incorrect entity type: [{expected}] != [{actual}]")]
+    IncorrectType { expected: String, actual: String },
+    #[error("remote location missing")]
+    MissingRemoteLocation,
 }
 
-#[derive_where(Debug, Clone; I, Mode)]
-pub(crate) struct RawEntityInner<T, I, Mode> {
-    id: EntityId,
-    name: OwnedName,
+pub trait EntityHandler: Sized {
+    type Body: for<'a> Yokeable<'a>;
+
+    fn db_type() -> &'static str;
+
+    fn to_owned(body: &<Self::Body as Yokeable>::Output) -> Self::Body;
+
+    fn extract(entity: FlatEntity) -> Result<<Self::Body as Yokeable>::Output, EntityError>;
+    fn serialize_body(
+        b: &mut FlatBufferBuilder,
+        entity: &EntityMut<Self>,
+    ) -> (FlatEntityBody, WIPOffset<UnionWIPOffset>);
+
+    fn normalize(value: &mut Self::Body);
+    fn hash(entity: &RawEntityInner<Self>) -> blake3::Hash;
+
+    fn references(entity: &RawEntityInner<Self>) -> Vec<EntityRef<'_>>;
+}
+
+#[derive_where(Debug)]
+pub(super) struct RawEntityInner<T: EntityHandler> {
+    revision: Revision,
     created: Timestamp,
     last_modified: Timestamp,
-    //extended_attributes: HashMap<String, Bytes>,
-    pub(super) inner: I,
-    mode: Mode,
+    metadata: Yoke<Metadata<'static>, Arc<[u8]>>,
+    #[derive_where(skip)]
+    body: Yoke<T::Body, Arc<[u8]>>,
     _phantom: PhantomData<T>,
 }
 
-impl<T, I, Mode> RawEntityInner<T, I, Mode> {
+impl<T: EntityHandler> RawEntityInner<T> {
+    pub fn id(&self) -> &EntityId {
+        self.metadata.get().id
+    }
+
+    pub fn revision(&self) -> &Revision {
+        &self.revision
+    }
+
+    pub fn name(&self) -> &Name {
+        self.metadata.get().name
+    }
+
+    pub fn created(&self) -> &Timestamp {
+        &self.created
+    }
+
+    pub fn last_modified(&self) -> &Timestamp {
+        &self.last_modified
+    }
+
+    pub fn body(&self) -> &<T::Body as Yokeable<'_>>::Output {
+        self.body.get()
+    }
+}
+
+#[derive(Yokeable, Debug)]
+struct Metadata<'a> {
+    id: &'a EntityId,
+    name: &'a Name,
+}
+
+impl<T: EntityHandler> RawEntityInner<T> {
+    fn try_from_flatbuffer(buffer: Arc<[u8]>) -> Result<Self, EntityError> {
+        let mut created = None;
+        let mut last_modified = None;
+
+        let metadata = Yoke::try_attach_to_cart::<EntityError, _>(buffer.clone(), |data| {
+            let flat_entity = flatbuffers::root::<FlatEntity>(data)?;
+            let id = EntityId::from_byte_ref(&flat_entity.id().0);
+            let name: &Name = flat_entity.name().try_into()?;
+            created = Some(
+                Timestamp::from_millis(flat_entity.created()).ok_or(EntityError::TimestampError)?,
+            );
+            last_modified = Some(
+                Timestamp::from_millis(flat_entity.last_modified())
+                    .ok_or(EntityError::TimestampError)?,
+            );
+
+            Ok(Metadata { id, name })
+        })?;
+
+        let body = Yoke::try_attach_to_cart::<EntityError, _>(buffer, |data| {
+            T::extract(flatbuffers::root::<FlatEntity>(data)?)
+        })?;
+
+        let mut this = Self {
+            revision: Revision::zeroed(), // placeholder
+            created: created.unwrap(),
+            last_modified: last_modified.unwrap(),
+            metadata,
+            body,
+            _phantom: PhantomData,
+        };
+
+        let revision = Revision::new_internal(T::hash(&this));
+        this.revision = revision;
+
+        Ok(this)
+    }
+}
+
+#[derive_where(Debug, Clone; Mode)]
+pub struct RawEntity<T: EntityHandler, Mode>(Arc<(RawEntityInner<T>, Mode)>);
+
+impl<T: EntityHandler, Mode> RawEntity<T, Mode> {
+    pub(super) fn new(inner: RawEntityInner<T>, mode: Mode) -> Self {
+        Self(Arc::new((inner, mode)))
+    }
+}
+
+impl<T: EntityHandler> RawEntityInner<T> {
     pub(crate) fn hash_metadata(&self, hasher: &mut blake3::Hasher) {
         hasher.update(b"begin_metadata:\nid:");
-        hasher.update(self.id.as_slice());
+        hasher.update(self.id().as_slice());
         hasher.update(b"\nname:");
-        hasher.update(self.name.as_bytes());
+        hasher.update(self.name().as_bytes());
         hasher.update(b"\ncreated:");
-        hasher.update(&self.created.timestamp().to_be_bytes());
+        hasher.update(&self.created().to_millis().to_be_bytes());
         hasher.update(b"\nlast_modified:");
-        hasher.update(&self.last_modified.timestamp().to_be_bytes());
+        hasher.update(&self.last_modified().to_millis().to_be_bytes());
         hasher.update(b"\nend_metadata");
     }
 }
 
-impl<T, I, Mode> RawEntityInner<T, I, Mode> {
-    fn into_draft(self) -> RawEntityInner<T, I, DraftMode> {
-        RawEntityInner {
-            id: self.id,
-            name: self.name,
-            created: self.created,
-            last_modified: self.last_modified,
-            inner: self.inner,
-            mode: DraftMode,
+impl<T: EntityHandler, Mode> RawEntity<T, Mode> {
+    pub fn entity_id(&self) -> &EntityId {
+        self.0.0.id()
+    }
+
+    pub fn revision(&self) -> &Revision {
+        self.0.0.revision()
+    }
+
+    pub fn name(&self) -> &Name {
+        self.0.0.name()
+    }
+
+    pub fn created(&self) -> &Timestamp {
+        self.0.0.created()
+    }
+
+    pub fn last_modified(&self) -> &Timestamp {
+        self.0.0.last_modified()
+    }
+
+    pub fn body(&self) -> &<T::Body as Yokeable<'_>>::Output {
+        self.0.0.body()
+    }
+    pub(crate) fn to_flatbuffer(&self) -> Arc<[u8]> {
+        self.0.0.metadata.backing_cart().clone()
+    }
+
+    pub(crate) fn references(&self) -> Vec<EntityRef<'_>> {
+        T::references(&self.0.0)
+    }
+}
+
+impl<T: EntityHandler> RawEntity<T, SyncedMode> {
+    pub fn remote_location(&self) -> &String {
+        &self.0.1.remote_location
+    }
+}
+
+impl<T: EntityHandler, Mode: Clone> RawEntity<T, Mode> {
+    pub fn into_mut(self) -> EntityMut<T> {
+        EntityMut {
+            id: self.entity_id().clone(),
+            name: self.name().to_owned(),
+            created: self.created().clone(),
+            last_modified: self.last_modified().clone(),
+            body: T::to_owned(self.body()),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T, I, Mode> RawEntity<T, I, Mode> {
-    pub fn entity_id(&self) -> &EntityId {
-        &self.0.1.id
-    }
-
-    pub fn revision(&self) -> &Revision {
-        &self.0.0
-    }
-
-    pub fn name(&self) -> &Name {
-        &self.0.1.name
-    }
-
-    pub fn created(&self) -> &Timestamp {
-        &self.0.1.created
-    }
-
-    pub fn last_modified(&self) -> &Timestamp {
-        &self.0.1.last_modified
-    }
-
-    pub fn inner(&self) -> &I {
-        &self.0.1.inner
-    }
+#[derive_where(Debug)]
+pub struct EntityMut<T: EntityHandler> {
+    id: EntityId,
+    name: OwnedName,
+    created: Timestamp,
+    last_modified: Timestamp,
+    //extended_attributes: HashMap<String, Bytes>,
+    #[derive_where(skip)]
+    body: <T as EntityHandler>::Body,
+    _phantom: PhantomData<T>,
 }
 
-impl<T, I> RawEntity<T, I, SyncedMode> {
-    pub fn remote_location(&self) -> &String {
-        &self.0.1.mode.remote_location
+impl<T: EntityHandler> EntityMut<T> {
+    pub(super) fn new(name: OwnedName, body: <T as EntityHandler>::Body) -> Self {
+        let now = Timestamp::now();
+        Self {
+            id: EntityId::generate(),
+            name,
+            created: now,
+            last_modified: now,
+            body,
+            _phantom: PhantomData,
+        }
     }
-}
 
-impl<T, I: Clone, Mode: Clone> RawEntity<T, I, Mode> {
-    pub fn into_mut(self) -> EntityMut<T, I> {
-        EntityMut(self.into_inner().into_draft())
-    }
-}
-
-#[derive_where(Debug; I)]
-pub struct EntityMut<T, I>(RawEntityInner<T, I, DraftMode>);
-
-impl<T, I> EntityMut<T, I> {
     pub fn id(&self) -> &EntityId {
-        &self.0.id
+        &self.id
     }
 
     pub fn name(&self) -> &Name {
-        &self.0.name
+        &self.name
     }
 
     pub fn set_name(&mut self, new: OwnedName) {
-        self.0.name = new;
+        self.name = new;
     }
 
     pub fn created(&self) -> &Timestamp {
-        &self.0.created
+        &self.created
     }
 
     pub fn last_modified(&self) -> &Timestamp {
-        &self.0.last_modified
+        &self.last_modified
     }
 
     pub fn set_last_modified(&mut self, new: Timestamp) {
-        self.0.last_modified = new;
+        self.last_modified = new;
     }
 
-    pub(crate) fn inner(&self) -> &I {
-        &self.0.inner
+    pub(crate) fn body(&self) -> &<T as EntityHandler>::Body {
+        &self.body
     }
 
-    pub(crate) fn inner_mut(&mut self) -> &mut I {
-        &mut self.0.inner
+    pub(crate) fn body_mut(&mut self) -> &mut <T as EntityHandler>::Body {
+        &mut self.body
     }
 
-    pub(crate) fn set_inner(&mut self, new: I) {
-        self.0.inner = new;
+    pub(crate) fn set_body(&mut self, new: <T as EntityHandler>::Body) {
+        self.body = new;
+    }
+
+    pub(crate) fn freeze(mut self) -> DraftEntity<T> {
+        T::normalize(&mut self.body);
+        let inner = RawEntityInner::try_from_flatbuffer(Arc::from(self.to_flatbuffer()))
+            .expect("deserialization to never fail");
+        RawEntity::new(inner, DraftMode)
+    }
+
+    fn to_flatbuffer(&self) -> Vec<u8> {
+        let mut b = FlatBufferBuilder::new();
+
+        // Strings (offsets) must be created BEFORE the parent table starts.
+        let name = b.create_string(self.name().as_ref());
+
+        let (body_type, body) = T::serialize_body(&mut b, &self);
+
+        let id = self.id.as_flatbuffer();
+
+        let mut eb = EntityBuilder::new(&mut b);
+        eb.add_id(id);
+        eb.add_name(name);
+        eb.add_created(self.created.to_millis());
+        eb.add_last_modified(self.last_modified.to_millis());
+        eb.add_body_type(body_type);
+        eb.add_body(body);
+        let entity = eb.finish();
+        b.finish(entity, None);
+        b.finished_data().to_vec()
     }
 }
 
-pub trait Freezable<T, I> {
-    fn freeze(self) -> DraftEntity<T, I>;
-}
-
-impl<T: EntityHasher<I, DraftMode> + Normalizer<I>, I> Freezable<T, I> for EntityMut<T, I> {
-    fn freeze(mut self) -> DraftEntity<T, I> {
-        T::normalize(&mut self.0.inner);
-        let revision = ContentId::new_internal(T::hash(&self.0));
-        RawEntity(Arc::new((revision, self.0)))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(C)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable,
+)]
 pub struct EntityKey {
     id: EntityId,
     revision: Revision,
 }
+
+// ensure EntityKey can be safely cast from Flatbuffer
+const _: () = {
+    assert!(size_of::<EntityKey>() == size_of::<FlatDirEntry>());
+    assert!(align_of::<EntityKey>() == align_of::<FlatDirEntry>());
+    assert!(std::mem::offset_of!(EntityKey, id) == 0);
+    assert!(std::mem::offset_of!(EntityKey, revision) == 16);
+    assert!(align_of::<EntityKey>() == 1);
+};
 
 impl EntityKey {
     pub(crate) fn new(id: EntityId, revision: Revision) -> Self {
@@ -290,24 +433,16 @@ pub type EntityId = TypedUuid<EntityKind>;
 pub struct RevisionKind;
 pub type Revision = ContentId<RevisionKind>;
 
-pub(crate) trait EntityHasher<I, Mode>: Sized {
-    fn hash(inner: &RawEntityInner<Self, I, Mode>) -> blake3::Hash;
-}
-
-pub trait Normalizer<I> {
-    fn normalize(value: &mut I);
-}
-
 impl<C: TxScope> Transaction<C>
 where
     Self: DbRead,
 {
-    pub(super) async fn entity_by_key<T, I>(
+    pub(super) async fn entity_by_key<T: EntityHandler>(
         &mut self,
         key: &EntityKey,
-    ) -> Result<Option<Entity<T, I>>, DbError>
+    ) -> Result<Option<Entity<T>>, DbError>
     where
-        Entity<T, I>: TryFrom<EntityRow>,
+        Entity<T>: TryFrom<EntityRow>,
     {
         let id_ref = key.id.as_slice();
         let rev_ref = key.revision.as_slice();
@@ -331,7 +466,7 @@ where
                     },
                     entity_type: r.entity_type.into(),
                     remote_location: r.remote_location,
-                    data: r.data,
+                    data: Arc::from(r.data.unwrap_or_default()),
                 })
             })
             .transpose()?
@@ -350,12 +485,36 @@ pub(crate) struct EntityRow {
     pub mode: Mode,
     pub entity_type: Cow<'static, str>,
     pub remote_location: Option<String>,
-    pub data: Option<Vec<u8>>,
+    pub data: Arc<[u8]>,
 }
 
-pub(crate) enum EntityRef {
-    Blob(BlobId),
-    Entity(EntityKey),
+pub(crate) enum EntityRef<'a> {
+    Blob(Cow<'a, BlobId>),
+    Entity(Cow<'a, EntityKey>),
+}
+
+impl From<BlobId> for EntityRef<'static> {
+    fn from(value: BlobId) -> Self {
+        Self::Blob(Cow::Owned(value))
+    }
+}
+
+impl<'a> From<&'a BlobId> for EntityRef<'a> {
+    fn from(value: &'a BlobId) -> Self {
+        Self::Blob(Cow::Borrowed(value))
+    }
+}
+
+impl From<EntityKey> for EntityRef<'static> {
+    fn from(value: EntityKey) -> Self {
+        Self::Entity(Cow::Owned(value))
+    }
+}
+
+impl<'a> From<&'a EntityKey> for EntityRef<'a> {
+    fn from(value: &'a EntityKey) -> Self {
+        Self::Entity(Cow::Borrowed(value))
+    }
 }
 
 pub(super) enum Mode {
@@ -363,16 +522,17 @@ pub(super) enum Mode {
     Local,
 }
 
-impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<Vec<u8>>)> for EntityRow {
-    fn from((entity, data): (DraftEntity<T, I>, Option<Vec<u8>>)) -> Self {
+impl<T: EntityHandler> From<&DraftEntity<T>> for EntityRow {
+    fn from(entity: &DraftEntity<T>) -> Self {
         let id = entity.entity_id().clone();
         let revision = entity.revision().clone();
-        let value = entity.into_inner();
+        let name = entity.name().to_owned();
+        let data = entity.to_flatbuffer();
 
         Self {
             id,
             revision,
-            name: value.name,
+            name,
             mode: Mode::Local,
             entity_type: T::db_type().into(),
             remote_location: None,
@@ -381,34 +541,30 @@ impl<T: AsDbType, I: Clone> From<(DraftEntity<T, I>, Option<Vec<u8>>)> for Entit
     }
 }
 
-impl<T, I> TryFrom<(EntityRow, I)> for Entity<T, I> {
-    type Error = String;
+impl<T: EntityHandler> TryFrom<EntityRow> for Entity<T> {
+    type Error = EntityError;
 
-    fn try_from((value, inner): (EntityRow, I)) -> Result<Self, Self::Error> {
+    fn try_from(value: EntityRow) -> Result<Self, Self::Error> {
+        let raw_entity = RawEntityInner::try_from_flatbuffer(value.data)?;
+        if raw_entity.revision() != &value.revision {
+            return Err(EntityError::RevisionMismatch {
+                expected: value.revision,
+                actual: raw_entity.revision,
+            });
+        };
+
         Ok(match value.mode {
             Mode::Synced => {
                 let remote_location = value
                     .remote_location
-                    .ok_or_else(|| "remote_location is missing".to_string())?;
+                    .ok_or_else(|| EntityError::MissingRemoteLocation)?;
+
                 Entity::Synced(SyncedEntity::new(
-                    value.id,
-                    value.revision,
-                    value.name,
-                    Timestamp::now(), //todo: remove
-                    Timestamp::now(), //todo: remove
-                    inner,
+                    raw_entity,
                     SyncedMode { remote_location },
                 ))
             }
-            Mode::Local => Entity::Local(LocalEntity::new(
-                value.id,
-                value.revision,
-                value.name,
-                Timestamp::now(), //todo: remove
-                Timestamp::now(), //todo: remove
-                inner,
-                LocalMode,
-            )),
+            Mode::Local => Entity::Local(LocalEntity::new(raw_entity, LocalMode)),
         })
     }
 }
@@ -417,13 +573,10 @@ impl<C: TxScope> Transaction<C>
 where
     Self: DbWrite,
 {
-    pub(crate) async fn create_entity_if_not_exist<T, I>(
+    pub(crate) async fn create_entity_if_not_exist<T: EntityHandler>(
         &mut self,
-        draft_entity: DraftEntity<T, I>,
-    ) -> Result<EntityKey, DbError>
-    where
-        (EntityRow, Vec<EntityRef>): From<DraftEntity<T, I>>,
-    {
+        draft_entity: DraftEntity<T>,
+    ) -> Result<EntityKey, DbError> {
         let id = draft_entity.entity_id();
         let rev = draft_entity.revision();
         let id_slice = id.as_slice();
@@ -434,9 +587,9 @@ where
             id_slice,
             rev_slice,
         )
-        .fetch_one(self.conn())
-        .await?
-        .entity_exists
+            .fetch_one(self.conn())
+            .await?
+            .entity_exists
         {
             // entity already exists
             return Ok(EntityKey {
@@ -446,8 +599,8 @@ where
         }
 
         // entity does not exist yet, creating from scratch
-
-        let (row, refs): (EntityRow, Vec<EntityRef>) = draft_entity.into();
+        let refs = draft_entity.references();
+        let row = EntityRow::from(&draft_entity);
         let id = row.id.as_slice();
         let rev = row.revision.as_slice();
         let name = row.name.as_ref();
@@ -457,7 +610,7 @@ where
             Mode::Synced => "S",
         };
         let remote_location = row.remote_location.as_ref().map(|l| l.as_str());
-        let data = row.data.as_ref().map(|d| d.as_slice());
+        let data = row.data.as_ref();
 
         sqlx::query!(
             "INSERT INTO entity (id, revision, name, entity_type, mode, remote_location, data)

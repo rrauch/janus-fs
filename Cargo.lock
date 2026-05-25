@@ -3601,6 +3601,7 @@ dependencies = [
  "twox-hash",
  "typed-path",
  "uuid",
+ "yoke",
  "zstd",
 ]
 

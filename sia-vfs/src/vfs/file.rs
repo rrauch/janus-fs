@@ -1,71 +1,110 @@
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::blob::{Blob, BlobId};
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
-use crate::vfs::directory::Directory;
-use crate::vfs::entity::{Entity, EntityRow, RawEntityInner};
-use crate::vfs::{
-    EntityHasher, InodeId, InodeMut, Name, Normalizer, Read, Timestamp, TypedInode, Vfs, VfsResult,
-    Write,
+use crate::gen_flatbuffers::vfs::entity::{
+    Entity as FlatEntity, EntityBody as FlatEntityBody, File as FlatFile, FileArgs,
 };
+use crate::vfs::directory::Directory;
+use crate::vfs::entity::{EntityError, EntityHandler, EntityMut, EntityRef, RawEntityInner};
+use crate::vfs::{InodeId, InodeMut, Name, Read, Timestamp, TypedInode, Vfs, VfsResult, Write};
 use async_trait::async_trait;
 use blake3::Hash;
+use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
+use std::borrow::Cow;
 use std::io::SeekFrom;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use uuid::Uuid;
+use yoke::Yokeable;
 
 pub struct FileKind;
 
-impl<Mode> EntityHasher<BlobInfo, Mode> for FileKind {
-    fn hash(inner: &RawEntityInner<Self, BlobInfo, Mode>) -> Hash {
-        let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_revision]");
-        hasher.update(b"begin:\n");
-        inner.hash_metadata(&mut hasher);
-        hasher.update(b"\nbegin_blob:\nid:\n");
-        hasher.update(inner.inner.blob_id.as_slice());
-        hasher.update(b"\nlength:\n");
-        hasher.update(&inner.inner.len.to_be_bytes());
-        hasher.update(b"\nend_blob\nend");
-        hasher.finalize()
-    }
-}
-
-impl Normalizer<BlobInfo> for FileKind {
-    fn normalize(value: &mut BlobInfo) {}
-}
-
-#[derive(Debug, Clone)]
-pub struct BlobInfo {
-    blob_id: BlobId,
+#[derive(Yokeable, Debug, Clone)]
+pub struct FileBody<'a> {
     len: u64,
+    blob_id: Cow<'a, BlobId>,
 }
 
-impl BlobInfo {
-    fn serialize(&self) -> Vec<u8> {
-        todo!()
-    }
-
-    fn deserialize(input: &[u8]) -> Result<Self, String> {
-        todo!()
+impl FileBody<'_> {
+    pub fn into_owned(self) -> FileBody<'static> {
+        FileBody {
+            len: self.len,
+            blob_id: Cow::Owned(self.blob_id.into_owned()),
+        }
     }
 }
 
-impl From<Blob> for BlobInfo {
+impl From<Blob> for FileBody<'static> {
     fn from(value: Blob) -> Self {
         Self {
-            blob_id: value.id().clone(),
+            blob_id: Cow::Owned(value.id().clone()),
             len: value.len(),
         }
     }
 }
 
-pub type File = TypedInode<FileKind, BlobInfo>;
-pub type FileMut = InodeMut<FileKind, BlobInfo>;
+impl EntityHandler for FileKind {
+    type Body = FileBody<'static>;
+
+    fn db_type() -> &'static str {
+        "F"
+    }
+
+    fn to_owned(body: &<Self::Body as Yokeable>::Output) -> Self::Body {
+        body.clone().into_owned()
+    }
+
+    fn extract(entity: FlatEntity) -> Result<<Self::Body as Yokeable>::Output, EntityError> {
+        let dir = entity.body_as_file().ok_or(EntityError::ExpectedFile)?;
+        Ok(FileBody {
+            len: dir.len(),
+            blob_id: Cow::Borrowed(BlobId::from_byte_ref(&dir.blob_id().0)),
+        })
+    }
+
+    fn serialize_body(
+        b: &mut FlatBufferBuilder,
+        entity: &EntityMut<Self>,
+    ) -> (FlatEntityBody, WIPOffset<UnionWIPOffset>) {
+        let blob_id = entity.body().blob_id.as_flatbuffer();
+        let file = FlatFile::create(
+            b,
+            &FileArgs {
+                len: entity.body().len,
+                blob_id: Some(blob_id),
+            },
+        );
+        (FlatEntityBody::File, file.as_union_value())
+    }
+
+    fn normalize(value: &mut Self::Body) {
+        // nothing do to
+    }
+
+    fn hash(entity: &RawEntityInner<Self>) -> Hash {
+        let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_entity]");
+        hasher.update(b"begin:\n");
+        entity.hash_metadata(&mut hasher);
+        hasher.update(b"\nbegin_blob:\nid:\n");
+        hasher.update(entity.body().blob_id.as_slice());
+        hasher.update(b"\nlength:\n");
+        hasher.update(&entity.body().len.to_be_bytes());
+        hasher.update(b"\nend_blob\nend");
+        hasher.finalize()
+    }
+
+    fn references(entity: &RawEntityInner<Self>) -> Vec<EntityRef<'_>> {
+        vec![EntityRef::from(entity.body().blob_id.as_ref())]
+    }
+}
+
+pub type File = TypedInode<FileKind>;
+pub type FileMut = InodeMut<FileKind>;
 
 impl File {
     pub fn len(&self) -> u64 {
-        self.inner().len
+        self.body().len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -73,45 +112,13 @@ impl File {
     }
 
     pub(crate) fn blob_id(&self) -> &BlobId {
-        &self.inner().blob_id
-    }
-}
-
-impl TryFrom<EntityRow> for Entity<FileKind, BlobInfo> {
-    type Error = String;
-
-    fn try_from(value: EntityRow) -> Result<Self, Self::Error> {
-        if value.entity_type != "F" {
-            return Err(format!(
-                "invalid entity_type; expected 'F' but got '{}'",
-                value.entity_type
-            ));
-        }
-
-        /*let blob_info = BlobInfo::deserialize(
-            value
-                .data
-                .as_ref()
-                .ok_or_else(|| "data is missing".to_string())?
-                .as_slice(),
-        )?;
-
-        if &blob_info.blob_id != blob_id {
-            return Err(format!(
-                "blob_id mismatch: {} != {}",
-                blob_id, blob_info.blob_id
-            ));
-        }
-
-        (value, blob_info).try_into()*/
-
-        todo!()
+        &self.body().blob_id
     }
 }
 
 impl FileMut {
-    pub(crate) fn set_content(&mut self, new: BlobInfo) {
-        self.set_inner(new);
+    pub(crate) fn set_content(&mut self, new: FileBody<'static>) {
+        self.set_body(new);
     }
 }
 

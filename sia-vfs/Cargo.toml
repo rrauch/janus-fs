@@ -29,6 +29,7 @@ tracing = "0.1"
 twox-hash = { version = "2.1", features = ["xxhash3_64", "std"] }
 typed-path = "0.12"
 uuid = { version = "1.23", features = ["v7", "bytemuck"] }
+yoke = "0.8"
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]

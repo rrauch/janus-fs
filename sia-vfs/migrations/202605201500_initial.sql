@@ -17,10 +17,10 @@ CREATE TABLE entity
 
     PRIMARY KEY (id, revision),
 
-    -- Make sure synced entities have a remote_location
+    -- Make sure synced entities have a remote_location and no data while local ones have data and no remote_location
     CHECK (
-        (mode = 'S' AND remote_location IS NOT NULL) OR
-        (mode = 'L' AND remote_location IS NULL)
+        (mode = 'S' AND remote_location IS NOT NULL AND data IS NULL) OR
+        (mode = 'L' AND remote_location IS NULL AND data IS NOT NULL)
         )
 );
 
@@ -39,8 +39,7 @@ CREATE TRIGGER entity_update_only_local_to_synced_or_refcount
         OR OLD.name IS NOT NEW.name
         OR OLD.entity_type IS NOT NEW.entity_type
 BEGIN
-    SELECT RAISE(ABORT, 'entity update: only L->S mode transition allowed')
-    WHERE NOT (
+    SELECT RAISE(ABORT, 'entity update: only L->S mode transition allowed') WHERE NOT (
         OLD.mode = 'L' AND NEW.mode = 'S'
             AND OLD.remote_location IS NULL
             AND NEW.remote_location IS NOT NULL
@@ -130,10 +129,11 @@ END;
 
 CREATE TABLE blob
 (
-    id              BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                                     LENGTH(id) = 32),
-    ref_count       INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
-    size            INTEGER          NOT NULL CHECK (size >= 0),
+    id        BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                               LENGTH(id) = 32),
+    ref_count INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    size      INTEGER          NOT NULL CHECK (size >= 0
+) ,
     mode            TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
     remote_location TEXT,
 
@@ -156,8 +156,7 @@ CREATE TRIGGER blob_update_only_local_to_synced_or_refcount
         OR OLD.id IS NOT NEW.id
         OR OLD.size IS NOT NEW.size
 BEGIN
-    SELECT RAISE(ABORT, 'blob update: only L->S mode transition allowed')
-    WHERE NOT (
+    SELECT RAISE(ABORT, 'blob update: only L->S mode transition allowed') WHERE NOT (
         OLD.mode = 'L' AND NEW.mode = 'S'
             AND OLD.id = NEW.id
             AND OLD.size = NEW.size
@@ -206,8 +205,7 @@ CREATE TRIGGER chunk_update_only_local_to_synced_or_refcount
         OR OLD.id IS NOT NEW.id
         OR OLD.data IS NOT NEW.data
 BEGIN
-    SELECT RAISE(ABORT, 'chunk update: only L->S mode transition allowed')
-    WHERE NOT (
+    SELECT RAISE(ABORT, 'chunk update: only L->S mode transition allowed') WHERE NOT (
         OLD.mode = 'L' AND NEW.mode = 'S'
             AND OLD.id = NEW.id
             AND OLD.remote_location IS NULL
@@ -297,8 +295,7 @@ CREATE TRIGGER vfs_insert_type_match
     ON vfs
     FOR EACH ROW
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type')
-    WHERE NEW.inode_type != (SELECT entity_type
+    SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type') WHERE NEW.inode_type != (SELECT entity_type
                              FROM entity
                              WHERE id = NEW.entity_id
                                AND revision = NEW.entity_rev);
@@ -311,8 +308,7 @@ CREATE TRIGGER vfs_update_type_match
     FOR EACH ROW
     WHEN OLD.entity_rev IS NOT NEW.entity_rev
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type')
-    WHERE NEW.inode_type != (SELECT entity_type
+    SELECT RAISE(ABORT, 'vfs: inode_type must match entity_type') WHERE NEW.inode_type != (SELECT entity_type
                              FROM entity
                              WHERE id = NEW.entity_id
                                AND revision = NEW.entity_rev);
@@ -327,7 +323,7 @@ CREATE TRIGGER vfs_immutable_fields_update
         OR OLD.inode_id != NEW.inode_id
         OR OLD.inode_type != NEW.inode_type
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: entity_id, inode_id and inode_type cannot be changed');
+SELECT RAISE(ABORT, 'vfs: entity_id, inode_id and inode_type cannot be changed');
 END;
 
 -- Ensure root inode_type is D
@@ -337,7 +333,7 @@ CREATE TRIGGER vfs_root_inode_type_insert
     FOR EACH ROW
     WHEN NEW.inode_type != 'D' AND NEW.inode_id = 1
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: root inode_type must be D');
+SELECT RAISE(ABORT, 'vfs: root inode_type must be D');
 END;
 
 -- Ensure root cannot be deleted
@@ -355,14 +351,13 @@ CREATE TRIGGER vfs_parent_insert
     BEFORE INSERT
     ON vfs
     FOR EACH ROW
-    WHEN (NEW.inode_id = 1 AND NEW.parent IS NOT NULL)
-        OR (NEW.inode_id != 1 AND NEW.parent IS NULL)
+    WHEN (NEW.inode_id = 1 AND NEW.parent IS NOT NULL) OR (NEW.inode_id != 1 AND NEW.parent IS NULL)
         OR (NEW.inode_id != 1 AND NEW.parent IS NOT NULL AND
             (SELECT inode_type
              FROM vfs
              WHERE inode_id = NEW.parent) != 'D')
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent directory');
+SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent directory');
 END;
 
 -- Ensure only directories parents, and that only root has no parent (on update)
@@ -370,14 +365,13 @@ CREATE TRIGGER vfs_parent_update
     BEFORE UPDATE
     ON vfs
     FOR EACH ROW
-    WHEN (NEW.inode_id = 1 AND NEW.parent IS NOT NULL)
-        OR (NEW.inode_id != 1 AND NEW.parent IS NULL)
+    WHEN (NEW.inode_id = 1 AND NEW.parent IS NOT NULL) OR (NEW.inode_id != 1 AND NEW.parent IS NULL)
         OR (NEW.inode_id != 1 AND NEW.parent IS NOT NULL AND
             (SELECT inode_type
              FROM vfs
              WHERE inode_id = NEW.parent) != 'D')
 BEGIN
-    SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent directory');
+SELECT RAISE(ABORT, 'vfs: invalid parent: root must have NULL parent, others must have a parent directory');
 END;
 
 -- Prevent an inode from becoming its own parent (on insert)
@@ -421,11 +415,10 @@ CREATE TRIGGER vfs_prevent_loops_on_update
     ON vfs
     FOR EACH ROW
     WHEN NEW.parent IS NOT NULL
-        AND (OLD.parent IS NULL OR NEW.parent != OLD.parent)
-        AND NEW.parent != NEW.inode_id
+    AND (OLD.parent IS NULL OR NEW.parent != OLD.parent)
+    AND NEW.parent != NEW.inode_id
 BEGIN
-    SELECT RAISE(ABORT, 'Loop detected in hierarchy - don''t be your own grandparent!')
-    WHERE EXISTS (SELECT 1
+SELECT RAISE(ABORT, 'Loop detected in hierarchy - don''t be your own grandparent!') WHERE EXISTS (SELECT 1
                   FROM vfs_inode_ancestors
                   WHERE ancestor = NEW.inode_id
                     AND inode_id = NEW.parent);
@@ -465,10 +458,10 @@ CREATE TRIGGER vfs_mark_inode_parent_dirty_on_update
         OR OLD.parent != NEW.parent
         OR OLD.entity_rev != NEW.entity_rev
 BEGIN
-    UPDATE vfs
-    SET is_dirty = 1
-    WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
-      AND inode_id != NEW.inode_id;
+UPDATE vfs
+SET is_dirty = 1
+WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
+  AND inode_id != NEW.inode_id;
 END;
 
 -- Recursively mark all dirty inodes where necessary
@@ -478,10 +471,10 @@ CREATE TRIGGER vfs_mark_dirty_inodes_on_update_recursive
     FOR EACH ROW
     WHEN NEW.is_dirty = 1 AND OLD.is_dirty != 1
 BEGIN
-    UPDATE vfs
-    SET is_dirty = 1
-    WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
-      AND inode_id != NEW.inode_id
+UPDATE vfs
+SET is_dirty = 1
+WHERE (inode_id = NEW.parent OR inode_id = OLD.parent)
+  AND inode_id != NEW.inode_id
       AND is_dirty != 1;
 END;
 
@@ -508,9 +501,9 @@ CREATE TRIGGER vfs_update_inode_path_on_update
         OR (OLD.parent IS NOT NULL AND NEW.parent IS NULL)
         OR OLD.parent != NEW.parent
 BEGIN
-    UPDATE vfs
-    SET path = NULL
-    WHERE inode_id = NEW.inode_id;
+UPDATE vfs
+SET path = NULL
+WHERE inode_id = NEW.inode_id;
 END;
 
 -- Recursively update the paths of marked objects
@@ -649,7 +642,7 @@ CREATE TRIGGER single_sync_job_only
     WHEN (SELECT COUNT(*)
           FROM sync_job) > 0
 BEGIN
-    SELECT RAISE(ABORT, 'sync_job: only a single row allowed at a time');
+SELECT RAISE(ABORT, 'sync_job: only a single row allowed at a time');
 END;
 
 CREATE TRIGGER sync_job_root_entity_type_insert
@@ -661,7 +654,7 @@ CREATE TRIGGER sync_job_root_entity_type_insert
           WHERE id = NEW.root_entity_id
             AND revision = NEW.root_entity_rev) != 'D'
 BEGIN
-    SELECT RAISE(ABORT, 'sync_job root must reference an entity of type D');
+SELECT RAISE(ABORT, 'sync_job root must reference an entity of type D');
 END;
 
 CREATE TRIGGER sync_job_immutable
@@ -684,7 +677,8 @@ CREATE TRIGGER sync_job_gc
     WHEN (SELECT COUNT(*)
           FROM sync_job) = 0
 BEGIN
-    DELETE FROM sync_job_queue;
+DELETE
+FROM sync_job_queue;
 END;
 
 -- Increment entity ref_count when sync_job is inserted
@@ -714,12 +708,12 @@ END;
 CREATE TABLE sync_job_queue
 (
     id             INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    type           TEXT                              NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
+    type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
     blob_id        BLOB REFERENCES blob (id),
     chunk_id       BLOB REFERENCES chunk (id),
     entity_id      BLOB,
     entity_rev     BLOB,
-    estimated_size INTEGER                           NOT NULL CHECK (estimated_size > 0),
+    estimated_size INTEGER NOT NULL CHECK (estimated_size > 0),
 
     FOREIGN KEY (entity_id, entity_rev) REFERENCES entity (id, revision),
 

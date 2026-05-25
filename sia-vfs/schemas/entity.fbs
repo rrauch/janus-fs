@@ -25,10 +25,11 @@ table Directory {
 union EntityBody { File, Directory }
 
 table Entity {
+  id: Uuid (required);
   name: string (required);
   created: int64;
   last_modified: int64;
-  body: EntityBody;
+  body: EntityBody (required);
 }
 
 root_type Entity;

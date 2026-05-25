@@ -10,8 +10,8 @@ use crate::db::{
 };
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
-    DraftEntity, Entity, EntityHasher, EntityId, EntityKey, EntityMut, EntityRef, EntityRow,
-    Freezable, Normalizer, Revision,
+    DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, EntityRef, EntityRow,
+    Revision,
 };
 use crate::vfs::file::File;
 use bytemuck::TransparentWrapper;
@@ -313,14 +313,14 @@ impl From<Directory> for Inode {
     }
 }
 
-#[derive_where(Debug, Clone; I)]
-pub struct TypedInode<T, I> {
+#[derive_where(Debug, Clone)]
+pub struct TypedInode<T: EntityHandler> {
     parent: Option<InodeId>,
     inode_id: InodeId,
-    entity: Entity<T, I>,
+    entity: Entity<T>,
 }
 
-impl<T, I> TypedInode<T, I> {
+impl<T: EntityHandler> TypedInode<T> {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
@@ -329,10 +329,7 @@ impl<T, I> TypedInode<T, I> {
         self.parent
     }
 
-    pub fn into_mut(self) -> InodeMut<T, I>
-    where
-        I: Clone,
-    {
+    pub fn into_mut(self) -> InodeMut<T> {
         InodeMut {
             parent: self.parent,
             inode_id: self.inode_id,
@@ -341,8 +338,8 @@ impl<T, I> TypedInode<T, I> {
     }
 }
 
-impl<T, I> Deref for TypedInode<T, I> {
-    type Target = Entity<T, I>;
+impl<T: EntityHandler> Deref for TypedInode<T> {
+    type Target = Entity<T>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -350,15 +347,15 @@ impl<T, I> Deref for TypedInode<T, I> {
     }
 }
 
-#[derive_where(Debug; I)]
-pub struct InodeMut<T, I> {
+#[derive_where(Debug)]
+pub struct InodeMut<T: EntityHandler> {
     parent: Option<InodeId>,
     inode_id: InodeId,
-    entity: EntityMut<T, I>,
+    entity: EntityMut<T>,
 }
 
-impl<T, I> InodeMut<T, I> {
-    pub(super) fn new(parent: Option<InodeId>, inode_id: InodeId, entity: EntityMut<T, I>) -> Self {
+impl<T: EntityHandler> InodeMut<T> {
+    pub(super) fn new(parent: Option<InodeId>, inode_id: InodeId, entity: EntityMut<T>) -> Self {
         Self {
             parent,
             inode_id,
@@ -372,19 +369,14 @@ impl<T, I> InodeMut<T, I> {
     pub fn parent_id(&self) -> Option<InodeId> {
         self.parent
     }
-}
 
-impl<T, I> InodeMut<T, I>
-where
-    EntityMut<T, I>: Freezable<T, I>,
-{
-    pub(crate) fn freeze(self) -> DraftEntity<T, I> {
+    pub(crate) fn freeze(self) -> DraftEntity<T> {
         self.entity.freeze()
     }
 }
 
-impl<T, I> Deref for InodeMut<T, I> {
-    type Target = EntityMut<T, I>;
+impl<T: EntityHandler> Deref for InodeMut<T> {
+    type Target = EntityMut<T>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -392,7 +384,7 @@ impl<T, I> Deref for InodeMut<T, I> {
     }
 }
 
-impl<T, I> DerefMut for InodeMut<T, I> {
+impl<T: EntityHandler> DerefMut for InodeMut<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.entity
     }
@@ -438,11 +430,7 @@ impl<Mode: Read> Vfs<Mode> {
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn update<T, I>(&self, modified_inode: InodeMut<T, I>) -> VfsResult<Inode>
-    where
-        EntityMut<T, I>: Freezable<T, I>,
-        (EntityRow, Vec<EntityRef>): From<DraftEntity<T, I>>,
-    {
+    pub async fn update<T: EntityHandler>(&self, modified_inode: InodeMut<T>) -> VfsResult<Inode> {
         let inode_id = modified_inode.inode_id;
         let name = modified_inode.name().to_owned();
         let draft_entity = modified_inode.freeze();
@@ -583,7 +571,7 @@ where
             .rows_affected())
     }
 
-    pub(super) async fn create_inode<T: AsDbType>(
+    pub(super) async fn create_inode<T: EntityHandler>(
         &mut self,
         name: &Name,
         parent: InodeId,
@@ -666,10 +654,6 @@ where
 
         Ok(())
     }
-}
-
-trait AsDbType {
-    fn db_type() -> &'static str;
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use crate::vfs::directory::{DirectoryDraft, DirectoryMut};
+use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
 use crate::vfs::{Inode, InodeId, OwnedName};
 use sqlx::migrate::MigrateError;
@@ -162,7 +162,7 @@ impl Transaction<ReadWrite> {
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-        dir.set_inner(entries);
+        dir.set_body(DirectoryBody::new(entries));
         self.create_entity_if_not_exist(dir.freeze()).await
     }
 

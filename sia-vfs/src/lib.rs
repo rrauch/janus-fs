@@ -1,3 +1,4 @@
+use crate::gen_flatbuffers::vfs::entity::{ContentId as FlatContentId, Uuid as FlatUuid};
 use bytemuck::TransparentWrapper;
 use derive_where::derive_where;
 use std::cmp::Ordering;
@@ -17,7 +18,7 @@ pub struct TypedUuid<T>(uuid::Uuid, PhantomData<T>);
 // SAFETY: `TypedUuid<T>` is `#[repr(transparent)]` over `uuid::Uuid`, which is
 // `Pod` (and `Zeroable`). The `PhantomData<T>` field is zero-sized
 // with no alignment requirements, so the layout is identical to `uuid::Uuid`.
-unsafe impl<T> TransparentWrapper<[u8; 32]> for TypedUuid<T> {}
+unsafe impl<T> TransparentWrapper<uuid::Uuid> for TypedUuid<T> {}
 unsafe impl<T: 'static> bytemuck::Zeroable for TypedUuid<T> {}
 unsafe impl<T: 'static> bytemuck::Pod for TypedUuid<T> {}
 
@@ -28,6 +29,23 @@ impl<T> TypedUuid<T> {
             Err(_) => return None,
         };
         Some(Self(uuid::Uuid::from_bytes(bytes), PhantomData))
+    }
+
+    pub(crate) fn from_byte_ref(input: &[u8; 16]) -> &Self {
+        Self::wrap_ref(uuid::Uuid::wrap_ref(input))
+    }
+
+    pub(crate) fn as_flatbuffer(&self) -> &FlatUuid {
+        const {
+            assert!(size_of::<FlatUuid>() == size_of::<[u8; 16]>());
+            assert!(align_of::<FlatUuid>() == align_of::<[u8; 16]>());
+            assert!(size_of::<TypedUuid<T>>() == size_of::<[u8; 16]>());
+            assert!(align_of::<TypedUuid<T>>() == align_of::<[u8; 16]>());
+        }
+        // SAFETY: `TypedUuid<T>` is `#[repr(transparent)]` over `[u8; 16]`.
+        // The const assertions above verify both `TypedUuid<T>` and
+        // `FlatUuid` have identical size and alignment to `[u8; 16]`.
+        unsafe { &*(self.0.as_bytes().as_ptr() as *const FlatUuid) }
     }
 
     pub(crate) fn generate() -> Self {
@@ -77,6 +95,19 @@ impl<T> ContentId<T> {
             Err(_) => return None,
         };
         Some(Self(bytes, PhantomData))
+    }
+
+    pub(crate) fn as_flatbuffer(&self) -> &FlatContentId {
+        const {
+            assert!(size_of::<FlatContentId>() == size_of::<[u8; 32]>());
+            assert!(align_of::<FlatContentId>() == align_of::<[u8; 32]>());
+            assert!(size_of::<ContentId<T>>() == size_of::<[u8; 32]>());
+            assert!(align_of::<ContentId<T>>() == align_of::<[u8; 32]>());
+        }
+        // SAFETY: `ContentId<T>` is `#[repr(transparent)]` over `[u8; 32]`.
+        // The const assertions above verify both `ContentId<T>` and
+        // `FlatContentId` have identical size and alignment to `[u8; 32]`.
+        unsafe { &*(self.0.as_ptr() as *const FlatContentId) }
     }
 
     pub(crate) fn from_byte_ref(input: &[u8; 32]) -> &Self {
