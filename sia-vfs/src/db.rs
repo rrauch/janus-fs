@@ -1,3 +1,4 @@
+use crate::vfs::cache::Cache;
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
 use crate::vfs::{Inode, InodeId, OwnedName};
@@ -57,8 +58,7 @@ impl AsMut<SqliteConnection> for ReadOnly {
     }
 }
 
-#[repr(transparent)]
-pub struct ReadWrite(SqlxTransaction<'static, Sqlite>);
+pub struct ReadWrite(SqlxTransaction<'static, Sqlite>, Cache);
 
 impl AsMut<SqliteConnection> for ReadWrite {
     #[inline]
@@ -89,7 +89,13 @@ impl Transaction<ReadWrite> {
     #[inline]
     pub async fn commit(mut self) -> Result<(), Error> {
         self.process_dirty_inodes().await?;
-        Ok(self.0.0.commit().await?)
+        self.0.0.commit().await?;
+
+        // invalidate caches after successful commit
+        self.0.1.inode_cache().invalidate_all();
+        self.0.1.path_cache().invalidate_all();
+
+        Ok(())
     }
 
     async fn process_dirty_inodes(&mut self) -> Result<(), Error> {
@@ -230,8 +236,8 @@ impl SqlitePool {
         Ok(Transaction(ReadOnly(self.reader.acquire().await?)))
     }
 
-    async fn write(&self) -> Result<Transaction<ReadWrite>, SqlxError> {
-        Ok(Transaction(ReadWrite(self.writer.begin().await?)))
+    async fn write(&self, cache: Cache) -> Result<Transaction<ReadWrite>, SqlxError> {
+        Ok(Transaction(ReadWrite(self.writer.begin().await?, cache)))
     }
 }
 
@@ -239,6 +245,7 @@ impl SqlitePool {
 struct DbInner {
     pool: SqlitePool,
     db_file: PathBuf,
+    cache: Cache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,15 +302,20 @@ impl Db {
         db_file: PathBuf,
         max_connections: u8,
         page_size: PageSize,
+        cache: Cache,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
-        let mut tx = pool.write().await?;
+        let mut tx = pool.write(cache.clone()).await?;
         tx.bootstrap().await?;
         tx.housekeeping().await?;
         tx.commit().await?;
 
-        Ok(Self(Arc::new(DbInner { pool, db_file })))
+        Ok(Self(Arc::new(DbInner {
+            pool,
+            db_file,
+            cache,
+        })))
     }
 
     pub async fn read(&self) -> Result<Transaction<ReadOnly>, Error> {
@@ -311,7 +323,7 @@ impl Db {
     }
 
     pub async fn write(&self) -> Result<Transaction<ReadWrite>, Error> {
-        Ok(self.0.pool.write().await?)
+        Ok(self.0.pool.write(self.0.cache.clone()).await?)
     }
 }
 

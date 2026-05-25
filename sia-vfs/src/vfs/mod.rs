@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod directory;
 pub mod entity;
 pub mod file;
@@ -5,9 +6,10 @@ pub mod path;
 
 use crate::blob::BlobId;
 use crate::db::{
-    DataError, Db, Error as DbError, Read as DbRead, ReadOnly as DbReadOnly,
+    DataError, Db, Error as DbError, PageSize, Read as DbRead, ReadOnly as DbReadOnly,
     ReadWrite as DbReadWrite, Transaction, TxScope, Write as DbWrite,
 };
+use crate::vfs::cache::{Cache, CacheSettings};
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
@@ -22,6 +24,7 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -47,6 +50,8 @@ pub enum VfsError {
     MissingRoot,
     #[error("other error: {0}")]
     Other(String),
+    #[error(transparent)]
+    CachedError(#[from] Arc<VfsError>),
 }
 
 #[derive(Error, Debug)]
@@ -439,15 +444,26 @@ impl<T: EntityHandler> DerefMut for InodeMut<T> {
 #[repr(transparent)]
 pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 
+#[bon::bon]
 impl<Mode> Vfs<Mode> {
-    pub(crate) fn new(db: Db) -> Self {
-        Self(Arc::new(Inner { db }), PhantomData)
+    #[builder(derive(Debug))]
+    pub async fn new(
+        db_file: PathBuf,
+        #[builder(default)] db_page_size: PageSize,
+        #[builder(default = 25)] max_db_connections: u8,
+        #[builder(default)] cache_settings: CacheSettings,
+    ) -> Result<Self, VfsError> {
+        let cache = Cache::new(&cache_settings);
+        let db = Db::new(db_file, max_db_connections, db_page_size, cache.clone()).await?;
+
+        Ok(Self(Arc::new(Inner { db, cache }), PhantomData))
     }
 }
 
 #[derive(Debug)]
 struct Inner {
     db: Db,
+    cache: Cache,
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -472,11 +488,23 @@ impl<Mode: Read> Vfs<Mode> {
     }
 
     pub async fn inode_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Inode>> {
+        Ok(self
+            .cache()
+            .inode_cache()
+            .try_get_with(inode_id, async { self._inode_by_id(inode_id).await })
+            .await?)
+    }
+
+    async fn _inode_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Inode>> {
         Ok(self.tx().await?.inode_by_id(inode_id).await?)
     }
 
     pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
         Ok(self.0.db.read().await?)
+    }
+
+    pub(crate) fn cache(&self) -> &Cache {
+        &self.0.cache
     }
 }
 
@@ -717,7 +745,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{Db, PageSize};
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
     use crate::vfs::{Inode, InodeId, Name, ReadWrite, Vfs, VfsError};
@@ -726,21 +753,16 @@ mod tests {
     use std::str::FromStr;
     use tempfile::{TempDir, tempdir};
 
-    async fn new_db() -> anyhow::Result<(Db, TempDir)> {
+    async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
-        let db = Db::new(path, 10, PageSize::default()).await?;
-        Ok((db, temp_dir))
-    }
 
-    async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
-        let (db, temp_dir) = new_db().await?;
-        Ok((Vfs::new(db), temp_dir))
+        Ok((Vfs::builder().db_file(path).build().await?, temp_dir))
     }
 
     #[tokio::test]
     async fn bootstrap() -> anyhow::Result<()> {
-        let (db, _temp_dir) = new_db().await?;
+        let (_vfs, _temp_dir) = new_vfs().await?;
         Ok(())
     }
 
