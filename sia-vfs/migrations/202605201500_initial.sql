@@ -572,7 +572,7 @@ END;
 CREATE TABLE temp_file_handle
 (
     id       INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL CHECK (id >= 0),
-    inode_id INTEGER REFERENCES vfs (inode_id) -- NULL in case of new file
+    inode_id INTEGER REFERENCES vfs (inode_id) NOT NULL
 );
 
 CREATE TRIGGER temp_file_handle_no_updates

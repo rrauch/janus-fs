@@ -1,3 +1,5 @@
+use crate::blob::BlobId;
+use crate::chunk::ChunkId;
 use crate::vfs::cache::Cache;
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
@@ -43,10 +45,22 @@ pub enum DataError {
     EntityNotFound(EntityKey),
     #[error("inode {0} not found")]
     InodeNotFound(InodeId),
+    #[error("blob {0} not found")]
+    BlobNotFound(BlobId),
     #[error("wrong number of rows affected: {actual} != {expected}")]
     UnexpectedAffectedRows { expected: u64, actual: u64 },
     #[error("dirty file detected: inode [{0}] should be directory or root")]
     DirtyFile(InodeId),
+    #[error("remote location missing")]
+    MissingRemoteLocation,
+    #[error("blob id mismatch: [{expected}] != [{actual}]")]
+    BlobIdMismatch { expected: BlobId, actual: BlobId },
+    #[error("chunk id mismatch: [{expected}] != [{actual}]")]
+    ChunkIdMismatch { expected: ChunkId, actual: ChunkId },
+    #[error("chunk {0} not found")]
+    ChunkNotFound(ChunkId),
+    #[error("storage mode unsupported")]
+    UnsupportedStorageMode,
 }
 
 #[repr(transparent)]

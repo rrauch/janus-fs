@@ -6,7 +6,7 @@ use crate::gen_flatbuffers::vfs::entity::{
     DirectoryEntry as FlatDirEntry, Entity as FlatEntity, EntityBody as FlatEntityBody,
     EntityBuilder,
 };
-use crate::vfs::{Name, NameError, OwnedName, Timestamp};
+use crate::vfs::{Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsResult};
 use crate::{ContentId, TypedUuid};
 use derive_where::derive_where;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
@@ -123,8 +123,6 @@ pub enum EntityError {
     BytemuckError(String),
     #[error("incorrect entity type: [{expected}] != [{actual}]")]
     IncorrectType { expected: String, actual: String },
-    #[error("remote location missing")]
-    MissingRemoteLocation,
 }
 
 pub trait EntityHandler: Sized {
@@ -460,12 +458,11 @@ where
                     revision: key.revision.clone(),
                     name: OwnedName::try_from(r.name).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
                     mode: match r.mode.as_str() {
-                        "L" => Mode::Local,
-                        "S" => Mode::Synced,
+                        "L" => StorageMode::Local,
+                        "S" => StorageMode::Synced(r.remote_location.ok_or(DataError::MissingRemoteLocation)?),
                         other => return Err(DataError::ConversionError(format!("invalid mode: {}", other).into()))?,
                     },
                     entity_type: r.entity_type.into(),
-                    remote_location: r.remote_location,
                     data: Arc::from(r.data.unwrap_or_default()),
                 })
             })
@@ -482,9 +479,8 @@ pub(crate) struct EntityRow {
     pub id: EntityId,
     pub revision: Revision,
     pub name: OwnedName,
-    pub mode: Mode,
+    pub mode: StorageMode,
     pub entity_type: Cow<'static, str>,
-    pub remote_location: Option<String>,
     pub data: Arc<[u8]>,
 }
 
@@ -517,11 +513,6 @@ impl<'a> From<&'a EntityKey> for EntityRef<'a> {
     }
 }
 
-pub(super) enum Mode {
-    Synced,
-    Local,
-}
-
 impl<T: EntityHandler> From<&DraftEntity<T>> for EntityRow {
     fn from(entity: &DraftEntity<T>) -> Self {
         let id = entity.entity_id().clone();
@@ -533,9 +524,8 @@ impl<T: EntityHandler> From<&DraftEntity<T>> for EntityRow {
             id,
             revision,
             name,
-            mode: Mode::Local,
+            mode: StorageMode::Local,
             entity_type: T::db_type().into(),
-            remote_location: None,
             data,
         }
     }
@@ -554,17 +544,11 @@ impl<T: EntityHandler> TryFrom<EntityRow> for Entity<T> {
         };
 
         Ok(match value.mode {
-            Mode::Synced => {
-                let remote_location = value
-                    .remote_location
-                    .ok_or_else(|| EntityError::MissingRemoteLocation)?;
-
-                Entity::Synced(SyncedEntity::new(
-                    raw_entity,
-                    SyncedMode { remote_location },
-                ))
-            }
-            Mode::Local => Entity::Local(LocalEntity::new(raw_entity, LocalMode)),
+            StorageMode::Synced(remote_location) => Entity::Synced(SyncedEntity::new(
+                raw_entity,
+                SyncedMode { remote_location },
+            )),
+            StorageMode::Local => Entity::Local(LocalEntity::new(raw_entity, LocalMode)),
         })
     }
 }
@@ -605,11 +589,10 @@ where
         let rev = row.revision.as_slice();
         let name = row.name.as_ref();
         let entity_type = row.entity_type.as_ref();
-        let mode = match row.mode {
-            Mode::Local => "L",
-            Mode::Synced => "S",
+        let (mode, remote_location) = match &row.mode {
+            StorageMode::Local => ("L", None),
+            StorageMode::Synced(loc) => ("S", Some(loc.as_str())),
         };
-        let remote_location = row.remote_location.as_ref().map(|l| l.as_str());
         let data = row.data.as_ref();
 
         sqlx::query!(
@@ -653,5 +636,19 @@ where
             id: row.id,
             revision: row.revision,
         })
+    }
+
+    pub(crate) async fn update<T: EntityHandler>(
+        &mut self,
+        inode_id: InodeId,
+        name: &Name,
+        draft_entity: DraftEntity<T>,
+    ) -> VfsResult<Inode> {
+        let entity_id = self.create_entity_if_not_exist(draft_entity).await?;
+        self.update_inode(inode_id, &name, &entity_id).await?;
+        Ok(self
+            .inode_by_id(inode_id)
+            .await?
+            .ok_or_else(|| DbError::DataError(DataError::InodeNotFound(inode_id)))?)
     }
 }
