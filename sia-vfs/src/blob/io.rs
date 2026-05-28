@@ -1,6 +1,6 @@
 use crate::blob::{Blob, BlobMut};
-use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
 use crate::chunk::chunk_map::{ChunkMap, ChunkMapEntry};
+use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_util::{AsyncWriteExt, ready};
 use std::cmp::{max, min};
@@ -514,6 +514,11 @@ impl<B: ChunkSource + ChunkSink + 'static> BlobWriter<B> {
         self.flush().await?;
         self.mode.blob.set_len(new_len);
         Ok(())
+    }
+
+    pub async fn fsync(&mut self) -> Result<Blob, std::io::Error> {
+        self.flush().await?;
+        Ok(self.mode.blob.clone().finalize())
     }
 
     pub async fn finalize(mut self) -> Result<Blob, std::io::Error> {

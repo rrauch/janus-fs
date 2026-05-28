@@ -18,15 +18,18 @@ blake3 = "1.8"
 bon = "3.9"
 bytemuck = { version = "1.25", features = ["derive"] }
 bytes = "1"
+bytesize = "2.3"
 chrono = "0.4"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
 flatbuffers = "=25.12.19"
 lz4_flex = { version = "0.13", optional = true }
+futures-channel = "0.3"
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 moka = { version = "0.12", features = ["future"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
 thiserror = "2"
+tokio = { version = "1.51", features = ["rt", "sync"] }
 tracing = "0.1"
 twox-hash = { version = "2.1", features = ["xxhash3_64", "std"] }
 typed-path = "0.12"

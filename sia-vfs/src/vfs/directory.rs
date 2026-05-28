@@ -148,23 +148,7 @@ impl DirectoryDraft {
     }
 }
 
-impl<Mode: Read + Write> Vfs<Mode> {
-    pub async fn create_dir(&self, parent: &Directory, name: &Name) -> VfsResult<Directory> {
-        let mut tx = self.tx_rw().await?;
-        let inode_id = tx.create_dir(name, parent.inode_id()).await?;
-        let dir = match tx.inode_by_id(inode_id).await? {
-            Some(Inode::Directory(dir)) => dir,
-            _ => {
-                return Err(VfsError::Other(format!(
-                    "inode {} is not a directory",
-                    inode_id
-                )));
-            }
-        };
-        tx.commit().await?;
-        Ok(dir)
-    }
-
+impl<Mode: Read> Vfs<Mode> {
     pub async fn list(
         &self,
         dir: &Directory,
@@ -193,6 +177,24 @@ impl<Mode: Read + Write> Vfs<Mode> {
             },
         )
         .boxed())
+    }
+}
+
+impl<Mode: Read + Write> Vfs<Mode> {
+    pub async fn create_dir(&self, parent: &Directory, name: &Name) -> VfsResult<Directory> {
+        let mut tx = self.tx_rw().await?;
+        let inode_id = tx.create_dir(name, parent.inode_id()).await?;
+        let dir = match tx.inode_by_id(inode_id).await? {
+            Some(Inode::Directory(dir)) => dir,
+            _ => {
+                return Err(VfsError::Other(format!(
+                    "inode {} is not a directory",
+                    inode_id
+                )));
+            }
+        };
+        tx.commit().await?;
+        Ok(dir)
     }
 }
 

@@ -1,3 +1,5 @@
+use crate::blob::BlobId;
+use crate::chunk::ChunkId;
 use crate::vfs::cache::Cache;
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
@@ -43,10 +45,22 @@ pub enum DataError {
     EntityNotFound(EntityKey),
     #[error("inode {0} not found")]
     InodeNotFound(InodeId),
+    #[error("blob {0} not found")]
+    BlobNotFound(BlobId),
     #[error("wrong number of rows affected: {actual} != {expected}")]
     UnexpectedAffectedRows { expected: u64, actual: u64 },
     #[error("dirty file detected: inode [{0}] should be directory or root")]
     DirtyFile(InodeId),
+    #[error("remote location missing")]
+    MissingRemoteLocation,
+    #[error("blob id mismatch: [{expected}] != [{actual}]")]
+    BlobIdMismatch { expected: BlobId, actual: BlobId },
+    #[error("chunk id mismatch: [{expected}] != [{actual}]")]
+    ChunkIdMismatch { expected: ChunkId, actual: ChunkId },
+    #[error("chunk {0} not found")]
+    ChunkNotFound(ChunkId),
+    #[error("storage mode unsupported")]
+    UnsupportedStorageMode,
 }
 
 #[repr(transparent)]
@@ -89,11 +103,27 @@ impl Transaction<ReadWrite> {
     #[inline]
     pub async fn commit(mut self) -> Result<(), Error> {
         self.process_dirty_inodes().await?;
+
+        let changelog = self.get_changelog().await?;
+        self.clear_changelog().await?;
         self.0.0.commit().await?;
 
         // invalidate caches after successful commit
-        self.0.1.inode_cache().invalidate_all();
-        self.0.1.path_cache().invalidate_all();
+        if !changelog.affected_inode_ids.is_empty() {
+            self.0.1.path_cache().invalidate_all();
+            self.0
+                .1
+                .inode_cache()
+                .invalidate_entries_if(move |k, _| changelog.affected_inode_ids.contains(k))
+                .expect("invalidation closure active");
+        }
+        if !changelog.affected_chunk_ids.is_empty() {
+            self.0
+                .1
+                .chunk_cache()
+                .invalidate_entries_if(move |k, _| changelog.affected_chunk_ids.contains(k))
+                .expect("invalidation closure active");
+        }
 
         Ok(())
     }
@@ -185,6 +215,55 @@ impl Transaction<ReadWrite> {
         Ok(())
     }
 
+    async fn clear_changelog(&mut self) -> Result<(), Error> {
+        sqlx::query!("DELETE FROM change_log")
+            .execute(self.conn())
+            .await?;
+        Ok(())
+    }
+
+    async fn get_changelog(&mut self) -> Result<Changelog, Error> {
+        let mut affected_inode_ids = vec![];
+        let mut affected_chunk_ids = vec![];
+
+        sqlx::query!("SELECT DISTINCT type, key1 FROM change_log")
+            .fetch_all(self.conn())
+            .await?
+            .into_iter()
+            .try_for_each(|r| {
+                match r.r#type.as_str() {
+                    "C" => {
+                        affected_chunk_ids.push(ChunkId::try_from_bytes(r.key1).ok_or_else(
+                            || DataError::ConversionError("invalid chunk_id".into()),
+                        )?);
+                        Ok(())
+                    }
+                    "I" => {
+                        // sqlite should return a string encoded integer here
+                        affected_inode_ids.push(InodeId::new(
+                            str::from_utf8(r.key1.as_slice())
+                                .map_err(|e| DataError::ConversionError(e.to_string().into()))?
+                                .parse()
+                                .map_err(|e| {
+                                    DataError::ConversionError(
+                                        format!("invalid inode_id: {}", e).into(),
+                                    )
+                                })?,
+                        ));
+                        Ok(())
+                    }
+                    other => Err(Error::DataError(DataError::ConversionError(
+                        format!("invalid changelog type: {}", other).into(),
+                    ))),
+                }
+            })?;
+
+        Ok(Changelog {
+            affected_inode_ids,
+            affected_chunk_ids,
+        })
+    }
+
     async fn bootstrap(&mut self) -> Result<(), Error> {
         if sqlx::query!("SELECT COUNT(*) AS vfs_rows FROM vfs")
             .fetch_one(self.conn())
@@ -207,8 +286,8 @@ impl Transaction<ReadWrite> {
                 entity_rev,
                 name
             )
-            .execute(self.conn())
-            .await?;
+                .execute(self.conn())
+                .await?;
         }
         Ok(())
     }
@@ -219,6 +298,11 @@ impl<Scope: TxScope> AsMut<SqliteConnection> for Transaction<Scope> {
     fn as_mut(&mut self) -> &mut SqliteConnection {
         self.0.as_mut()
     }
+}
+
+struct Changelog {
+    affected_inode_ids: Vec<InodeId>,
+    affected_chunk_ids: Vec<ChunkId>,
 }
 
 #[derive(Debug, Clone)]
@@ -323,7 +407,9 @@ impl Db {
     }
 
     pub async fn write(&self) -> Result<Transaction<ReadWrite>, Error> {
-        Ok(self.0.pool.write(self.0.cache.clone()).await?)
+        let mut tx = self.0.pool.write(self.0.cache.clone()).await?;
+        tx.clear_changelog().await?;
+        Ok(tx)
     }
 }
 
