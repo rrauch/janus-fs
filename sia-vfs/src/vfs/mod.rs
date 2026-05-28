@@ -418,7 +418,7 @@ impl<T: EntityHandler> Deref for TypedInode<T> {
     }
 }
 
-#[derive_where(Debug)]
+#[derive_where(Debug, Clone)]
 pub struct InodeMut<T: EntityHandler> {
     parent: Option<InodeId>,
     inode_id: InodeId,

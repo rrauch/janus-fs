@@ -126,7 +126,7 @@ pub enum EntityError {
 }
 
 pub trait EntityHandler: Sized {
-    type Body: for<'a> Yokeable<'a>;
+    type Body: for<'a> Yokeable<'a> + Clone;
 
     fn db_type() -> &'static str;
 
@@ -302,7 +302,7 @@ impl<T: EntityHandler, Mode: Clone> RawEntity<T, Mode> {
     }
 }
 
-#[derive_where(Debug)]
+#[derive_where(Debug, Clone)]
 pub struct EntityMut<T: EntityHandler> {
     id: EntityId,
     name: OwnedName,

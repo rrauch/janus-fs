@@ -19,7 +19,7 @@ use blake3::Hash;
 use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 use futures_channel::mpsc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
-use futures_util::StreamExt;
+use futures_util::{AsyncWriteExt, StreamExt};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Error, SeekFrom};
@@ -30,7 +30,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
-use tokio::task::JoinHandle;
 use twox_hash::XxHash3_64;
 use uuid::Uuid;
 use yoke::Yokeable;
@@ -446,21 +445,20 @@ where
         self.inner.writer.is_empty()
     }
 
+    pub async fn fsync(&mut self) -> VfsResult<()> {
+        self.flush().await?;
+        let blob = self.inner.writer.fsync().await?;
+        let mut tx = self.inner.vfs.tx_rw().await?;
+        let file = tx.fsync(self.inner.file.clone(), blob).await?;
+        tx.commit().await?;
+        self.inner.file = file.into_mut();
+        Ok(())
+    }
+
     pub async fn commit(mut self) -> VfsResult<File> {
         let blob = self.inner.writer.finalize().await?;
-        let mut file = self.inner.file;
-        file.set_content(blob.clone().into());
-        file.set_last_modified(Timestamp::now());
-        let inode_id = file.inode_id;
         let mut tx = self.inner.vfs.tx_rw().await?;
-        tx.create_blob_if_not_exist(&blob).await?;
-        let name = file.name().to_owned();
-        let file = match tx.update(inode_id, &name, file.freeze()).await? {
-            Inode::File(file) => file,
-            _ => {
-                return Err(VfsError::Other(format!("inode {} is not a file", inode_id)));
-            }
-        };
+        let file = tx.fsync(self.inner.file, blob).await?;
         tx.delete_fh(self.id).await?;
         tx.commit().await?;
         self.inner.reaper_notifier.disarm();
@@ -576,6 +574,21 @@ where
         Ok(self
             .create_inode::<FileKind>(&name, parent_inode_id, entity_id)
             .await?)
+    }
+
+    async fn fsync(&mut self, mut file: FileMut, blob: Blob) -> Result<File, VfsError> {
+        let inode_id = file.inode_id;
+        file.set_content(blob.clone().into());
+        file.set_last_modified(Timestamp::now());
+        self.create_blob_if_not_exist(&blob).await?;
+        let name = file.name().to_owned();
+        let file = match self.update(inode_id, &name, file.freeze()).await? {
+            Inode::File(file) => file,
+            _ => {
+                return Err(VfsError::Other(format!("inode {} is not a file", inode_id)));
+            }
+        };
+        Ok(file)
     }
 
     async fn create_fh(&mut self, inode_id: InodeId) -> Result<u64, DbError> {

@@ -60,7 +60,7 @@ impl From<Blob> for BlobMut {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlobMut {
     chunk_map: ChunkMap,
     mode: StorageMode,
