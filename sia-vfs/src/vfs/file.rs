@@ -21,9 +21,16 @@ use futures_channel::mpsc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_util::StreamExt;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::{Error, SeekFrom};
+use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
+use std::time::Duration;
+use thiserror::Error;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::task::JoinHandle;
 use twox_hash::XxHash3_64;
 use uuid::Uuid;
 use yoke::Yokeable;
@@ -159,6 +166,65 @@ where
     }
 }
 
+#[derive(Debug, Error)]
+pub enum LockError {
+    #[error("lock acquisition timed out")]
+    AcquisitionTimeout,
+}
+
+struct FileWriteLock {
+    guard: Option<OwnedMutexGuard<InodeId>>,
+    map: LockMap,
+}
+
+impl FileWriteLock {
+    pub fn inode_id(&self) -> InodeId {
+        *self.guard.as_ref().unwrap().deref()
+    }
+}
+
+impl Drop for FileWriteLock {
+    fn drop(&mut self) {
+        // drop the guard here to make sure we don't hold a strong reference
+        self.guard.take();
+
+        let mut guard = self.map.lock().expect("lock to not be poisoned");
+        guard.retain(|_, v| v.strong_count() >= 1);
+    }
+}
+
+type LockMap = Arc<Mutex<HashMap<InodeId, Weak<AsyncMutex<InodeId>>>>>;
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub(super) struct FileWriteLocks(LockMap);
+
+impl FileWriteLocks {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+    async fn acquire(&self, inode_id: InodeId) -> Result<FileWriteLock, LockError> {
+        let async_lock = {
+            let mut outer_lock = self.0.lock().expect("lock to not be poisoned");
+
+            if let Some(async_lock) = outer_lock.get(&inode_id).and_then(|w| w.upgrade()) {
+                async_lock
+            } else {
+                let async_lock = Arc::new(AsyncMutex::new(inode_id));
+                outer_lock.insert(inode_id, Arc::downgrade(&async_lock));
+                async_lock
+            }
+        };
+        let owned_guard = tokio::time::timeout(Duration::from_secs(5), async_lock.lock_owned())
+            .await
+            .map_err(|_| LockError::AcquisitionTimeout)?;
+        Ok(FileWriteLock {
+            guard: Some(owned_guard),
+            map: self.0.clone(),
+        })
+    }
+}
+
 impl<Mode: Read + Write> Vfs<Mode>
 where
     Self: ChunkSource + ChunkSink + 'static,
@@ -168,7 +234,7 @@ where
             .blob_by_id(file.blob_id())
             .await?
             .ok_or_else(|| DbError::DataError(DataError::BlobNotFound(*file.blob_id())))?;
-        //todo: locking
+        let lock = self.0.file_write_locks.acquire(file.inode_id).await?;
         let mut tx = self.tx_rw().await?;
         let current_file = match tx
             .inode_by_id(file.inode_id)
@@ -206,7 +272,7 @@ where
                     },
                     self.max_chunk_size(),
                 ),
-                file_id,
+                lock,
                 file,
                 vfs: self.clone(),
                 reaper_notifier: ReaperNotifier {
@@ -300,7 +366,7 @@ where
 
 pub struct ReadWrite<Mode> {
     writer: BlobWriter<TempChunkTracker<Mode>>,
-    file_id: InodeId,
+    lock: FileWriteLock,
     file: FileMut,
     vfs: Vfs<Mode>,
     reaper_notifier: ReaperNotifier,
@@ -365,7 +431,7 @@ where
     Vfs<Mode>: ChunkSource + ChunkSink + 'static,
 {
     pub fn file_id(&self) -> InodeId {
-        self.inner.file_id
+        self.inner.lock.inode_id()
     }
 
     pub fn len(&self) -> u64 {

@@ -16,7 +16,7 @@ use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
 };
-use crate::vfs::file::{File, Reaper};
+use crate::vfs::file::{File, FileWriteLocks, Reaper};
 use crate::vfs::path::VfsPath;
 use async_trait::async_trait;
 use bytemuck::TransparentWrapper;
@@ -56,6 +56,8 @@ pub enum VfsError {
     Other(String),
     #[error(transparent)]
     CachedError(#[from] Arc<VfsError>),
+    #[error(transparent)]
+    FileLockError(#[from] file::LockError),
 }
 
 #[derive(Error, Debug)]
@@ -486,6 +488,7 @@ impl<Mode> Vfs<Mode> {
                 cache,
                 max_chunk_size,
                 dead_fh_reaper: reaper,
+                file_write_locks: FileWriteLocks::new(),
             }),
             PhantomData,
         ))
@@ -498,6 +501,7 @@ struct Inner {
     cache: Cache,
     max_chunk_size: usize,
     dead_fh_reaper: Reaper,
+    file_write_locks: FileWriteLocks,
 }
 
 pub trait Read: Send + Sync + 'static {}
