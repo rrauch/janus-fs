@@ -189,6 +189,15 @@ impl TryFrom<Cow<'static, str>> for OwnedName {
     }
 }
 
+impl FromStr for OwnedName {
+    type Err = NameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        check_valid_filename(s)?;
+        Ok(Self(Cow::Owned(s.to_string())))
+    }
+}
+
 impl Deref for OwnedName {
     type Target = Name;
 
@@ -977,9 +986,10 @@ where
 mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{Inode, InodeId, Name, ReadWrite, Vfs, VfsError};
+    use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError};
     use anyhow::bail;
-    use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
+    use futures_util::{AsyncReadExt, AsyncWriteExt, StreamExt, TryStreamExt};
+    use std::ops::Deref;
     use std::str::FromStr;
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
@@ -1176,5 +1186,56 @@ mod tests {
                 .await
                 .map(|r| r.chunk_count as u64)?,
         )
+    }
+
+    #[tokio::test]
+    async fn rename_mv() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+
+        let dir1 = vfs
+            .create_dir(&vfs.root().await?, "foo".try_into()?)
+            .await?;
+
+        let dir2 = vfs.create_dir(&dir1, "bar".try_into()?).await?;
+
+        let mut file = vfs.create_file(&dir2, "file".try_into()?).await?.into_mut();
+        let file_inode = file.inode_id;
+        let new_name = OwnedName::from_str("file2")?;
+        file.set_name(new_name.clone());
+        let file = vfs.update(file).await?;
+        assert_eq!(file.name(), new_name.deref());
+
+        assert_eq!(vfs.list(&vfs.root().await?).await?.count().await, 1);
+
+        assert_eq!(count_path_entries(&vfs, "/foo").await?, 1);
+
+        vfs.mv(dir2.inode_id, &vfs.root().await?).await?;
+
+        assert_eq!(vfs.list(&vfs.root().await?).await?.count().await, 2);
+
+        assert_eq!(count_path_entries(&vfs, "/foo").await?, 0);
+        assert_eq!(count_path_entries(&vfs, "/bar").await?, 1);
+
+        let inode = vfs
+            .inode_by_path(&VfsPath::from_str("/bar/file2")?)
+            .await?
+            .unwrap();
+        assert_eq!(inode.as_file().unwrap().inode_id, file_inode);
+        Ok(())
+    }
+
+    async fn count_path_entries<Mode: Read>(vfs: &Vfs<Mode>, path: &str) -> anyhow::Result<usize> {
+        Ok(vfs
+            .list(
+                vfs.inode_by_path(&VfsPath::from_str(path)?)
+                    .await?
+                    .unwrap()
+                    .as_directory()
+                    .unwrap(),
+            )
+            .await?
+            .count()
+            .await)
     }
 }
