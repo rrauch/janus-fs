@@ -1,6 +1,6 @@
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::blob::{Blob, BlobId, BlobMut};
-use crate::chunk::{ChunkSink, ChunkSource};
+use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
 use crate::db::{DataError, Db, Error as DbError, Read as DbRead, Write as DbWrite};
 use crate::db::{Transaction, TxScope};
 use crate::gen_flatbuffers::vfs::entity::{
@@ -14,13 +14,14 @@ use crate::vfs::{
     Inode, InodeId, InodeMut, Name, OwnedName, Read, Timestamp, TypedInode, Vfs, VfsError,
     VfsResult, Write,
 };
+use async_trait::async_trait;
 use blake3::Hash;
 use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 use futures_channel::mpsc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_util::StreamExt;
 use std::borrow::Cow;
-use std::io::SeekFrom;
+use std::io::{Error, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use twox_hash::XxHash3_64;
@@ -199,7 +200,10 @@ where
             ReadWrite {
                 writer: BlobWriter::new_writer(
                     blob.into_mut(),
-                    self.clone(),
+                    TempChunkTracker {
+                        vfs: self.clone(),
+                        fh_id,
+                    },
                     self.max_chunk_size(),
                 ),
                 file_id,
@@ -295,11 +299,43 @@ where
 }
 
 pub struct ReadWrite<Mode> {
-    writer: BlobWriter<Vfs<Mode>>,
+    writer: BlobWriter<TempChunkTracker<Mode>>,
     file_id: InodeId,
     file: FileMut,
     vfs: Vfs<Mode>,
     reaper_notifier: ReaperNotifier,
+}
+
+struct TempChunkTracker<Mode> {
+    vfs: Vfs<Mode>,
+    fh_id: u64,
+}
+
+#[async_trait]
+impl<Mode> ChunkSource for TempChunkTracker<Mode>
+where
+    Vfs<Mode>: ChunkSource,
+{
+    async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, Error> {
+        self.vfs.get_chunk(chunk_id).await
+    }
+}
+
+#[async_trait]
+impl<Mode: Read + Write> ChunkSink for TempChunkTracker<Mode>
+where
+    Vfs<Mode>: ChunkSink,
+{
+    async fn insert_chunk(&self, chunk: Chunk) -> Result<(), Error> {
+        let chunk_id = chunk.id().clone();
+        self.vfs.insert_chunk(chunk).await?;
+        let mut tx = self.vfs.tx_rw().await.map_err(Error::other)?;
+        tx.insert_temp_fh_chunk(self.fh_id, &chunk_id)
+            .await
+            .map_err(Error::other)?;
+        tx.commit().await.map_err(Error::other)?;
+        Ok(())
+    }
 }
 
 struct ReaperNotifier {
@@ -366,7 +402,7 @@ where
     }
 }
 
-impl<Mode> AsyncRead for FileHandle<ReadWrite<Mode>>
+impl<Mode: Read + Write> AsyncRead for FileHandle<ReadWrite<Mode>>
 where
     Vfs<Mode>: ChunkSource + ChunkSink + 'static,
 {
@@ -380,7 +416,7 @@ where
     }
 }
 
-impl<Mode> AsyncWrite for FileHandle<ReadWrite<Mode>>
+impl<Mode: Read + Write> AsyncWrite for FileHandle<ReadWrite<Mode>>
 where
     Vfs<Mode>: ChunkSource + ChunkSink + 'static,
 {
@@ -404,7 +440,7 @@ where
     }
 }
 
-impl<Mode> AsyncSeek for FileHandle<ReadWrite<Mode>>
+impl<Mode: Read + Write> AsyncSeek for FileHandle<ReadWrite<Mode>>
 where
     Vfs<Mode>: ChunkSource + ChunkSink + 'static,
 {
@@ -492,6 +528,25 @@ where
         sqlx::query!("DELETE FROM temp_file_handle WHERE id = ?", id)
             .execute(self.conn())
             .await?;
+        Ok(())
+    }
+
+    async fn insert_temp_fh_chunk(
+        &mut self,
+        fh_id: u64,
+        chunk_id: &ChunkId,
+    ) -> Result<(), DbError> {
+        let fh_id = fh_id as i64;
+        let chunk_id = chunk_id.as_slice();
+
+        sqlx::query!(
+            "INSERT OR IGNORE INTO temp_file_chunks (file_handle, chunk_id) VALUES (?, ?)",
+            fh_id,
+            chunk_id
+        )
+        .execute(self.conn())
+        .await?;
+
         Ok(())
     }
 }

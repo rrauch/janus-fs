@@ -1108,7 +1108,15 @@ mod tests {
         let file = vfs.create_file(&root, file_name).await?;
         let mut fh = vfs.open_rw(&file).await?;
         fh.write_all(file_content).await?;
+        fh.flush().await?;
+
+        assert_eq!(count_fh(&vfs).await?, 1);
+        assert_eq!(count_temp_chunks(&vfs).await?, 1);
+
         let file = fh.commit().await?;
+
+        assert_eq!(count_fh(&vfs).await?, 0);
+        assert_eq!(count_temp_chunks(&vfs).await?, 0);
 
         let ref_file = vfs
             .inode_by_path(&VfsPath::from_str("/just_a_file.txt")?)
@@ -1136,13 +1144,16 @@ mod tests {
         let file = vfs.create_file(&root, file_name).await?;
         let mut fh = vfs.open_rw(&file).await?;
         fh.write_all(file_content).await?;
+        fh.flush().await?;
 
         assert_eq!(count_fh(&vfs).await?, 1);
+        assert_eq!(count_temp_chunks(&vfs).await?, 1);
         drop(fh);
 
         // dead fh should be auto cleaned
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count_fh(&vfs).await?, 0);
+        assert_eq!(count_temp_chunks(&vfs).await?, 0);
 
         Ok(())
     }
@@ -1154,6 +1165,16 @@ mod tests {
                 .fetch_one(tx.as_mut())
                 .await
                 .map(|r| r.fh_count as u64)?,
+        )
+    }
+
+    async fn count_temp_chunks(vfs: &Vfs<ReadWrite>) -> anyhow::Result<u64> {
+        let mut tx = vfs.0.db.read().await?;
+        Ok(
+            sqlx::query!("SELECT COUNT(*) AS chunk_count FROM temp_file_chunks")
+                .fetch_one(tx.as_mut())
+                .await
+                .map(|r| r.chunk_count as u64)?,
         )
     }
 }
