@@ -16,7 +16,7 @@ use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
 };
-use crate::vfs::file::File;
+use crate::vfs::file::{File, Reaper};
 use crate::vfs::path::VfsPath;
 use async_trait::async_trait;
 use bytemuck::TransparentWrapper;
@@ -469,11 +469,14 @@ impl<Mode> Vfs<Mode> {
 
         //todo: check that PageSize & max_chunk_size align
 
+        let reaper = Reaper::new(db.clone());
+
         Ok(Self(
             Arc::new(Inner {
                 db,
                 cache,
                 max_chunk_size,
+                dead_fh_reaper: reaper,
             }),
             PhantomData,
         ))
@@ -485,6 +488,7 @@ struct Inner {
     db: Db,
     cache: Cache,
     max_chunk_size: usize,
+    dead_fh_reaper: Reaper,
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -977,6 +981,7 @@ mod tests {
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncWriteExt, TryStreamExt};
     use std::str::FromStr;
+    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
 
     async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
@@ -1119,5 +1124,36 @@ mod tests {
         assert_eq!(file_content, content.as_slice());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_fh() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+        let root = vfs.root().await?;
+        let file_name = "another_file.txt".try_into()?;
+        let file_content = b"This is another test.".as_slice();
+        let file = vfs.create_file(&root, file_name).await?;
+        let mut fh = vfs.open_rw(&file).await?;
+        fh.write_all(file_content).await?;
+
+        assert_eq!(count_fh(&vfs).await?, 1);
+        drop(fh);
+
+        // dead fh should be auto cleaned
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count_fh(&vfs).await?, 0);
+
+        Ok(())
+    }
+
+    async fn count_fh(vfs: &Vfs<ReadWrite>) -> anyhow::Result<u64> {
+        let mut tx = vfs.0.db.read().await?;
+        Ok(
+            sqlx::query!("SELECT COUNT(*) AS fh_count FROM temp_file_handle")
+                .fetch_one(tx.as_mut())
+                .await
+                .map(|r| r.fh_count as u64)?,
+        )
     }
 }

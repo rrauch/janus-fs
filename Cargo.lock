@@ -3589,6 +3589,7 @@ dependencies = [
  "dotenv",
  "flatbuffers",
  "flatbuffers-build",
+ "futures-channel",
  "futures-io",
  "futures-util",
  "lz4_flex",

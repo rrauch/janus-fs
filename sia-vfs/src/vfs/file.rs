@@ -1,7 +1,7 @@
 use crate::blob::io::{BlobReader, BlobWriter};
 use crate::blob::{Blob, BlobId, BlobMut};
 use crate::chunk::{ChunkSink, ChunkSource};
-use crate::db::{DataError, Error as DbError, Read as DbRead, Write as DbWrite};
+use crate::db::{DataError, Db, Error as DbError, Read as DbRead, Write as DbWrite};
 use crate::db::{Transaction, TxScope};
 use crate::gen_flatbuffers::vfs::entity::{
     Entity as FlatEntity, EntityBody as FlatEntityBody, File as FlatFile, FileArgs,
@@ -16,7 +16,9 @@ use crate::vfs::{
 };
 use blake3::Hash;
 use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
+use futures_channel::mpsc;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
+use futures_util::StreamExt;
 use std::borrow::Cow;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -188,8 +190,10 @@ where
         }
 
         let fh_id = tx.create_fh(file.inode_id).await?;
+        tx.commit().await?;
         let file_id = file.inode_id;
         let file = current_file.into_mut();
+        let reaper_tx = self.0.dead_fh_reaper.tx();
         Ok(FileHandle::new(
             fh_id,
             ReadWrite {
@@ -201,6 +205,10 @@ where
                 file_id,
                 file,
                 vfs: self.clone(),
+                reaper_notifier: ReaperNotifier {
+                    fh_id,
+                    reaper_tx: Some(reaper_tx),
+                },
             },
         ))
     }
@@ -291,6 +299,27 @@ pub struct ReadWrite<Mode> {
     file_id: InodeId,
     file: FileMut,
     vfs: Vfs<Mode>,
+    reaper_notifier: ReaperNotifier,
+}
+
+struct ReaperNotifier {
+    fh_id: u64,
+    reaper_tx: Option<mpsc::Sender<u64>>,
+}
+
+impl ReaperNotifier {
+    fn disarm(&mut self) {
+        self.reaper_tx.take();
+    }
+}
+
+impl Drop for ReaperNotifier {
+    fn drop(&mut self) {
+        // notify reaper this fh is dead
+        if let Some(mut reaper_tx) = self.reaper_tx.take() {
+            let _ = reaper_tx.try_send(self.fh_id);
+        }
+    }
 }
 
 impl<Mode> FileMode for ReadWrite<Mode> where Vfs<Mode>: ChunkSource + ChunkSink + 'static {}
@@ -315,7 +344,7 @@ where
         self.inner.writer.is_empty()
     }
 
-    pub async fn commit(self) -> VfsResult<File> {
+    pub async fn commit(mut self) -> VfsResult<File> {
         let blob = self.inner.writer.finalize().await?;
         let mut file = self.inner.file;
         file.set_content(blob.clone().into());
@@ -332,6 +361,7 @@ where
         };
         tx.delete_fh(self.id).await?;
         tx.commit().await?;
+        self.inner.reaper_notifier.disarm();
         Ok(file)
     }
 }
@@ -385,6 +415,46 @@ where
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
         Pin::new(&mut self.as_mut().inner.writer).poll_seek(cx, pos)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Reaper {
+    tx: mpsc::Sender<u64>,
+    jh: tokio::task::JoinHandle<()>,
+}
+
+impl Reaper {
+    pub fn new(db: Db) -> Self {
+        let (tx, rx) = mpsc::channel(32);
+
+        let jh = tokio::spawn(async move { Self::run(db, rx).await });
+
+        Self { tx, jh }
+    }
+
+    pub fn tx(&self) -> mpsc::Sender<u64> {
+        self.tx.clone()
+    }
+
+    async fn run(db: Db, mut rx: mpsc::Receiver<u64>) {
+        'main: loop {
+            let fh_id = match rx.next().await {
+                None => break 'main,
+                Some(fh_id) => fh_id,
+            };
+
+            if let Ok(mut tx) = db.write().await {
+                let _ = tx.delete_fh(fh_id).await;
+                let _ = tx.commit().await;
+            }
+        }
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        self.jh.abort();
     }
 }
 
