@@ -3584,6 +3584,7 @@ dependencies = [
  "bon",
  "bytemuck",
  "bytes",
+ "bytesize 2.3.1",
  "chrono",
  "derive-where",
  "dotenv",

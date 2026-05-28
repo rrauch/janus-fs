@@ -548,15 +548,21 @@ impl<Mode: Read> Vfs<Mode> {
     pub(crate) async fn blob_by_id(&self, blob_id: &BlobId) -> VfsResult<Option<Blob>> {
         Ok(self.tx().await?.blob_by_id(blob_id).await?)
     }
+
+    async fn _get_chunk(&self, chunk_id: &ChunkId) -> VfsResult<Option<Chunk>> {
+        let mut tx = self.tx().await.map_err(std::io::Error::other)?;
+        Ok(tx.chunk_by_id(chunk_id).await?)
+    }
 }
 
 #[async_trait]
 impl<Mode: Read + Unpin> ChunkSource for Vfs<Mode> {
     async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, Error> {
-        let mut tx = self.tx().await.map_err(std::io::Error::other)?;
-        tx.chunk_by_id(chunk_id)
+        self.cache()
+            .chunk_cache()
+            .try_get_with_by_ref(chunk_id, async { self._get_chunk(chunk_id).await })
             .await
-            .map_err(std::io::Error::other)
+            .map_err(Error::other)
     }
 }
 
@@ -568,6 +574,10 @@ impl<Mode: Read + Write + Unpin> ChunkSink for Vfs<Mode> {
             .await
             .map_err(std::io::Error::other)?;
         tx.commit().await.map_err(std::io::Error::other)?;
+        self.cache()
+            .chunk_cache()
+            .insert(*chunk.id(), Some(chunk))
+            .await;
         Ok(())
     }
 }

@@ -6,6 +6,8 @@ use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
 
+pub use bytesize::ByteSize;
+
 pub mod blob;
 pub mod chunk;
 pub(crate) mod db;
