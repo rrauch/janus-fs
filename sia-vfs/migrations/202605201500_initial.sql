@@ -806,3 +806,64 @@ BEGIN
     WHERE id = OLD.entity_id
       AND revision = OLD.entity_rev;
 END;
+
+-- Automatic change tracking
+CREATE TABLE change_log
+(
+    change TEXT NOT NULL CHECK (change IN ('I', 'U', 'D')), -- Insert, Update or Delete
+    type   TEXT NOT NULL CHECK (type IN ('C', 'I')),   -- Chunk or Inode,
+    key1   BLOB NOT NULL
+);
+
+CREATE TRIGGER change_log_no_update
+    BEFORE UPDATE
+    ON change_log
+    FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'change_log: updates are not allowed');
+END;
+
+-- chunk
+CREATE TRIGGER change_log_chunk_insert
+    AFTER INSERT
+    ON chunk
+BEGIN
+    INSERT INTO change_log(change, type, key1) VALUES ('I', 'C', NEW.id);
+END;
+CREATE TRIGGER change_log_chunk_delete
+    AFTER DELETE
+    ON chunk
+BEGIN
+    INSERT INTO change_log(change, type, key1) VALUES ('D', 'C', OLD.id);
+END;
+CREATE TRIGGER change_log_chunk_update
+    AFTER UPDATE
+    ON chunk
+    WHEN OLD.mode IS NOT NEW.mode
+BEGIN
+    INSERT INTO change_log(change, type, key1) VALUES ('U', 'C', NEW.id);
+END;
+
+-- vfs
+CREATE TRIGGER change_log_vfs_insert
+    AFTER INSERT
+    ON vfs
+BEGIN
+    INSERT INTO change_log(change, type, key1) VALUES ('I', 'I', NEW.inode_id);
+END;
+CREATE TRIGGER change_log_vfs_delete
+    AFTER DELETE
+    ON vfs
+BEGIN
+    INSERT INTO change_log(change, type, key1) VALUES ('D', 'I', OLD.inode_id);
+END;
+CREATE TRIGGER change_log_vfs_update
+    AFTER UPDATE
+    ON vfs
+    WHEN OLD.name IS NOT NEW.name
+        OR OLD.parent IS NOT NEW.parent
+        OR OLD.entity_rev IS NOT NEW.entity_rev
+        OR OLD.path IS NOT NEW.path
+BEGIN
+    INSERT INTO change_log(change, type, key1) VALUES ('U', 'I', NEW.inode_id);
+END;
