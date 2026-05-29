@@ -1,6 +1,7 @@
 use flatbuffers_build::BuilderOptions;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
+use std::ffi::OsString;
 use std::path::Path;
 use std::{env, fs};
 use tokio::runtime::Runtime;
@@ -37,7 +38,26 @@ fn main() -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed=migrations");
 
     // flatbuffers code generation
-    BuilderOptions::new_with_files(["schemas/entity.fbs"]).compile()?;
+    // vfs
+    let vfs_path = env::var_os("OUT_DIR")
+        .map(|mut s| {
+            s.push(OsString::from("/flatbuffers/vfs"));
+            s
+        })
+        .expect("OUT_DIR not set");
+    BuilderOptions::new_with_files(["schemas/entity.fbs"])
+        .set_output_path(vfs_path)
+        .compile()?;
+    // object
+    let object_path = env::var_os("OUT_DIR")
+        .map(|mut s| {
+            s.push(OsString::from("/flatbuffers/object"));
+            s
+        })
+        .expect("OUT_DIR not set");
+    BuilderOptions::new_with_files(["schemas/object_metadata.fbs"])
+        .set_output_path(object_path)
+        .compile()?;
     println!("cargo:rerun-if-changed=schemas");
 
     Ok(())

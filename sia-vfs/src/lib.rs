@@ -11,6 +11,7 @@ pub use bytesize::ByteSize;
 pub mod blob;
 pub mod chunk;
 pub(crate) mod db;
+pub(crate) mod object;
 pub mod vfs;
 
 #[derive_where(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -165,5 +166,10 @@ impl<T> ContentId<T> {
 #[allow(warnings)]
 #[rustfmt::skip]
 mod gen_flatbuffers {
-    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
+    pub mod object {
+        include!(concat!(env!("OUT_DIR"), "/flatbuffers/object/mod.rs"));
+    }
+    pub mod vfs {
+        include!(concat!(env!("OUT_DIR"), "/flatbuffers/vfs/mod.rs"));
+    }
 }

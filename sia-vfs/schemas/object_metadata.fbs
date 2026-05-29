@@ -1,0 +1,12 @@
+namespace metadata;
+
+table Entry {
+  key:string (key);
+  value:string;
+}
+
+table Metadata {
+  entries:[Entry];
+}
+
+root_type Metadata;

@@ -7,7 +7,6 @@ use futures_util::TryStreamExt;
 use mime::Mime;
 use serde::{Deserialize, Deserializer};
 use sia_storage::ObjectsCursor;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -159,9 +158,9 @@ impl From<renterd::client::Client> for Backend {
 
 pub enum Metadata<'a> {
     #[cfg(feature = "indexd")]
-    Indexd(Cow<'a, [u8]>),
+    Indexd(&'a [u8]),
     #[cfg(feature = "renterd")]
-    Renterd(Cow<'a, HashMap<String, String>>),
+    Renterd(&'a HashMap<String, String>),
 }
 
 #[derive(Debug, Error)]

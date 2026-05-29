@@ -12,7 +12,6 @@ use ouroboros::self_referencing;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sia_storage::ObjectsCursor;
-use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::hash::Hasher;
 use std::pin::Pin;
@@ -238,9 +237,9 @@ impl Object {
     pub fn metadata(&self) -> Metadata<'_> {
         match &self {
             #[cfg(feature = "indexd")]
-            Self::Indexd { inner, .. } => Metadata::Indexd(inner.metadata().into()),
+            Self::Indexd { inner, .. } => Metadata::Indexd(inner.metadata()),
             #[cfg(feature = "renterd")]
-            Self::Renterd { inner, .. } => Metadata::Renterd(Cow::Borrowed(inner.metadata())),
+            Self::Renterd { inner, .. } => Metadata::Renterd(inner.metadata()),
         }
     }
 }
@@ -462,14 +461,14 @@ impl Backend {
         match (&self, metadata) {
             #[cfg(feature = "indexd")]
             (Self::Indexd(indexd), Some(Metadata::Indexd(metadata))) => Ok(indexd
-                .upload(content, Some(metadata.into_owned()))
+                .upload(content, Some(metadata.to_owned()))
                 .await?
                 .into()),
             (Self::Indexd(indexd), None) => Ok(indexd.upload(content, None).await?.into()),
             #[cfg(feature = "renterd")]
             (Self::Renterd(renterd), metadata) => {
                 let metadata = match metadata {
-                    Some(Metadata::Renterd(m)) => Some(m.into_owned()),
+                    Some(Metadata::Renterd(m)) => Some(m.to_owned()),
                     None => None,
                     _ => return Err(crate::Error::BackendMismatch),
                 };
