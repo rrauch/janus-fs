@@ -998,11 +998,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::SeekFrom;
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
     use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError};
     use anyhow::bail;
-    use futures_util::{AsyncReadExt, AsyncWriteExt, StreamExt, TryStreamExt};
+    use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
     use std::ops::Deref;
     use std::str::FromStr;
     use std::time::Duration;
@@ -1251,5 +1252,28 @@ mod tests {
             .await?
             .count()
             .await)
+    }
+
+    #[tokio::test]
+    async fn write_extend() -> anyhow::Result<()> {
+        let (vfs, _temp_dir) = new_vfs().await?;
+        let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+
+        let file = vfs
+            .create_file(&vfs.root().await?, "file".try_into()?)
+            .await?;
+
+        let mut fh = vfs.open_rw(&file).await?;
+        fh.write_all(b"some bytes").await?;
+        fh.flush().await?;
+        fh.seek(SeekFrom::End(0)).await?;
+        fh.write_all(b"more").await?;
+        let file = fh.commit().await?;
+        assert_eq!(file.len(), 14);
+        let mut fh = vfs.open(&file).await?;
+        let mut buf = Vec::new();
+        fh.read_to_end(&mut buf).await?;
+        assert_eq!(buf.as_slice(), b"some bytesmore");
+        Ok(())
     }
 }

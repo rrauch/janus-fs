@@ -443,32 +443,44 @@ impl<B: ChunkSource + ChunkSink + 'static> ReadWrite<B> {
 
         // If no buffer, create one
         if self.pipeline.buffer.is_none() {
-            match self.blob.chunk_map.get(pos) {
+            let aligned_pos = pos - (pos % self.max_chunk_size as u64);
+
+            match self.blob.chunk_map.get(aligned_pos) {
+                // An existing chunk starts at our aligned position: load it so partial
+                // writes preserve existing bytes. Covers both mid-blob overwrites and
+                // the short-tail-chunk edge case at EOF.
                 Some(ChunkMapEntry::Chunk {
                     chunk_id,
-                    chunk_offset,
+                    chunk_offset: 0,
                     ..
                 }) => {
-                    // Need to fetch existing chunk data for partial overwrite
-                    ready!(self.fetch.poll_ensure(chunk_id, &self.backend, cx))?;
+                    let chunk_id = chunk_id.clone();
+                    ready!(self.fetch.poll_ensure(&chunk_id, &self.backend, cx))?;
                     let chunk = self.fetch.get_cached();
-                    let start_pos = pos.saturating_sub(chunk_offset as u64);
                     self.pipeline.buffer = Some(WriteBuffer::from_data(
-                        start_pos,
-                        chunk.len(),
+                        aligned_pos,
+                        self.max_chunk_size,
                         chunk.deref(),
                     ));
                 }
+                // Hole at aligned_pos: cap the buffer so it doesn't overrun into the
+                // next existing chunk.
                 Some(ChunkMapEntry::Hole { len }) => {
-                    let aligned_pos = pos - (pos % self.max_chunk_size as u64);
-                    let cap = min(((pos - aligned_pos) + len) as usize, self.max_chunk_size);
+                    let cap = min(len as usize, self.max_chunk_size);
                     self.pipeline.buffer = Some(WriteBuffer::new(aligned_pos, cap));
                 }
+                // Past EOF: fresh chunk-sized buffer.
                 None => {
-                    let aligned_pos = pos - (pos % self.max_chunk_size as u64);
                     self.pipeline.buffer = Some(WriteBuffer::new(aligned_pos, self.max_chunk_size));
                 }
-            };
+                Some(ChunkMapEntry::Chunk { .. }) => {
+                    // chunk_offset != 0: aligned_pos lies in the middle of a chunk.
+                    // Should not happen in practise - treat as error.
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "unexpected mid-chunk alignment",
+                    )));
+                }
+            }
         }
 
         // Write into the buffer
@@ -1014,6 +1026,27 @@ mod tests {
         let mut hole_buf = vec![0xFFu8; 500];
         reader.read_exact(&mut hole_buf).await?;
         assert!(hole_buf.iter().all(|&b| b == 0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_roundtrip_write_extend_read() -> anyhow::Result<()> {
+        let backend = MockBackend::default();
+        let mut writer = BlobWriter::new_writer(BlobMut::empty(), backend.clone(), 1024);
+
+        writer.write_all(b"hello").await?;
+        writer.flush().await?;
+        writer.write_all(b" world").await?;
+        let blob = writer.finalize().await?;
+
+        assert_eq!(blob.len(), 11);
+
+        let mut reader = BlobReader::new_reader(blob, backend);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+
+        assert_eq!(buf.as_slice(), b"hello world");
 
         Ok(())
     }
