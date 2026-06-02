@@ -6,6 +6,7 @@ use crate::gen_flatbuffers::vfs::entity::{
     DirectoryEntry as FlatDirEntry, Entity as FlatEntity, EntityBody as FlatEntityBody,
     EntityBuilder,
 };
+use crate::object::ObjectId;
 use crate::vfs::{Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsResult};
 use crate::{ContentId, TypedUuid};
 use derive_where::derive_where;
@@ -13,6 +14,7 @@ use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffse
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::sync::Arc;
 use thiserror::Error;
 use yoke::{Yoke, Yokeable};
@@ -65,9 +67,9 @@ impl<T: EntityHandler> Entity<T> {
     }
 
     #[inline]
-    pub fn remote_location(&self) -> Option<&String> {
+    pub fn object_id(&self) -> Option<ObjectId> {
         match self {
-            Self::Synced(e) => Some(e.remote_location()),
+            Self::Synced(e) => Some(e.object_id()),
             Self::Local(_) => None,
         }
     }
@@ -91,7 +93,7 @@ impl<T: EntityHandler> Entity<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncedMode {
-    remote_location: String,
+    object_id: ObjectId,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalMode;
@@ -284,8 +286,8 @@ impl<T: EntityHandler, Mode> RawEntity<T, Mode> {
 }
 
 impl<T: EntityHandler> RawEntity<T, SyncedMode> {
-    pub fn remote_location(&self) -> &String {
-        &self.0.1.remote_location
+    pub fn object_id(&self) -> ObjectId {
+        self.0.1.object_id
     }
 }
 
@@ -446,7 +448,7 @@ where
         let rev_ref = key.revision.as_slice();
 
         Ok(sqlx::query!(
-            "SELECT name, mode, entity_type, remote_location, data FROM entity WHERE id = ? and revision = ?",
+            "SELECT name, mode, entity_type, object_id, data FROM entity WHERE id = ? and revision = ?",
             id_ref,
             rev_ref,
         )
@@ -459,7 +461,7 @@ where
                     name: OwnedName::try_from(r.name).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
                     mode: match r.mode.as_str() {
                         "L" => StorageMode::Local,
-                        "S" => StorageMode::Synced(r.remote_location.ok_or(DataError::MissingRemoteLocation)?),
+                        "S" => StorageMode::Synced(r.object_id.map(ObjectId::from).ok_or(DataError::MissingObject)?),
                         other => return Err(DataError::ConversionError(format!("invalid mode: {}", other).into()))?,
                     },
                     entity_type: r.entity_type.into(),
@@ -544,10 +546,9 @@ impl<T: EntityHandler> TryFrom<EntityRow> for Entity<T> {
         };
 
         Ok(match value.mode {
-            StorageMode::Synced(remote_location) => Entity::Synced(SyncedEntity::new(
-                raw_entity,
-                SyncedMode { remote_location },
-            )),
+            StorageMode::Synced(object_id) => {
+                Entity::Synced(SyncedEntity::new(raw_entity, SyncedMode { object_id }))
+            }
             StorageMode::Local => Entity::Local(LocalEntity::new(raw_entity, LocalMode)),
         })
     }
@@ -589,21 +590,21 @@ where
         let rev = row.revision.as_slice();
         let name = row.name.as_ref();
         let entity_type = row.entity_type.as_ref();
-        let (mode, remote_location) = match &row.mode {
+        let (mode, object_id) = match &row.mode {
             StorageMode::Local => ("L", None),
-            StorageMode::Synced(loc) => ("S", Some(loc.as_str())),
+            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64)),
         };
         let data = row.data.as_ref();
 
         sqlx::query!(
-            "INSERT INTO entity (id, revision, name, entity_type, mode, remote_location, data)
+            "INSERT INTO entity (id, revision, name, entity_type, mode, object_id, data)
                     VALUES (?, ?, ?, ?, ?, ?, ?)",
             id,
             rev,
             name,
             entity_type,
             mode,
-            remote_location,
+            object_id,
             data,
         )
         .execute(self.conn())

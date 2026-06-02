@@ -1,6 +1,7 @@
 use crate::gen_flatbuffers::object::metadata::{
     Entry, EntryArgs, Metadata as FlatMetadata, MetadataArgs,
 };
+use crate::object::METADATA_MAGIC_NUMBER;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use sia_io::Metadata as IoMetadata;
 use std::borrow::Cow;
@@ -9,14 +10,6 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use thiserror::Error;
 use yoke::{Yoke, Yokeable};
-
-const METADATA_MAGIC_NUMBER: [u8; 4] = [0xA8, 0x19, 0xCD, 0x28];
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error(transparent)]
-    MetadataError(#[from] MetadataError),
-}
 
 #[derive(Debug, Error)]
 pub enum MetadataError {

@@ -11,6 +11,7 @@ use crate::db::{
     DataError, Db, Error as DbError, PageSize, Read as DbRead, ReadOnly as DbReadOnly,
     ReadWrite as DbReadWrite, Transaction, TxScope, Write as DbWrite,
 };
+use crate::object::ObjectId;
 use crate::vfs::cache::{Cache, CacheSettings};
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
@@ -107,7 +108,7 @@ impl Display for InodeId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum StorageMode {
-    Synced(String),
+    Synced(ObjectId),
     Local,
 }
 
@@ -720,12 +721,9 @@ where
     pub(crate) async fn blob_by_id(&mut self, blob_id: &BlobId) -> Result<Option<Blob>, DbError> {
         let id = blob_id.as_ref();
 
-        let r = match sqlx::query!(
-            "SELECT size, mode, remote_location FROM blob where id = ?",
-            id
-        )
-        .fetch_optional(self.conn())
-        .await?
+        let r = match sqlx::query!("SELECT size, mode, object_id FROM blob where id = ?", id)
+            .fetch_optional(self.conn())
+            .await?
         {
             None => return Ok(None),
             Some(r) => r,
@@ -735,7 +733,11 @@ where
 
         let mode = match r.mode.as_str() {
             "L" => StorageMode::Local,
-            "S" => StorageMode::Synced(r.remote_location.ok_or(DataError::MissingRemoteLocation)?),
+            "S" => StorageMode::Synced(
+                r.object_id
+                    .map(ObjectId::from)
+                    .ok_or(DataError::MissingObject)?,
+            ),
             other => {
                 return Err(DataError::ConversionError(
                     format!("invalid mode: {}", other).into(),
@@ -771,12 +773,9 @@ where
 
     async fn chunk_by_id(&mut self, chunk_id: &ChunkId) -> Result<Option<Chunk>, DbError> {
         let id = chunk_id.as_slice();
-        let r = match sqlx::query!(
-            "SELECT mode, remote_location, data FROM chunk WHERE id = ?",
-            id
-        )
-        .fetch_optional(self.conn())
-        .await?
+        let r = match sqlx::query!("SELECT mode, object_id, data FROM chunk WHERE id = ?", id)
+            .fetch_optional(self.conn())
+            .await?
         {
             Some(r) => r,
             None => return Ok(None),
@@ -784,7 +783,11 @@ where
 
         let mode = match r.mode.as_str() {
             "L" => StorageMode::Local,
-            "S" => StorageMode::Synced(r.remote_location.ok_or(DataError::MissingRemoteLocation)?),
+            "S" => StorageMode::Synced(
+                r.object_id
+                    .map(ObjectId::from)
+                    .ok_or(DataError::MissingObject)?,
+            ),
             other => {
                 return Err(DataError::ConversionError(
                     format!("invalid mode: {}", other).into(),
@@ -910,11 +913,12 @@ where
     pub(crate) async fn create_blob_if_not_exist(&mut self, blob: &Blob) -> Result<(), DbError> {
         let id = blob.id().as_slice();
 
-        if let StorageMode::Synced(remote_location) = blob.mode() {
+        if let StorageMode::Synced(object_id) = blob.mode() {
             // upgrade blob to synced if necessary
+            let object_id = *object_id.deref() as i64;
             sqlx::query!(
-                "UPDATE blob SET mode = 'S', remote_location = ? WHERE id = ?",
-                remote_location,
+                "UPDATE blob SET mode = 'S', object_id = ? WHERE id = ?",
+                object_id,
                 id
             )
             .execute(self.conn())
@@ -934,17 +938,17 @@ where
         }
 
         let size = blob.len() as i64;
-        let (mode, remote_location) = match blob.mode() {
+        let (mode, object_id) = match blob.mode() {
             StorageMode::Local => ("L", None),
-            StorageMode::Synced(loc) => ("S", Some(loc.as_str())),
+            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64)),
         };
 
         sqlx::query!(
-            "INSERT INTO blob (id, size, mode, remote_location) VALUES (?, ?, ?, ?)",
+            "INSERT INTO blob (id, size, mode, object_id) VALUES (?, ?, ?, ?)",
             id,
             size,
             mode,
-            remote_location,
+            object_id,
         )
         .execute(self.conn())
         .await?;
@@ -998,12 +1002,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::SeekFrom;
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
     use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError};
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
+    use std::io::SeekFrom;
     use std::ops::Deref;
     use std::str::FromStr;
     use std::time::Duration;

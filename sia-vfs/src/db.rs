@@ -51,8 +51,8 @@ pub enum DataError {
     UnexpectedAffectedRows { expected: u64, actual: u64 },
     #[error("dirty file detected: inode [{0}] should be directory or root")]
     DirtyFile(InodeId),
-    #[error("remote location missing")]
-    MissingRemoteLocation,
+    #[error("object missing")]
+    MissingObject,
     #[error("blob id mismatch: [{expected}] != [{actual}]")]
     BlobIdMismatch { expected: BlobId, actual: BlobId },
     #[error("chunk id mismatch: [{expected}] != [{actual}]")]
