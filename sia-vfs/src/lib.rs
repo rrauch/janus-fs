@@ -1,12 +1,12 @@
 use crate::gen_flatbuffers::vfs::entity::{ContentId as FlatContentId, Uuid as FlatUuid};
 use bytemuck::TransparentWrapper;
+pub use bytesize::ByteSize;
 use derive_where::derive_where;
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
-
-pub use bytesize::ByteSize;
+use std::str::FromStr;
 
 pub mod blob;
 pub mod chunk;
@@ -26,6 +26,12 @@ unsafe impl<T: 'static> bytemuck::Zeroable for TypedUuid<T> {}
 unsafe impl<T: 'static> bytemuck::Pod for TypedUuid<T> {}
 
 impl<T> TypedUuid<T> {
+    pub(crate) fn try_from_str(input: &str) -> Option<Self> {
+        uuid::Uuid::from_str(input)
+            .ok()
+            .map(|id| Self(id, PhantomData))
+    }
+
     pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<Self> {
         let bytes = match input.try_into() {
             Ok(bytes) => bytes,
@@ -51,7 +57,7 @@ impl<T> TypedUuid<T> {
         unsafe { &*(self.0.as_bytes().as_ptr() as *const FlatUuid) }
     }
 
-    pub(crate) fn generate() -> Self {
+    pub(crate) fn _generate() -> Self {
         Self(uuid::Uuid::now_v7(), PhantomData)
     }
 

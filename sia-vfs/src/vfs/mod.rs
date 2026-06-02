@@ -4,6 +4,7 @@ pub mod entity;
 pub mod file;
 pub mod path;
 
+use crate::TypedUuid;
 use crate::blob::{Blob, BlobId, BlobMut};
 use crate::chunk::chunk_map::ChunkMap;
 use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
@@ -76,6 +77,23 @@ pub enum NameError {
 }
 
 pub type VfsResult<T> = Result<T, VfsError>;
+
+pub struct VfsKind;
+pub type VfsId = TypedUuid<VfsKind>;
+
+impl FromStr for VfsId {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from_str(s).ok_or_else(|| ())
+    }
+}
+
+impl VfsId {
+    pub fn generate() -> Self {
+        Self::_generate()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -470,6 +488,7 @@ pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 impl<Mode> Vfs<Mode> {
     #[builder(derive(Debug))]
     pub async fn new(
+        vfs_id: VfsId,
         db_file: PathBuf,
         #[builder(default)] db_page_size: PageSize,
         #[builder(default = 25)] max_db_connections: u8,
@@ -485,6 +504,7 @@ impl<Mode> Vfs<Mode> {
 
         Ok(Self(
             Arc::new(Inner {
+                vfs_id,
                 db,
                 cache,
                 max_chunk_size,
@@ -494,10 +514,15 @@ impl<Mode> Vfs<Mode> {
             PhantomData,
         ))
     }
+
+    pub fn id(&self) -> &VfsId {
+        &self.0.vfs_id
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
+    vfs_id: VfsId,
     db: Db,
     cache: Cache,
     max_chunk_size: usize,
@@ -1004,7 +1029,7 @@ where
 mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError};
+    use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError, VfsId};
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
     use std::io::SeekFrom;
@@ -1017,7 +1042,14 @@ mod tests {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
 
-        Ok((Vfs::builder().db_file(path).build().await?, temp_dir))
+        Ok((
+            Vfs::builder()
+                .db_file(path)
+                .vfs_id(VfsId::generate())
+                .build()
+                .await?,
+            temp_dir,
+        ))
     }
 
     #[tokio::test]

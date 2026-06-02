@@ -5,7 +5,7 @@ use crate::object::metadata::MetadataError;
 use crate::vfs::Timestamp;
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use thiserror::Error;
 
 const METADATA_MAGIC_NUMBER: [u8; 4] = [0xA8, 0x19, 0xCD, 0x28];

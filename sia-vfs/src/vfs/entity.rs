@@ -430,6 +430,12 @@ impl EntityKey {
 pub struct EntityKind;
 pub type EntityId = TypedUuid<EntityKind>;
 
+impl EntityId {
+    pub(crate) fn generate() -> Self {
+        Self::_generate()
+    }
+}
+
 pub struct RevisionKind;
 pub type Revision = ContentId<RevisionKind>;
 
