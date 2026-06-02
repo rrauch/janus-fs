@@ -1,10 +1,18 @@
 pub(crate) mod chunk_map;
 mod compression;
 
-use crate::ContentId;
+use crate::vfs::Backend;
+use crate::{ContentId, object};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::AsyncReadExt;
+use sia_io::object::ObjectId as BackendObjectId;
+use std::io::ErrorKind;
 use std::ops::Deref;
+use std::sync::Arc;
+
+pub(crate) const METADATA_OBJECT_TYPE: &'static str = "CHUNK";
+pub(crate) const METADATA_CHUNK_ID: &'static str = "CHUNK-ID";
 
 pub type ChunkId = ContentId<Chunk>;
 
@@ -15,6 +23,38 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    pub(crate) async fn load_from_backend(
+        id: &BackendObjectId,
+        backend: &impl Backend,
+    ) -> Result<Self, std::io::Error> {
+        let dl = backend
+            .download(id)
+            .await?
+            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
+
+        let metadata: object::metadata::Metadata = dl
+            .object()
+            .metadata()
+            .try_into()
+            .map_err(std::io::Error::other)?;
+
+        if metadata.get(object::METADATA_VFS_OBJECT_TYPE) != Some(METADATA_OBJECT_TYPE) {
+            Err(std::io::Error::other("METADATA_OBJECT_TYPE mismatch"))?
+        }
+
+        let mut buffer = Vec::with_capacity(dl.object().size() as usize);
+        let mut reader = dl.open().await.map_err(std::io::Error::other)?;
+        reader.read_to_end(&mut buffer).await?;
+        let this = Self::from(buffer);
+
+        let chunk_id = this.id().to_string();
+        if metadata.get(METADATA_CHUNK_ID) != Some(chunk_id.as_str()) {
+            Err(std::io::Error::other("METADATA_CHUNK_ID mismatch"))?
+        }
+
+        Ok(this)
+    }
+
     pub fn id(&self) -> &ChunkId {
         &self.id
     }
@@ -54,6 +94,13 @@ impl From<Bytes> for Chunk {
 impl From<Vec<u8>> for Chunk {
     fn from(value: Vec<u8>) -> Self {
         let bytes: Bytes = value.into();
+        bytes.into()
+    }
+}
+
+impl From<Arc<[u8]>> for Chunk {
+    fn from(value: Arc<[u8]>) -> Self {
+        let bytes = Bytes::from_owner(value);
         bytes.into()
     }
 }

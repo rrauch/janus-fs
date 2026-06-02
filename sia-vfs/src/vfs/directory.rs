@@ -45,10 +45,8 @@ impl DirectoryBody<'_> {
 
 impl EntityHandler for DirectoryKind {
     type Body = DirectoryBody<'static>;
-
-    fn db_type() -> &'static str {
-        "D"
-    }
+    const DB_TYPE: &'static str = "D";
+    const METADATA_TYPE: &'static str = "DIRECTORY";
 
     fn to_owned(body: &<Self::Body as Yokeable>::Output) -> Self::Body {
         body.clone().into_owned()
@@ -208,7 +206,7 @@ where
         parent_inode_id: InodeId,
     ) -> Result<InodeId, DbError> {
         let entity = DirectoryDraft::new_directory_draft(name.to_owned());
-        let entity_id = self.create_entity_if_not_exist(entity).await?;
+        let entity_id = self.register_entity(entity).await?;
         Ok(self
             .create_inode::<DirectoryKind>(&name, parent_inode_id, entity_id)
             .await?)

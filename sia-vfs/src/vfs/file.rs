@@ -62,10 +62,8 @@ impl From<Blob> for FileBody<'static> {
 
 impl EntityHandler for FileKind {
     type Body = FileBody<'static>;
-
-    fn db_type() -> &'static str {
-        "F"
-    }
+    const DB_TYPE: &'static str = "F";
+    const METADATA_TYPE: &'static str = "FILE";
 
     fn to_owned(body: &<Self::Body as Yokeable>::Output) -> Self::Body {
         body.clone().into_owned()
@@ -568,9 +566,9 @@ where
         parent_inode_id: InodeId,
     ) -> Result<InodeId, DbError> {
         let blob = BlobMut::empty().finalize();
-        self.create_blob_if_not_exist(&blob).await?;
+        self.register_blob(&blob).await?;
         let entity = FileDraft::new_file_draft(name.to_owned(), blob);
-        let entity_id = self.create_entity_if_not_exist(entity).await?;
+        let entity_id = self.register_entity(entity).await?;
         Ok(self
             .create_inode::<FileKind>(&name, parent_inode_id, entity_id)
             .await?)
@@ -580,7 +578,7 @@ where
         let inode_id = file.inode_id;
         file.set_content(blob.clone().into());
         file.set_last_modified(Timestamp::now());
-        self.create_blob_if_not_exist(&blob).await?;
+        self.register_blob(&blob).await?;
         let name = file.name().to_owned();
         let file = match self.update(inode_id, &name, file.freeze()).await? {
             Inode::File(file) => file,

@@ -193,6 +193,7 @@ pub enum ConfigError {
     InvalidMaxConcurrentDownloads,
 }
 
+#[derive(Debug)]
 pub struct Client {
     backend: Backend,
     cache: Cache,

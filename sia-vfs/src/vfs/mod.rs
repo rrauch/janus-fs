@@ -24,6 +24,10 @@ use async_trait::async_trait;
 use bytemuck::TransparentWrapper;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
+use futures_util::TryStreamExt;
+use futures_util::stream::BoxStream;
+use sia_io::Client as Sia;
+use sia_io::object::{DownloadableObject, Object as BackendObject, ObjectId as BackendObjectId};
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
@@ -127,7 +131,7 @@ impl Display for InodeId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum StorageMode {
     Synced(ObjectId),
-    Local,
+    Local(Arc<[u8]>),
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, PartialOrd, Ord)]
@@ -349,7 +353,7 @@ impl Inode {
     pub fn is_directory(&self) -> bool {
         match self {
             Self::Directory(_) => true,
-            Self::File(i) => false,
+            Self::File(_) => false,
         }
     }
 
@@ -357,7 +361,7 @@ impl Inode {
     pub fn as_directory(&self) -> Option<&Directory> {
         match self {
             Self::Directory(dir) => Some(dir),
-            Self::File(i) => None,
+            Self::File(_) => None,
         }
     }
 
@@ -487,16 +491,25 @@ pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 #[bon::bon]
 impl<Mode> Vfs<Mode> {
     #[builder(derive(Debug))]
-    pub async fn new(
+    pub async fn new<B: Backend + 'static>(
         vfs_id: VfsId,
         db_file: PathBuf,
+        backend: B,
         #[builder(default)] db_page_size: PageSize,
         #[builder(default = 25)] max_db_connections: u8,
         #[builder(default)] cache_settings: CacheSettings,
         #[builder(default = 64 * 1024)] max_chunk_size: usize,
     ) -> Result<Self, VfsError> {
         let cache = Cache::new(&cache_settings);
-        let db = Db::new(db_file, max_db_connections, db_page_size, cache.clone()).await?;
+        let backend = Arc::new(backend);
+        let db = Db::new(
+            db_file,
+            max_db_connections,
+            db_page_size,
+            cache.clone(),
+            backend.clone(),
+        )
+        .await?;
 
         //todo: check that PageSize & max_chunk_size align
 
@@ -510,6 +523,7 @@ impl<Mode> Vfs<Mode> {
                 max_chunk_size,
                 dead_fh_reaper: reaper,
                 file_write_locks: FileWriteLocks::new(),
+                backend,
             }),
             PhantomData,
         ))
@@ -520,7 +534,7 @@ impl<Mode> Vfs<Mode> {
     }
 }
 
-#[derive(Debug)]
+#[derive_where(Debug)]
 struct Inner {
     vfs_id: VfsId,
     db: Db,
@@ -528,6 +542,41 @@ struct Inner {
     max_chunk_size: usize,
     dead_fh_reaper: Reaper,
     file_write_locks: FileWriteLocks,
+    #[derive_where(skip)]
+    backend: Arc<dyn Backend>,
+}
+
+#[async_trait]
+pub(crate) trait Backend: Send + Sync {
+    async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, std::io::Error>>;
+    async fn download(
+        &self,
+        id: &BackendObjectId,
+    ) -> Result<Option<DownloadableObject>, std::io::Error>;
+}
+
+#[async_trait]
+impl Backend for Arc<dyn Backend> {
+    #[inline]
+    async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, std::io::Error>> {
+        self.deref().list_objects().await
+    }
+
+    #[inline]
+    async fn download(&self, id: &BackendObjectId) -> Result<Option<DownloadableObject>, Error> {
+        self.deref().download(id).await
+    }
+}
+
+#[async_trait]
+impl Backend for Sia {
+    async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, std::io::Error>> {
+        Box::pin(Sia::list_objects(self).map_err(std::io::Error::other))
+    }
+
+    async fn download(&self, id: &BackendObjectId) -> Result<Option<DownloadableObject>, Error> {
+        Sia::download(self, id).await.map_err(std::io::Error::other)
+    }
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -541,6 +590,28 @@ pub struct ReadWrite;
 
 impl Read for ReadWrite {}
 impl Write for ReadWrite {}
+
+impl<Mode> Vfs<Mode> {
+    pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
+        Ok(self.0.db.read().await?)
+    }
+
+    pub(crate) async fn tx_rw(&self) -> VfsResult<Transaction<DbReadWrite>> {
+        Ok(self.0.db.write().await?)
+    }
+
+    pub(crate) fn backend(&self) -> &impl Backend {
+        &self.0.backend
+    }
+
+    pub(crate) fn cache(&self) -> &Cache {
+        &self.0.cache
+    }
+
+    pub(crate) fn max_chunk_size(&self) -> usize {
+        self.0.max_chunk_size
+    }
+}
 
 impl<Mode: Read> Vfs<Mode> {
     #[inline]
@@ -561,18 +632,6 @@ impl<Mode: Read> Vfs<Mode> {
 
     async fn _inode_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Inode>> {
         Ok(self.tx().await?.inode_by_id(inode_id).await?)
-    }
-
-    pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
-        Ok(self.0.db.read().await?)
-    }
-
-    pub(crate) fn cache(&self) -> &Cache {
-        &self.0.cache
-    }
-
-    pub(crate) fn max_chunk_size(&self) -> usize {
-        self.0.max_chunk_size
     }
 
     pub(crate) async fn blob_by_id(&self, blob_id: &BlobId) -> VfsResult<Option<Blob>> {
@@ -600,7 +659,7 @@ impl<Mode: Read + Unpin> ChunkSource for Vfs<Mode> {
 impl<Mode: Read + Write + Unpin> ChunkSink for Vfs<Mode> {
     async fn insert_chunk(&self, chunk: Chunk) -> Result<(), Error> {
         let mut tx = self.tx_rw().await.map_err(std::io::Error::other)?;
-        tx.insert_chunk_if_not_exist(&chunk)
+        tx.register_chunk(&chunk)
             .await
             .map_err(std::io::Error::other)?;
         tx.commit().await.map_err(std::io::Error::other)?;
@@ -643,15 +702,11 @@ impl<Mode: Read + Write> Vfs<Mode> {
         Ok(())
     }
 
-    pub async fn copy(&self, inode_id: InodeId, new_parent: &Directory) -> VfsResult<()> {
+    pub async fn copy(&self, inode_id: InodeId, _new_parent: &Directory) -> VfsResult<()> {
         if inode_id == ROOT_INODE_ID {
             return Err(VfsError::CopyRootError);
         }
         todo!()
-    }
-
-    pub(crate) async fn tx_rw(&self) -> VfsResult<Transaction<DbReadWrite>> {
-        Ok(self.0.db.write().await?)
     }
 }
 
@@ -757,7 +812,7 @@ where
         let len = r.size as u64;
 
         let mode = match r.mode.as_str() {
-            "L" => StorageMode::Local,
+            "L" => StorageMode::Local(Arc::from(vec![])),
             "S" => StorageMode::Synced(
                 r.object_id
                     .map(ObjectId::from)
@@ -807,7 +862,7 @@ where
         };
 
         let mode = match r.mode.as_str() {
-            "L" => StorageMode::Local,
+            "L" => StorageMode::Local(Arc::from(r.data.unwrap_or_default())),
             "S" => StorageMode::Synced(
                 r.object_id
                     .map(ObjectId::from)
@@ -820,21 +875,28 @@ where
             }
         };
 
-        if let StorageMode::Local = mode {
-            let chunk = match r.data {
-                Some(bytes) => Chunk::from(bytes),
-                None => return Err(DataError::ConversionError("chunk data is missing".into()))?,
-            };
-            if chunk.id() != chunk_id {
-                return Err(DataError::ChunkIdMismatch {
-                    expected: chunk_id.clone(),
-                    actual: chunk.id().clone(),
+        let chunk = match mode {
+            StorageMode::Local(bytes) => Chunk::from(bytes),
+            StorageMode::Synced(object_id) => {
+                // load object from backend
+                let object = self
+                    .object_by_id(object_id)
+                    .await?
+                    .ok_or_else(|| DataError::ObjectNotFound(object_id))?;
+                let backend_id = object.try_to_backend_object_id().ok_or_else(|| {
+                    DataError::InvalidRemoteLocation(object.remote_location().to_string())
                 })?;
+                Chunk::load_from_backend(&backend_id, self.backend()).await?
             }
-            Ok(Some(chunk))
-        } else {
-            Err(DataError::UnsupportedStorageMode)?
+        };
+
+        if chunk.id() != chunk_id {
+            return Err(DataError::ChunkIdMismatch {
+                expected: chunk_id.clone(),
+                actual: chunk.id().clone(),
+            })?;
         }
+        Ok(Some(chunk))
     }
 }
 
@@ -857,7 +919,7 @@ where
         parent: InodeId,
         entity_key: EntityKey,
     ) -> Result<InodeId, DbError> {
-        let inode_type = T::db_type();
+        let inode_type = T::DB_TYPE;
         let inode_id = InodeId::from_entity_id(entity_key.id());
         let name = name.as_ref();
         let parent = parent.0 as i64;
@@ -935,7 +997,7 @@ where
         Ok(())
     }
 
-    pub(crate) async fn create_blob_if_not_exist(&mut self, blob: &Blob) -> Result<(), DbError> {
+    pub(crate) async fn register_blob(&mut self, blob: &Blob) -> Result<(), DbError> {
         let id = blob.id().as_slice();
 
         if let StorageMode::Synced(object_id) = blob.mode() {
@@ -964,7 +1026,7 @@ where
 
         let size = blob.len() as i64;
         let (mode, object_id) = match blob.mode() {
-            StorageMode::Local => ("L", None),
+            StorageMode::Local(_) => ("L", None),
             StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64)),
         };
 
@@ -996,16 +1058,13 @@ where
         Ok(())
     }
 
-    async fn insert_chunk_if_not_exist(&mut self, chunk: &Chunk) -> Result<bool, DbError> {
+    async fn register_chunk(&mut self, chunk: &Chunk) -> Result<bool, DbError> {
         let id = chunk.id().as_slice();
 
-        if sqlx::query!(
-            "SELECT EXISTS(SELECT 1 FROM chunk WHERE id = ?) as \"chunk_exists: bool\"",
-            id,
-        )
-        .fetch_one(self.conn())
-        .await?
-        .chunk_exists
+        if let Some(mode) = sqlx::query!("SELECT mode FROM chunk WHERE id = ?", id,)
+            .map(|r| r.mode)
+            .fetch_optional(self.conn())
+            .await?
         {
             // chunk already exists
             return Ok(false);
@@ -1029,14 +1088,37 @@ where
 mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError, VfsId};
+    use crate::vfs::{
+        Backend, Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError, VfsId,
+    };
     use anyhow::bail;
+    use async_trait::async_trait;
+    use futures_util::stream::BoxStream;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
-    use std::io::SeekFrom;
+    use sia_io::object::{
+        DownloadableObject, Object as BackendObject, ObjectId as BackendObjectId,
+    };
+    use std::io::{Error, SeekFrom};
     use std::ops::Deref;
     use std::str::FromStr;
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
+
+    struct MockBackend;
+
+    #[async_trait]
+    impl Backend for MockBackend {
+        async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, Error>> {
+            todo!()
+        }
+
+        async fn download(
+            &self,
+            id: &BackendObjectId,
+        ) -> Result<Option<DownloadableObject>, Error> {
+            todo!()
+        }
+    }
 
     async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
         let temp_dir = tempdir()?;
@@ -1044,6 +1126,7 @@ mod tests {
 
         Ok((
             Vfs::builder()
+                .backend(MockBackend)
                 .db_file(path)
                 .vfs_id(VfsId::generate())
                 .build()

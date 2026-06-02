@@ -658,7 +658,9 @@ struct IterHolder<K: 'static> {
 }
 
 impl Client {
-    pub fn list_objects(&self) -> impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin {
+    pub fn list_objects(
+        &self,
+    ) -> impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin + '_ {
         let set = self.known_object_ids.clone();
 
         let holder = IterHolderBuilder {

@@ -7,17 +7,27 @@ use crate::gen_flatbuffers::vfs::entity::{
     EntityBuilder,
 };
 use crate::object::ObjectId;
-use crate::vfs::{Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsResult};
-use crate::{ContentId, TypedUuid};
+use crate::vfs::{
+    Backend, Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsResult,
+};
+use crate::{ContentId, TypedUuid, object};
 use derive_where::derive_where;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
+use futures_util::AsyncReadExt;
+use sia_io::object::ObjectId as BackendObjectId;
 use std::borrow::Cow;
 use std::fmt::Debug;
+use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 use thiserror::Error;
 use yoke::{Yoke, Yokeable};
+
+pub(crate) const METADATA_OBJECT_TYPE: &'static str = "ENTITY";
+pub(crate) const METADATA_ENTITY_ID: &'static str = "ENTITY-ID";
+pub(crate) const METADATA_ENTITY_REVISION: &'static str = "ENTITY-REVISION";
+pub(crate) const METADATA_ENTITY_TYPE: &'static str = "ENTITY-TYPE";
 
 #[derive_where(Debug, Clone, PartialEq, Eq)]
 pub enum Entity<T: EntityHandler> {
@@ -31,6 +41,14 @@ impl<T: EntityHandler> Entity<T> {
         match self {
             Self::Synced(e) => e.entity_id(),
             Self::Local(e) => e.entity_id(),
+        }
+    }
+
+    #[inline]
+    pub fn revision(&self) -> &Revision {
+        match self {
+            Self::Synced(e) => e.revision(),
+            Self::Local(e) => e.revision(),
         }
     }
 
@@ -101,6 +119,62 @@ pub struct LocalMode;
 pub struct DraftMode;
 
 pub type SyncedEntity<T> = RawEntity<T, SyncedMode>;
+
+impl<T: EntityHandler> SyncedEntity<T> {
+    pub(crate) async fn load_from_backend(
+        object_id: ObjectId,
+        backend_id: &BackendObjectId,
+        backend: &impl Backend,
+    ) -> Result<Self, std::io::Error> {
+        let dl = backend
+            .download(backend_id)
+            .await?
+            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
+
+        let metadata: object::metadata::Metadata = dl
+            .object()
+            .metadata()
+            .try_into()
+            .map_err(std::io::Error::other)?;
+
+        if metadata.get(object::METADATA_VFS_OBJECT_TYPE) != Some(METADATA_OBJECT_TYPE) {
+            Err(std::io::Error::other("METADATA_OBJECT_TYPE mismatch"))?
+        }
+
+        if metadata.get(METADATA_ENTITY_TYPE) != Some(T::METADATA_TYPE) {
+            Err(std::io::Error::other("METADATA_ENTITY_TYPE mismatch"))?
+        }
+
+        let mut buffer = Vec::with_capacity(dl.object().size() as usize);
+        let mut reader = dl.open().await.map_err(std::io::Error::other)?;
+        reader.read_to_end(&mut buffer).await?;
+        let this = Self::try_from_flatbuffer(Arc::from(buffer), object_id)
+            .map_err(std::io::Error::other)?;
+
+        let entity_id = this.entity_id().to_string();
+        if metadata.get(METADATA_ENTITY_ID) != Some(entity_id.as_str()) {
+            Err(std::io::Error::other("METADATA_ENTITY_ID mismatch"))?
+        }
+
+        let revision = this.revision().to_string();
+        if metadata.get(METADATA_ENTITY_REVISION) != Some(revision.as_str()) {
+            Err(std::io::Error::other("METADATA_ENTITY_REVISION mismatch"))?
+        }
+
+        Ok(this)
+    }
+
+    pub(crate) fn try_from_flatbuffer(
+        buffer: Arc<[u8]>,
+        object_id: ObjectId,
+    ) -> Result<Self, EntityError> {
+        Ok(Self::new(
+            RawEntityInner::try_from_flatbuffer(buffer)?,
+            SyncedMode { object_id },
+        ))
+    }
+}
+
 pub type LocalEntity<T> = RawEntity<T, LocalMode>;
 pub type DraftEntity<T> = RawEntity<T, DraftMode>;
 
@@ -108,6 +182,11 @@ pub type DraftEntity<T> = RawEntity<T, DraftMode>;
 pub enum EntityError {
     #[error(transparent)]
     InvalidFlatbuffer(#[from] InvalidFlatbuffer),
+    #[error("id mismatch: [{expected}] != [{actual}]")]
+    IdMismatch {
+        expected: EntityId,
+        actual: EntityId,
+    },
     #[error("revision mismatch: [{expected}] != [{actual}]")]
     RevisionMismatch {
         expected: Revision,
@@ -121,16 +200,22 @@ pub enum EntityError {
     ExpectedDirectory,
     #[error("expected file entity")]
     ExpectedFile,
+    #[error("expected local mode")]
+    ExpectedLocalMode,
     #[error("bytemuck error: {0}")]
     BytemuckError(String),
     #[error("incorrect entity type: [{expected}] != [{actual}]")]
     IncorrectType { expected: String, actual: String },
+    #[error("invalid entity id")]
+    InvalidId,
+    #[error("invalid entity revision")]
+    InvalidRevision,
 }
 
 pub trait EntityHandler: Sized {
     type Body: for<'a> Yokeable<'a> + Clone;
-
-    fn db_type() -> &'static str;
+    const DB_TYPE: &'static str;
+    const METADATA_TYPE: &'static str;
 
     fn to_owned(body: &<Self::Body as Yokeable>::Output) -> Self::Body;
 
@@ -446,14 +531,11 @@ where
     pub(super) async fn entity_by_key<T: EntityHandler>(
         &mut self,
         key: &EntityKey,
-    ) -> Result<Option<Entity<T>>, DbError>
-    where
-        Entity<T>: TryFrom<EntityRow>,
-    {
+    ) -> Result<Option<Entity<T>>, DbError> {
         let id_ref = key.id.as_slice();
         let rev_ref = key.revision.as_slice();
 
-        Ok(sqlx::query!(
+        if let Some(entity_row) = sqlx::query!(
             "SELECT name, mode, entity_type, object_id, data FROM entity WHERE id = ? and revision = ?",
             id_ref,
             rev_ref,
@@ -466,20 +548,38 @@ where
                     revision: key.revision.clone(),
                     name: OwnedName::try_from(r.name).map_err(|e| DataError::ConversionError(e.to_string().into()))?,
                     mode: match r.mode.as_str() {
-                        "L" => StorageMode::Local,
+                        "L" => StorageMode::Local(Arc::from(r.data.unwrap_or_default())),
                         "S" => StorageMode::Synced(r.object_id.map(ObjectId::from).ok_or(DataError::MissingObject)?),
                         other => return Err(DataError::ConversionError(format!("invalid mode: {}", other).into()))?,
                     },
                     entity_type: r.entity_type.into(),
-                    data: Arc::from(r.data.unwrap_or_default()),
                 })
             })
-            .transpose()?
-            .map(|e| {
-                e.try_into()
-                    .map_err(|_| DataError::ConversionError("invalid row".into()))
-            })
-            .transpose()?)
+            .transpose()? {
+            let object_id = match &entity_row.mode {
+                StorageMode::Local(_) => None,
+                StorageMode::Synced(object_id) => Some(*object_id),
+            };
+
+            Ok(match object_id {
+                Some(object_id) => {
+                    // synced entity
+                    let object = self.object_by_id(object_id).await?.ok_or_else(|| DataError::ObjectNotFound(object_id))?;
+                    let backend_id = object.try_to_backend_object_id().ok_or_else(|| DataError::ConversionError("invalid remote_location".into()))?;
+                    Ok::<_, DbError>(Some(Entity::Synced(SyncedEntity::<T>::load_from_backend(object_id, &backend_id, self.backend()).await?)))
+                }
+                None => {
+                    // local entity
+                    Ok(Some(Entity::Local(LocalEntity::<T>::try_from(entity_row).map_err(|_| DataError::ConversionError("invalid row".into()))?)))
+                }
+            }.map(|o| o.map(|e| if e.entity_id() != &key.id || e.revision() != &key.revision {
+                Err(DataError::EntityMismatch)
+            } else {
+                Ok(e)
+            }).transpose())??)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -489,7 +589,6 @@ pub(crate) struct EntityRow {
     pub name: OwnedName,
     pub mode: StorageMode,
     pub entity_type: Cow<'static, str>,
-    pub data: Arc<[u8]>,
 }
 
 pub(crate) enum EntityRef<'a> {
@@ -532,18 +631,40 @@ impl<T: EntityHandler> From<&DraftEntity<T>> for EntityRow {
             id,
             revision,
             name,
-            mode: StorageMode::Local,
-            entity_type: T::db_type().into(),
-            data,
+            mode: StorageMode::Local(data),
+            entity_type: T::DB_TYPE.into(),
         }
     }
 }
 
-impl<T: EntityHandler> TryFrom<EntityRow> for Entity<T> {
+impl<T: EntityHandler> From<&SyncedEntity<T>> for EntityRow {
+    fn from(entity: &SyncedEntity<T>) -> Self {
+        let id = entity.entity_id().clone();
+        let revision = entity.revision().clone();
+        let name = entity.name().to_owned();
+
+        Self {
+            id,
+            revision,
+            name,
+            mode: StorageMode::Synced(entity.object_id()),
+            entity_type: T::DB_TYPE.into(),
+        }
+    }
+}
+
+impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
     type Error = EntityError;
 
     fn try_from(value: EntityRow) -> Result<Self, Self::Error> {
-        let raw_entity = RawEntityInner::try_from_flatbuffer(value.data)?;
+        let data = match value.mode {
+            StorageMode::Local(data) => data,
+            StorageMode::Synced(_) => {
+                return Err(EntityError::ExpectedLocalMode);
+            }
+        };
+
+        let raw_entity = RawEntityInner::try_from_flatbuffer(data)?;
         if raw_entity.revision() != &value.revision {
             return Err(EntityError::RevisionMismatch {
                 expected: value.revision,
@@ -551,12 +672,7 @@ impl<T: EntityHandler> TryFrom<EntityRow> for Entity<T> {
             });
         };
 
-        Ok(match value.mode {
-            StorageMode::Synced(object_id) => {
-                Entity::Synced(SyncedEntity::new(raw_entity, SyncedMode { object_id }))
-            }
-            StorageMode::Local => Entity::Local(LocalEntity::new(raw_entity, LocalMode)),
-        })
+        Ok(LocalEntity::new(raw_entity, LocalMode))
     }
 }
 
@@ -564,25 +680,46 @@ impl<C: TxScope> Transaction<C>
 where
     Self: DbWrite,
 {
-    pub(crate) async fn create_entity_if_not_exist<T: EntityHandler>(
+    pub(crate) async fn register_entity<T: EntityHandler, Mode>(
         &mut self,
-        draft_entity: DraftEntity<T>,
-    ) -> Result<EntityKey, DbError> {
-        let id = draft_entity.entity_id();
-        let rev = draft_entity.revision();
+        raw_entity: RawEntity<T, Mode>,
+    ) -> Result<EntityKey, DbError>
+    where
+        EntityRow: for<'a> From<&'a RawEntity<T, Mode>>,
+    {
+        let id = raw_entity.entity_id();
+        let rev = raw_entity.revision();
         let id_slice = id.as_slice();
         let rev_slice = rev.as_slice();
 
-        if sqlx::query!(
-            "SELECT EXISTS(SELECT 1 FROM entity WHERE id = ? AND revision = ?) as \"entity_exists: bool\"",
+        if let Some(mode) = sqlx::query!(
+            "SELECT mode FROM entity WHERE id = ? AND revision = ?",
             id_slice,
             rev_slice,
         )
-            .fetch_one(self.conn())
-            .await?
-            .entity_exists
+        .map(|r| r.mode)
+        .fetch_optional(self.conn())
+        .await?
         {
-            // entity already exists
+            let row = EntityRow::from(&raw_entity);
+            match (mode.as_str(), &row.mode) {
+                ("L", StorageMode::Synced(oid)) => {
+                    // Existing local, new synced: perform L->S transition
+                    let new_object_id = *oid.deref() as i64;
+                    sqlx::query!(
+                        "UPDATE entity SET mode = 'S', object_id = ?, data = NULL \
+                            WHERE id = ? AND revision = ?",
+                        new_object_id,
+                        id_slice,
+                        rev_slice,
+                    )
+                    .execute(self.conn())
+                    .await?;
+                }
+                _ => {
+                    // Entity exists and no transition
+                }
+            }
             return Ok(EntityKey {
                 id: id.clone(),
                 revision: rev.clone(),
@@ -590,17 +727,16 @@ where
         }
 
         // entity does not exist yet, creating from scratch
-        let refs = draft_entity.references();
-        let row = EntityRow::from(&draft_entity);
+        let refs = raw_entity.references();
+        let row = EntityRow::from(&raw_entity);
         let id = row.id.as_slice();
         let rev = row.revision.as_slice();
         let name = row.name.as_ref();
         let entity_type = row.entity_type.as_ref();
-        let (mode, object_id) = match &row.mode {
-            StorageMode::Local => ("L", None),
-            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64)),
+        let (mode, object_id, data) = match &row.mode {
+            StorageMode::Local(data) => ("L", None, Some(data.as_ref())),
+            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64), None),
         };
-        let data = row.data.as_ref();
 
         sqlx::query!(
             "INSERT INTO entity (id, revision, name, entity_type, mode, object_id, data)
@@ -651,7 +787,7 @@ where
         name: &Name,
         draft_entity: DraftEntity<T>,
     ) -> VfsResult<Inode> {
-        let entity_id = self.create_entity_if_not_exist(draft_entity).await?;
+        let entity_id = self.register_entity(draft_entity).await?;
         self.update_inode(inode_id, &name, &entity_id).await?;
         Ok(self
             .inode_by_id(inode_id)

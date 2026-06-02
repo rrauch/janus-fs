@@ -3,6 +3,10 @@ pub mod io;
 use crate::ContentId;
 use crate::chunk::chunk_map::ChunkMap;
 use crate::vfs::StorageMode;
+use std::sync::Arc;
+
+pub(crate) const METADATA_OBJECT_TYPE: &'static str = "BLOB";
+pub(crate) const METADATA_BLOB_ID: &'static str = "BLOB-ID";
 
 pub type BlobId = ContentId<Blob>;
 
@@ -70,7 +74,7 @@ impl BlobMut {
     pub fn empty() -> Self {
         Self {
             chunk_map: ChunkMap::new(),
-            mode: StorageMode::Local,
+            mode: StorageMode::Local(Arc::from(vec![])),
         }
     }
 
