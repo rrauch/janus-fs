@@ -5,9 +5,7 @@ pub mod file;
 pub mod path;
 
 use crate::TypedUuid;
-use crate::blob::{Blob, BlobId, BlobMut};
-use crate::chunk::chunk_map::ChunkMap;
-use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
+use crate::blob::BlobId;
 use crate::db::{
     DataError, Db, Error as DbError, PageSize, Read as DbRead, ReadOnly as DbReadOnly,
     ReadWrite as DbReadWrite, Transaction, TxScope, Write as DbWrite,
@@ -633,42 +631,6 @@ impl<Mode: Read> Vfs<Mode> {
     async fn _inode_by_id(&self, inode_id: InodeId) -> VfsResult<Option<Inode>> {
         Ok(self.tx().await?.inode_by_id(inode_id).await?)
     }
-
-    pub(crate) async fn blob_by_id(&self, blob_id: &BlobId) -> VfsResult<Option<Blob>> {
-        Ok(self.tx().await?.blob_by_id(blob_id).await?)
-    }
-
-    async fn _get_chunk(&self, chunk_id: &ChunkId) -> VfsResult<Option<Chunk>> {
-        let mut tx = self.tx().await.map_err(std::io::Error::other)?;
-        Ok(tx.chunk_by_id(chunk_id).await?)
-    }
-}
-
-#[async_trait]
-impl<Mode: Read + Unpin> ChunkSource for Vfs<Mode> {
-    async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, Error> {
-        self.cache()
-            .chunk_cache()
-            .try_get_with_by_ref(chunk_id, async { self._get_chunk(chunk_id).await })
-            .await
-            .map_err(Error::other)
-    }
-}
-
-#[async_trait]
-impl<Mode: Read + Write + Unpin> ChunkSink for Vfs<Mode> {
-    async fn insert_chunk(&self, chunk: Chunk) -> Result<(), Error> {
-        let mut tx = self.tx_rw().await.map_err(std::io::Error::other)?;
-        tx.register_chunk(&chunk)
-            .await
-            .map_err(std::io::Error::other)?;
-        tx.commit().await.map_err(std::io::Error::other)?;
-        self.cache()
-            .chunk_cache()
-            .insert(*chunk.id(), Some(chunk))
-            .await;
-        Ok(())
-    }
 }
 
 impl<Mode: Read + Write> Vfs<Mode> {
@@ -797,107 +759,6 @@ where
             }
         }))
     }
-
-    pub(crate) async fn blob_by_id(&mut self, blob_id: &BlobId) -> Result<Option<Blob>, DbError> {
-        let id = blob_id.as_ref();
-
-        let r = match sqlx::query!("SELECT size, mode, object_id FROM blob where id = ?", id)
-            .fetch_optional(self.conn())
-            .await?
-        {
-            None => return Ok(None),
-            Some(r) => r,
-        };
-
-        let len = r.size as u64;
-
-        let mode = match r.mode.as_str() {
-            "L" => StorageMode::Local(Arc::from(vec![])),
-            "S" => StorageMode::Synced(
-                r.object_id
-                    .map(ObjectId::from)
-                    .ok_or(DataError::MissingObject)?,
-            ),
-            other => {
-                return Err(DataError::ConversionError(
-                    format!("invalid mode: {}", other).into(),
-                ))?;
-            }
-        };
-
-        let rows = sqlx::query!(
-            "SELECT offset, len, chunk_id, chunk_offset FROM chunk_map WHERE blob_id = ? ORDER BY offset ASC",
-            id
-        ).fetch_all(self.conn()).await?;
-
-        let mut chunk_map = ChunkMap::with_len(len);
-        for r in rows {
-            chunk_map.insert(
-                r.offset as u64,
-                r.len as u64,
-                ChunkId::try_from_bytes(r.chunk_id)
-                    .ok_or_else(|| DataError::ConversionError("invalid chunk id".into()))?,
-                r.chunk_offset as usize,
-            )
-        }
-
-        let blob = BlobMut::from_chunk_map(chunk_map, mode).finalize();
-        if blob.id() != blob_id {
-            Err(DataError::BlobIdMismatch {
-                expected: *blob_id,
-                actual: *blob.id(),
-            })?
-        }
-        Ok(Some(blob))
-    }
-
-    async fn chunk_by_id(&mut self, chunk_id: &ChunkId) -> Result<Option<Chunk>, DbError> {
-        let id = chunk_id.as_slice();
-        let r = match sqlx::query!("SELECT mode, object_id, data FROM chunk WHERE id = ?", id)
-            .fetch_optional(self.conn())
-            .await?
-        {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-
-        let mode = match r.mode.as_str() {
-            "L" => StorageMode::Local(Arc::from(r.data.unwrap_or_default())),
-            "S" => StorageMode::Synced(
-                r.object_id
-                    .map(ObjectId::from)
-                    .ok_or(DataError::MissingObject)?,
-            ),
-            other => {
-                return Err(DataError::ConversionError(
-                    format!("invalid mode: {}", other).into(),
-                ))?;
-            }
-        };
-
-        let chunk = match mode {
-            StorageMode::Local(bytes) => Chunk::from(bytes),
-            StorageMode::Synced(object_id) => {
-                // load object from backend
-                let object = self
-                    .object_by_id(object_id)
-                    .await?
-                    .ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                let backend_id = object.try_to_backend_object_id().ok_or_else(|| {
-                    DataError::InvalidRemoteLocation(object.remote_location().to_string())
-                })?;
-                Chunk::load_from_backend(&backend_id, self.backend()).await?
-            }
-        };
-
-        if chunk.id() != chunk_id {
-            return Err(DataError::ChunkIdMismatch {
-                expected: chunk_id.clone(),
-                actual: chunk.id().clone(),
-            })?;
-        }
-        Ok(Some(chunk))
-    }
 }
 
 impl<C: TxScope> Transaction<C>
@@ -995,92 +856,6 @@ where
         }
 
         Ok(())
-    }
-
-    pub(crate) async fn register_blob(&mut self, blob: &Blob) -> Result<(), DbError> {
-        let id = blob.id().as_slice();
-
-        if let StorageMode::Synced(object_id) = blob.mode() {
-            // upgrade blob to synced if necessary
-            let object_id = *object_id.deref() as i64;
-            sqlx::query!(
-                "UPDATE blob SET mode = 'S', object_id = ? WHERE id = ?",
-                object_id,
-                id
-            )
-            .execute(self.conn())
-            .await?;
-        }
-
-        if sqlx::query!(
-            "SELECT EXISTS(SELECT 1 FROM blob WHERE id = ?) as \"blob_exists: bool\"",
-            id,
-        )
-        .fetch_one(self.conn())
-        .await?
-        .blob_exists
-        {
-            // blob already exists
-            return Ok(());
-        }
-
-        let size = blob.len() as i64;
-        let (mode, object_id) = match blob.mode() {
-            StorageMode::Local(_) => ("L", None),
-            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64)),
-        };
-
-        sqlx::query!(
-            "INSERT INTO blob (id, size, mode, object_id) VALUES (?, ?, ?, ?)",
-            id,
-            size,
-            mode,
-            object_id,
-        )
-        .execute(self.conn())
-        .await?;
-
-        for chunk in blob.chunk_map().iter() {
-            let offset = chunk.offset as i64;
-            let len = chunk.len as i64;
-            let chunk_id = chunk.chunk_id.as_slice();
-            let chunk_offset = chunk.chunk_offset as i64;
-            sqlx::query!(
-                "INSERT INTO chunk_map (blob_id, offset, len, chunk_id, chunk_offset) VALUES (?, ?, ?, ?, ?)",
-                id,
-                offset,
-                len,
-                chunk_id,
-                chunk_offset
-            ).execute(self.conn()).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn register_chunk(&mut self, chunk: &Chunk) -> Result<bool, DbError> {
-        let id = chunk.id().as_slice();
-
-        if let Some(mode) = sqlx::query!("SELECT mode FROM chunk WHERE id = ?", id,)
-            .map(|r| r.mode)
-            .fetch_optional(self.conn())
-            .await?
-        {
-            // chunk already exists
-            return Ok(false);
-        }
-
-        let data = chunk.deref();
-
-        sqlx::query!(
-            "INSERT INTO chunk (id, mode, data) VALUES (?, 'L', ?)",
-            id,
-            data
-        )
-        .execute(self.conn())
-        .await?;
-
-        Ok(true)
     }
 }
 

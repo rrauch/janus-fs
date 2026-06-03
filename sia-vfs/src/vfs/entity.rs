@@ -7,13 +7,16 @@ use crate::gen_flatbuffers::vfs::entity::{
     EntityBuilder,
 };
 use crate::object::ObjectId;
+use crate::sync::{Error as SyncError, SyncTask};
 use crate::vfs::{
-    Backend, Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsResult,
+    Backend, Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError,
+    VfsResult,
 };
 use crate::{ContentId, TypedUuid, object};
 use derive_where::derive_where;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
 use futures_util::AsyncReadExt;
+use sia_io::object::Object as SiaObject;
 use sia_io::object::ObjectId as BackendObjectId;
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -673,6 +676,47 @@ impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
         };
 
         Ok(LocalEntity::new(raw_entity, LocalMode))
+    }
+}
+
+impl<Mode> SyncTask<Mode> {
+    pub(crate) async fn entity_sync<T: EntityHandler, TX: TxScope>(
+        tx: &mut Transaction<TX>,
+        backend: &impl Backend,
+        entity_id: &str,
+        rev: &str,
+        sia_object: &SiaObject,
+        object_id: ObjectId,
+    ) -> Result<(), SyncError>
+    where
+        Transaction<TX>: crate::db::Read + crate::db::Write,
+    {
+        let entity_id = EntityId::try_from_str(entity_id).ok_or_else(|| EntityError::InvalidId)?;
+        let rev = Revision::try_from_str(rev).ok_or_else(|| EntityError::InvalidRevision)?;
+
+        let entity =
+            SyncedEntity::<T>::load_from_backend(object_id, sia_object.id(), backend).await?;
+
+        let entity_key = tx
+            .register_entity(entity)
+            .await
+            .map_err(VfsError::DbError)?;
+
+        if entity_key.id() != &entity_id {
+            return Err(EntityError::IdMismatch {
+                expected: entity_id,
+                actual: entity_key.id().clone(),
+            })?;
+        }
+
+        if entity_key.revision() != &rev {
+            return Err(EntityError::RevisionMismatch {
+                expected: rev,
+                actual: entity_key.revision().clone(),
+            })?;
+        }
+
+        Ok(())
     }
 }
 

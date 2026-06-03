@@ -1,10 +1,8 @@
-use crate::blob::BlobId;
-use crate::chunk::{Chunk, ChunkId};
-use crate::db::{Transaction, TxScope};
+use crate::blob::BlobError;
 use crate::object::metadata::Metadata;
 use crate::object::{ObjectCreateResult, ObjectId};
 use crate::vfs::directory::DirectoryKind;
-use crate::vfs::entity::{EntityError, EntityHandler, EntityId, Revision, SyncedEntity};
+use crate::vfs::entity::{EntityError, EntityHandler};
 use crate::vfs::file::FileKind;
 use crate::vfs::{Backend, Timestamp, Vfs, VfsError, VfsResult, entity};
 use crate::{blob, chunk, object};
@@ -26,10 +24,8 @@ pub enum Error {
     EntityError(#[from] EntityError),
     #[error("chunk_id invalid")]
     InvalidChunkId,
-    #[error("blob_id invalid")]
-    InvalidBlobId,
-    #[error("blob_id mismatch: [{expected}] != [{actual}]")]
-    BlobIdMismatch { expected: BlobId, actual: BlobId },
+    #[error(transparent)]
+    BlobError(#[from] BlobError),
 }
 
 pub struct SyncTask<Mode> {
@@ -40,8 +36,29 @@ impl<Mode> SyncTask<Mode> {
     pub async fn run(&mut self) -> Result<(), Error> {
         let mut erroneous_object_ids = self.vfs.known_object_ids().await?;
 
+        // The order in which objects are processed is important due to their internal dependency hierarchy:
+        // Entities may depend on Blobs & Blobs depend on Chunks
+        // Hence we have to process in order of: 1. Chunks 2. Blobs 3. Entities
+        let mut chunks = vec![];
+        let mut blobs = vec![];
+        let mut entities = vec![];
+
         let mut stream = self.vfs.backend_objects().await?;
         while let Some(sia_object) = stream.try_next().await.map_err(VfsError::IoError)? {
+            let metadata: Metadata = sia_object
+                .metadata()
+                .try_into()
+                .expect("metadata conversion to never fail");
+
+            match metadata.get(object::METADATA_VFS_OBJECT_TYPE) {
+                Some(chunk::METADATA_OBJECT_TYPE) => chunks.push(sia_object),
+                Some(blob::METADATA_OBJECT_TYPE) => blobs.push(sia_object),
+                Some(entity::METADATA_OBJECT_TYPE) => entities.push(sia_object),
+                _ => {} // ignore
+            }
+        }
+
+        for sia_object in chunks.into_iter().chain(blobs).chain(entities) {
             match self.sync_object(sia_object).await {
                 Ok(id) => {
                     erroneous_object_ids.remove(&id);
@@ -118,12 +135,13 @@ impl<Mode> SyncTask<Mode> {
                     }
                     Some(blob::METADATA_OBJECT_TYPE) => {
                         if let Some(blob_id) = metadata.get(blob::METADATA_BLOB_ID) {
-                            Self::blob_sync(&mut tx, self.vfs.backend(), blob_id).await?;
+                            Self::blob_sync(&mut tx, self.vfs.backend(), blob_id, &sia_object, id)
+                                .await?;
                         }
                     }
                     Some(chunk::METADATA_OBJECT_TYPE) => {
                         if let Some(chunk_id) = metadata.get(chunk::METADATA_CHUNK_ID) {
-                            Self::chunk_sync(&mut tx, chunk_id).await?;
+                            Self::chunk_sync(&mut tx, chunk_id, id).await?;
                         }
                     }
                     None => {}
@@ -135,66 +153,6 @@ impl<Mode> SyncTask<Mode> {
         };
         tx.commit().await.map_err(VfsError::DbError)?;
         Ok(id)
-    }
-
-    async fn chunk_sync<TX: TxScope>(tx: &mut Transaction<TX>, chunk_id: &str) -> Result<(), Error>
-    where
-        Transaction<TX>: crate::db::Read + crate::db::Write,
-    {
-        let chunk_id = ChunkId::try_from_str(chunk_id).ok_or_else(|| Error::InvalidChunkId)?;
-        todo!("register chunk");
-        Ok(())
-    }
-
-    async fn blob_sync<TX: TxScope>(
-        tx: &mut Transaction<TX>,
-        backend: &impl Backend,
-        blob_id: &str,
-    ) -> Result<(), Error>
-    where
-        Transaction<TX>: crate::db::Read + crate::db::Write,
-    {
-        let blob_id = BlobId::try_from_str(blob_id).ok_or_else(|| Error::InvalidBlobId)?;
-        todo!()
-    }
-
-    async fn entity_sync<T: EntityHandler, TX: TxScope>(
-        tx: &mut Transaction<TX>,
-        backend: &impl Backend,
-        entity_id: &str,
-        rev: &str,
-        sia_object: &SiaObject,
-        object_id: ObjectId,
-    ) -> Result<(), Error>
-    where
-        Transaction<TX>: crate::db::Read + crate::db::Write,
-    {
-        let entity_id = EntityId::try_from_str(entity_id).ok_or_else(|| EntityError::InvalidId)?;
-        let rev = Revision::try_from_str(rev).ok_or_else(|| EntityError::InvalidRevision)?;
-
-        let entity =
-            SyncedEntity::<T>::load_from_backend(object_id, sia_object.id(), backend).await?;
-
-        let entity_key = tx
-            .register_entity(entity)
-            .await
-            .map_err(VfsError::DbError)?;
-
-        if entity_key.id() != &entity_id {
-            return Err(EntityError::IdMismatch {
-                expected: entity_id,
-                actual: entity_key.id().clone(),
-            })?;
-        }
-
-        if entity_key.revision() != &rev {
-            return Err(EntityError::RevisionMismatch {
-                expected: rev,
-                actual: entity_key.revision().clone(),
-            })?;
-        }
-
-        Ok(())
     }
 }
 
