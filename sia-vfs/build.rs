@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
             s
         })
         .expect("OUT_DIR not set");
-    BuilderOptions::new_with_files(["schemas/entity.fbs"])
+    BuilderOptions::new_with_files(["schemas/content_id.fbs", "schemas/vfs.fbs"])
         .set_output_path(vfs_path)
         .compile()?;
     // object

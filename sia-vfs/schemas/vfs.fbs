@@ -1,3 +1,5 @@
+include "content_id.fbs";
+
 namespace entity;
 
 struct ContentId {
@@ -10,12 +12,12 @@ struct Uuid {
 
 table File {
   len: uint64;
-  blob_id: ContentId (required);
+  blob_id: common.ContentId (required);
 }
 
 struct DirectoryEntry {
   id: Uuid;
-  revision: ContentId;
+  revision: common.ContentId;
 }
 
 table Directory {
@@ -32,4 +34,16 @@ table Entity {
   body: EntityBody (required);
 }
 
-root_type Entity;
+namespace blob;
+
+struct Chunk {
+  offset: uint64;
+  len: uint64;
+  chunk_id: common.ContentId;
+  chunk_offset: uint64;
+}
+
+table Blob {
+    len: uint64;
+    chunks: [Chunk];
+}
