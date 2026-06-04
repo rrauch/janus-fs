@@ -63,7 +63,7 @@ impl Object {
         self.remote_location.as_str()
     }
 
-    pub fn try_to_backend_object_id(&self) -> Option<sia_io::object::ObjectId> {
+    pub fn try_to_sia_oid(&self) -> Option<sia_io::object::ObjectId> {
         sia_io::object::ObjectId::from_str(self.remote_location.as_str()).ok()
     }
 }

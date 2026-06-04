@@ -4,8 +4,9 @@ use crate::object::ObjectId;
 use crate::vfs::cache::Cache;
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
-use crate::vfs::{Backend, Inode, InodeId, OwnedName};
+use crate::vfs::{Inode, InodeId, OwnedName};
 use derive_where::derive_where;
+use sia_io::Client as Sia;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -73,7 +74,7 @@ pub enum DataError {
     UnsupportedStorageMode,
 }
 
-pub struct ReadOnly(PoolConnection<Sqlite>, Arc<dyn Backend>);
+pub struct ReadOnly(PoolConnection<Sqlite>, Arc<Sia>);
 
 impl AsMut<SqliteConnection> for ReadOnly {
     fn as_mut(&mut self) -> &mut SqliteConnection {
@@ -81,7 +82,7 @@ impl AsMut<SqliteConnection> for ReadOnly {
     }
 }
 
-pub struct ReadWrite(SqlxTransaction<'static, Sqlite>, Cache, Arc<dyn Backend>);
+pub struct ReadWrite(SqlxTransaction<'static, Sqlite>, Cache, Arc<Sia>);
 
 impl AsMut<SqliteConnection> for ReadWrite {
     #[inline]
@@ -96,17 +97,17 @@ pub(crate) trait Read: AsMut<SqliteConnection> {
         self.as_mut()
     }
 
-    fn backend(&self) -> &impl Backend;
+    fn sia_client(&self) -> &Sia;
 }
 impl Read for Transaction<ReadOnly> {
-    fn backend(&self) -> &impl Backend {
+    fn sia_client(&self) -> &Sia {
         &self.0.1
     }
 }
 
 pub(crate) trait Write: Read {}
 impl Read for Transaction<ReadWrite> {
-    fn backend(&self) -> &impl Backend {
+    fn sia_client(&self) -> &Sia {
         &self.0.2
     }
 }
@@ -335,30 +336,32 @@ struct SqlitePool {
 }
 
 impl SqlitePool {
-    async fn read(&self, backend: Arc<dyn Backend>) -> Result<Transaction<ReadOnly>, SqlxError> {
-        Ok(Transaction(ReadOnly(self.reader.acquire().await?, backend)))
+    async fn read(&self, sia_client: Arc<Sia>) -> Result<Transaction<ReadOnly>, SqlxError> {
+        Ok(Transaction(ReadOnly(
+            self.reader.acquire().await?,
+            sia_client,
+        )))
     }
 
     async fn write(
         &self,
         cache: Cache,
-        backend: Arc<dyn Backend>,
+        sia_client: Arc<Sia>,
     ) -> Result<Transaction<ReadWrite>, SqlxError> {
         Ok(Transaction(ReadWrite(
             self.writer.begin().await?,
             cache,
-            backend,
+            sia_client,
         )))
     }
 }
 
-#[derive_where(Debug)]
+#[derive(Debug)]
 struct DbInner {
     pool: SqlitePool,
     db_file: PathBuf,
     cache: Cache,
-    #[derive_where(skip)]
-    backend: Arc<dyn Backend>,
+    sia_client: Arc<Sia>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,11 +419,11 @@ impl Db {
         max_connections: u8,
         page_size: PageSize,
         cache: Cache,
-        backend: Arc<dyn Backend>,
+        sia_client: Arc<Sia>,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
-        let mut tx = pool.write(cache.clone(), backend.clone()).await?;
+        let mut tx = pool.write(cache.clone(), sia_client.clone()).await?;
         tx.bootstrap().await?;
         tx.housekeeping().await?;
         tx.commit().await?;
@@ -429,19 +432,19 @@ impl Db {
             pool,
             db_file,
             cache,
-            backend,
+            sia_client,
         })))
     }
 
     pub async fn read(&self) -> Result<Transaction<ReadOnly>, Error> {
-        Ok(self.0.pool.read(self.0.backend.clone()).await?)
+        Ok(self.0.pool.read(self.0.sia_client.clone()).await?)
     }
 
     pub async fn write(&self) -> Result<Transaction<ReadWrite>, Error> {
         let mut tx = self
             .0
             .pool
-            .write(self.0.cache.clone(), self.0.backend.clone())
+            .write(self.0.cache.clone(), self.0.sia_client.clone())
             .await?;
         tx.clear_changelog().await?;
         Ok(tx)

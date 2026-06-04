@@ -18,18 +18,13 @@ use crate::vfs::entity::{
 };
 use crate::vfs::file::{File, FileWriteLocks, Reaper};
 use crate::vfs::path::VfsPath;
-use async_trait::async_trait;
 use bytemuck::TransparentWrapper;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
-use futures_util::TryStreamExt;
-use futures_util::stream::BoxStream;
 use sia_io::Client as Sia;
-use sia_io::object::{DownloadableObject, Object as BackendObject, ObjectId as BackendObjectId};
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
-use std::io::Error;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -489,23 +484,23 @@ pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 #[bon::bon]
 impl<Mode> Vfs<Mode> {
     #[builder(derive(Debug))]
-    pub async fn new<B: Backend + 'static>(
+    pub async fn new(
         vfs_id: VfsId,
         db_file: PathBuf,
-        backend: B,
+        sia_client: Sia,
         #[builder(default)] db_page_size: PageSize,
         #[builder(default = 25)] max_db_connections: u8,
         #[builder(default)] cache_settings: CacheSettings,
         #[builder(default = 64 * 1024)] max_chunk_size: usize,
     ) -> Result<Self, VfsError> {
         let cache = Cache::new(&cache_settings);
-        let backend = Arc::new(backend);
+        let sia_client = Arc::new(sia_client);
         let db = Db::new(
             db_file,
             max_db_connections,
             db_page_size,
             cache.clone(),
-            backend.clone(),
+            sia_client.clone(),
         )
         .await?;
 
@@ -521,7 +516,7 @@ impl<Mode> Vfs<Mode> {
                 max_chunk_size,
                 dead_fh_reaper: reaper,
                 file_write_locks: FileWriteLocks::new(),
-                backend,
+                sia_client,
             }),
             PhantomData,
         ))
@@ -532,7 +527,7 @@ impl<Mode> Vfs<Mode> {
     }
 }
 
-#[derive_where(Debug)]
+#[derive(Debug)]
 struct Inner {
     vfs_id: VfsId,
     db: Db,
@@ -540,41 +535,7 @@ struct Inner {
     max_chunk_size: usize,
     dead_fh_reaper: Reaper,
     file_write_locks: FileWriteLocks,
-    #[derive_where(skip)]
-    backend: Arc<dyn Backend>,
-}
-
-#[async_trait]
-pub(crate) trait Backend: Send + Sync {
-    async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, std::io::Error>>;
-    async fn download(
-        &self,
-        id: &BackendObjectId,
-    ) -> Result<Option<DownloadableObject>, std::io::Error>;
-}
-
-#[async_trait]
-impl Backend for Arc<dyn Backend> {
-    #[inline]
-    async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, std::io::Error>> {
-        self.deref().list_objects().await
-    }
-
-    #[inline]
-    async fn download(&self, id: &BackendObjectId) -> Result<Option<DownloadableObject>, Error> {
-        self.deref().download(id).await
-    }
-}
-
-#[async_trait]
-impl Backend for Sia {
-    async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, std::io::Error>> {
-        Box::pin(Sia::list_objects(self).map_err(std::io::Error::other))
-    }
-
-    async fn download(&self, id: &BackendObjectId) -> Result<Option<DownloadableObject>, Error> {
-        Sia::download(self, id).await.map_err(std::io::Error::other)
-    }
+    sia_client: Arc<Sia>,
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -598,8 +559,8 @@ impl<Mode> Vfs<Mode> {
         Ok(self.0.db.write().await?)
     }
 
-    pub(crate) fn backend(&self) -> &impl Backend {
-        &self.0.backend
+    pub(crate) fn sia_client(&self) -> &Sia {
+        &self.0.sia_client
     }
 
     pub(crate) fn cache(&self) -> &Cache {
@@ -860,50 +821,39 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{
-        Backend, Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError, VfsId,
-    };
+    use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError, VfsId};
     use anyhow::bail;
-    use async_trait::async_trait;
-    use futures_util::stream::BoxStream;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
-    use sia_io::object::{
-        DownloadableObject, Object as BackendObject, ObjectId as BackendObjectId,
-    };
-    use std::io::{Error, SeekFrom};
+    use sia_io::Client as Sia;
+    use std::io::SeekFrom;
     use std::ops::Deref;
     use std::str::FromStr;
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
 
-    struct MockBackend;
-
-    #[async_trait]
-    impl Backend for MockBackend {
-        async fn list_objects(&self) -> BoxStream<'_, Result<BackendObject, Error>> {
-            todo!()
-        }
-
-        async fn download(
-            &self,
-            id: &BackendObjectId,
-        ) -> Result<Option<DownloadableObject>, Error> {
-            todo!()
-        }
+    pub(crate) async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
+        new_vfs_with_opts(None, None).await
     }
 
-    async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
+    pub(crate) async fn new_vfs_with_opts(
+        vfs_id: Option<VfsId>,
+        sia_client: Option<Sia>,
+    ) -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
-
+        let sia_client = match sia_client {
+            Some(sia_client) => sia_client,
+            None => Sia::mock().await,
+        };
+        let vfs_id = vfs_id.unwrap_or_else(|| VfsId::generate());
         Ok((
             Vfs::builder()
-                .backend(MockBackend)
+                .sia_client(sia_client)
                 .db_file(path)
-                .vfs_id(VfsId::generate())
+                .vfs_id(vfs_id)
                 .build()
                 .await?,
             temp_dir,

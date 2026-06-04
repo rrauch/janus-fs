@@ -6,12 +6,13 @@ use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrit
 use crate::gen_flatbuffers::vfs::blob::{Blob as FlatBlob, BlobBuilder, Chunk as FlatChunk};
 use crate::object::ObjectId;
 use crate::sync::{Error as SyncError, SyncTask};
-use crate::vfs::{Backend, Read, StorageMode, Vfs, VfsError, VfsResult};
+use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsResult};
 use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
+use sia_io::Client as Sia;
 use sia_io::object::Object as SiaObject;
-use sia_io::object::ObjectId as BackendObjectId;
+use sia_io::object::ObjectId as SiaObjectId;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -42,12 +43,13 @@ pub struct Blob {
 impl Blob {
     pub(crate) async fn load_from_backend(
         object_id: ObjectId,
-        backend_id: &BackendObjectId,
-        backend: &impl Backend,
+        sia_oid: &SiaObjectId,
+        sia_client: &Sia,
     ) -> Result<Self, std::io::Error> {
-        let dl = backend
-            .download(backend_id)
-            .await?
+        let dl = sia_client
+            .download(sia_oid)
+            .await
+            .map_err(std::io::Error::other)?
             .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
 
         let metadata: object::metadata::Metadata = dl
@@ -202,7 +204,7 @@ impl<Mode: Read> Vfs<Mode> {
 impl<Mode> SyncTask<Mode> {
     pub(crate) async fn blob_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
-        backend: &impl Backend,
+        sia_client: &Sia,
         blob_id: &str,
         sia_object: &SiaObject,
         object_id: ObjectId,
@@ -212,7 +214,7 @@ impl<Mode> SyncTask<Mode> {
     {
         let blob_id = BlobId::try_from_str(blob_id).ok_or_else(|| BlobError::InvalidBlobId)?;
 
-        let blob = Blob::load_from_backend(object_id, sia_object.id(), backend).await?;
+        let blob = Blob::load_from_backend(object_id, sia_object.id(), sia_client).await?;
 
         tx.register_blob(&blob).await.map_err(VfsError::DbError)?;
 

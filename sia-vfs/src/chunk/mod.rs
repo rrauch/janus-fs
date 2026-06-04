@@ -4,12 +4,13 @@ mod compression;
 use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
 use crate::object::ObjectId;
 use crate::sync::{Error as SyncError, SyncTask};
-use crate::vfs::{Backend, Read, StorageMode, Vfs, VfsError, VfsResult, Write};
+use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsResult, Write};
 use crate::{ContentId, object};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::AsyncReadExt;
-use sia_io::object::ObjectId as BackendObjectId;
+use sia_io::Client as Sia;
+use sia_io::object::ObjectId as SiaObjectId;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -27,12 +28,13 @@ pub struct Chunk {
 
 impl Chunk {
     pub(crate) async fn load_from_backend(
-        id: &BackendObjectId,
-        backend: &impl Backend,
+        sia_oid: &SiaObjectId,
+        sia_client: &Sia,
     ) -> Result<Self, std::io::Error> {
-        let dl = backend
-            .download(id)
-            .await?
+        let dl = sia_client
+            .download(sia_oid)
+            .await
+            .map_err(std::io::Error::other)?
             .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
 
         let metadata: object::metadata::Metadata = dl
@@ -215,10 +217,10 @@ where
                     .object_by_id(object_id)
                     .await?
                     .ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                let backend_id = object.try_to_backend_object_id().ok_or_else(|| {
+                let sia_oid = object.try_to_sia_oid().ok_or_else(|| {
                     DataError::InvalidRemoteLocation(object.remote_location().to_string())
                 })?;
-                Chunk::load_from_backend(&backend_id, self.backend()).await?
+                Chunk::load_from_backend(&sia_oid, self.sia_client()).await?
             }
         };
 

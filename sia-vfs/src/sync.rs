@@ -4,7 +4,7 @@ use crate::object::{ObjectCreateResult, ObjectId};
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::{EntityError, EntityHandler};
 use crate::vfs::file::FileKind;
-use crate::vfs::{Backend, Timestamp, Vfs, VfsError, VfsResult, entity};
+use crate::vfs::{Timestamp, Vfs, VfsError, VfsResult, entity};
 use crate::{blob, chunk, object};
 use futures_util::{StreamExt, TryStream, TryStreamExt};
 use sia_io::object::Object as SiaObject;
@@ -107,7 +107,7 @@ impl<Mode> SyncTask<Mode> {
                             ) => {
                                 Self::entity_sync::<FileKind, _>(
                                     &mut tx,
-                                    self.vfs.backend(),
+                                    self.vfs.sia_client(),
                                     entity_id,
                                     rev,
                                     &sia_object,
@@ -122,7 +122,7 @@ impl<Mode> SyncTask<Mode> {
                             ) => {
                                 Self::entity_sync::<DirectoryKind, _>(
                                     &mut tx,
-                                    self.vfs.backend(),
+                                    self.vfs.sia_client(),
                                     entity_id,
                                     rev,
                                     &sia_object,
@@ -135,8 +135,14 @@ impl<Mode> SyncTask<Mode> {
                     }
                     Some(blob::METADATA_OBJECT_TYPE) => {
                         if let Some(blob_id) = metadata.get(blob::METADATA_BLOB_ID) {
-                            Self::blob_sync(&mut tx, self.vfs.backend(), blob_id, &sia_object, id)
-                                .await?;
+                            Self::blob_sync(
+                                &mut tx,
+                                self.vfs.sia_client(),
+                                blob_id,
+                                &sia_object,
+                                id,
+                            )
+                            .await?;
                         }
                     }
                     Some(chunk::METADATA_OBJECT_TYPE) => {
@@ -173,9 +179,8 @@ impl<Mode> Vfs<Mode> {
         let vfs_id = Arc::new(self.id().to_string());
 
         Ok(self
-            .backend()
+            .sia_client()
             .list_objects()
-            .await
             .try_filter_map(move |o| {
                 let vfs_id = vfs_id.clone();
                 async move {
@@ -198,6 +203,7 @@ impl<Mode> Vfs<Mode> {
                     Ok(Some(o))
                 }
             })
+            .map_err(std::io::Error::other)
             .boxed())
     }
 }

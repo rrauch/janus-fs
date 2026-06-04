@@ -9,15 +9,15 @@ use crate::gen_flatbuffers::vfs::entity::{
 use crate::object::ObjectId;
 use crate::sync::{Error as SyncError, SyncTask};
 use crate::vfs::{
-    Backend, Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError,
-    VfsResult,
+    Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError, VfsResult,
 };
 use crate::{ContentId, TypedUuid, object};
 use derive_where::derive_where;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
 use futures_util::AsyncReadExt;
+use sia_io::Client as Sia;
 use sia_io::object::Object as SiaObject;
-use sia_io::object::ObjectId as BackendObjectId;
+use sia_io::object::ObjectId as SiaObjectId;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io::ErrorKind;
@@ -126,12 +126,13 @@ pub type SyncedEntity<T> = RawEntity<T, SyncedMode>;
 impl<T: EntityHandler> SyncedEntity<T> {
     pub(crate) async fn load_from_backend(
         object_id: ObjectId,
-        backend_id: &BackendObjectId,
-        backend: &impl Backend,
+        sia_oid: &SiaObjectId,
+        sia_client: &Sia,
     ) -> Result<Self, std::io::Error> {
-        let dl = backend
-            .download(backend_id)
-            .await?
+        let dl = sia_client
+            .download(sia_oid)
+            .await
+            .map_err(std::io::Error::other)?
             .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
 
         let metadata: object::metadata::Metadata = dl
@@ -568,8 +569,8 @@ where
                 Some(object_id) => {
                     // synced entity
                     let object = self.object_by_id(object_id).await?.ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                    let backend_id = object.try_to_backend_object_id().ok_or_else(|| DataError::ConversionError("invalid remote_location".into()))?;
-                    Ok::<_, DbError>(Some(Entity::Synced(SyncedEntity::<T>::load_from_backend(object_id, &backend_id, self.backend()).await?)))
+                    let sia_oid = object.try_to_sia_oid().ok_or_else(|| DataError::ConversionError("invalid remote_location".into()))?;
+                    Ok::<_, DbError>(Some(Entity::Synced(SyncedEntity::<T>::load_from_backend(object_id, &sia_oid, self.sia_client()).await?)))
                 }
                 None => {
                     // local entity
@@ -682,7 +683,7 @@ impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
 impl<Mode> SyncTask<Mode> {
     pub(crate) async fn entity_sync<T: EntityHandler, TX: TxScope>(
         tx: &mut Transaction<TX>,
-        backend: &impl Backend,
+        sia_client: &Sia,
         entity_id: &str,
         rev: &str,
         sia_object: &SiaObject,
@@ -695,7 +696,7 @@ impl<Mode> SyncTask<Mode> {
         let rev = Revision::try_from_str(rev).ok_or_else(|| EntityError::InvalidRevision)?;
 
         let entity =
-            SyncedEntity::<T>::load_from_backend(object_id, sia_object.id(), backend).await?;
+            SyncedEntity::<T>::load_from_backend(object_id, sia_object.id(), sia_client).await?;
 
         let entity_key = tx
             .register_entity(entity)

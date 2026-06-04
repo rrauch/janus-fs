@@ -81,8 +81,12 @@ impl<'a> TryFrom<IoMetadata<'a>> for Metadata<'a> {
 
     fn try_from(value: IoMetadata<'a>) -> Result<Self, Self::Error> {
         match value {
+            #[cfg(feature = "indexd")]
             IoMetadata::Indexd(bytes) => Self::try_from(bytes),
+            #[cfg(feature = "renterd")]
             IoMetadata::Renterd(map) => Ok(Self::from(map)),
+            #[cfg(test)]
+            IoMetadata::Mock(map) => Ok(Self::from(map)),
         }
     }
 }
