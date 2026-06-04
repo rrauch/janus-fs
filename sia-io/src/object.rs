@@ -1,9 +1,14 @@
 use crate::cache::Cache;
 use crate::chunk::{ChunkDownloader, ChunkedReader};
-use crate::renterd::object::AnyObject;
+#[cfg(feature = "indexd")]
+use crate::indexd;
+#[cfg(feature = "mock")]
+use crate::mock;
+#[cfg(feature = "renterd")]
+use crate::renterd;
 use crate::scheduler::Scheduler;
 use crate::scheduler::resource_manager::Resource;
-use crate::{Backend, Client, ETag, Metadata, MimeType, indexd, renterd};
+use crate::{Backend, Client, ETag, Metadata, MimeType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_io::{AsyncRead, AsyncSeek};
@@ -12,6 +17,7 @@ use ouroboros::self_referencing;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sia_storage::ObjectsCursor;
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::hash::Hasher;
 use std::pin::Pin;
@@ -31,6 +37,8 @@ pub enum ObjectId {
     Indexd(indexd::object::ObjectId),
     #[cfg(feature = "renterd")]
     Renterd(renterd::object::FileId),
+    #[cfg(feature = "mock")]
+    Mock(String),
 }
 
 impl Serialize for ObjectId {
@@ -38,12 +46,16 @@ impl Serialize for ObjectId {
     where
         S: Serializer,
     {
-        let id = match self {
-            Self::Indexd(id) => id.to_string(),
-            Self::Renterd(id) => id.to_string(),
+        let id: Cow<str> = match self {
+            #[cfg(feature = "indexd")]
+            Self::Indexd(id) => Cow::Owned(id.to_string()),
+            #[cfg(feature = "renterd")]
+            Self::Renterd(id) => Cow::Owned(id.to_string()),
+            #[cfg(feature = "mock")]
+            Self::Mock(id) => Cow::Borrowed(id.as_str()),
         };
 
-        serializer.serialize_str(id.as_str())
+        serializer.serialize_str(id.as_ref())
     }
 }
 
@@ -116,8 +128,12 @@ impl FromStr for ObjectId {
 impl Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "indexd")]
             Self::Indexd(id) => Display::fmt(id, f),
+            #[cfg(feature = "renterd")]
             Self::Renterd(id) => Display::fmt(id, f),
+            #[cfg(feature = "mock")]
+            Self::Mock(id) => Display::fmt(id, f),
         }
     }
 }
@@ -133,6 +149,13 @@ impl From<indexd::object::ObjectId> for ObjectId {
 impl From<renterd::object::FileId> for ObjectId {
     fn from(value: renterd::object::FileId) -> Self {
         Self::Renterd(value)
+    }
+}
+
+#[cfg(feature = "mock")]
+impl From<String> for ObjectId {
+    fn from(value: String) -> Self {
+        Self::Mock(value)
     }
 }
 
@@ -160,6 +183,12 @@ pub enum Object {
         version: Version,
         inner: Arc<renterd::object::File>,
     },
+    #[cfg(feature = "mock")]
+    Mock {
+        id: ObjectId,
+        version: Version,
+        inner: Arc<mock::MockObject>,
+    },
 }
 
 impl Object {
@@ -170,6 +199,8 @@ impl Object {
             Self::Indexd { id, .. } => id,
             #[cfg(feature = "renterd")]
             Self::Renterd { id, .. } => id,
+            #[cfg(feature = "mock")]
+            Self::Mock { id, .. } => id,
         }
     }
 
@@ -180,6 +211,8 @@ impl Object {
             Self::Indexd { version, .. } => *version,
             #[cfg(feature = "renterd")]
             Self::Renterd { version, .. } => *version,
+            #[cfg(feature = "mock")]
+            Self::Mock { version, .. } => *version,
         }
     }
 
@@ -190,6 +223,8 @@ impl Object {
             Self::Indexd { inner, .. } => Some(inner.created_at()),
             #[cfg(feature = "renterd")]
             Self::Renterd { .. } => None,
+            #[cfg(feature = "mock")]
+            Self::Mock { inner, .. } => Some(&inner.created_at),
         }
     }
 
@@ -200,6 +235,8 @@ impl Object {
             Self::Indexd { inner, .. } => inner.updated_at(),
             #[cfg(feature = "renterd")]
             Self::Renterd { inner, .. } => inner.mod_time(),
+            #[cfg(feature = "mock")]
+            Self::Mock { inner, .. } => &inner.updated_at,
         }
     }
 
@@ -210,6 +247,8 @@ impl Object {
             Self::Indexd { inner, .. } => inner.size(),
             #[cfg(feature = "renterd")]
             Self::Renterd { inner, .. } => inner.size(),
+            #[cfg(feature = "mock")]
+            Self::Mock { inner, .. } => inner.size(),
         }
     }
 
@@ -220,6 +259,8 @@ impl Object {
             Self::Indexd { .. } => None,
             #[cfg(feature = "renterd")]
             Self::Renterd { inner, .. } => Some(inner.mime_type()),
+            #[cfg(feature = "mock")]
+            Self::Mock { inner, .. } => inner.mime_type.as_ref(),
         }
     }
 
@@ -230,6 +271,8 @@ impl Object {
             Self::Indexd { .. } => None,
             #[cfg(feature = "renterd")]
             Self::Renterd { inner, .. } => inner.etag(),
+            #[cfg(feature = "mock")]
+            Self::Mock { inner, .. } => inner.etag.as_ref(),
         }
     }
 
@@ -240,6 +283,8 @@ impl Object {
             Self::Indexd { inner, .. } => Metadata::Indexd(inner.metadata()),
             #[cfg(feature = "renterd")]
             Self::Renterd { inner, .. } => Metadata::Renterd(inner.metadata()),
+            #[cfg(feature = "mock")]
+            Self::Mock { inner, .. } => Metadata::Mock(&inner.metadata),
         }
     }
 }
@@ -282,6 +327,25 @@ impl From<renterd::object::File> for Object {
     }
 }
 
+#[cfg(feature = "mock")]
+impl From<mock::MockObject> for Object {
+    fn from(value: mock::MockObject) -> Self {
+        let mut hasher = XxHash3_64::new();
+        hasher.write(VERSION_HASH_PREFIX);
+        hasher.write("MOCK\n".as_bytes());
+        value.hash(&mut hasher);
+        hasher.write(VERSION_HASH_SUFFIX);
+        let version = Version(hasher.finish());
+
+        let id = value.id.clone().into();
+        Self::Mock {
+            id,
+            version,
+            inner: Arc::new(value),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum BackendDO {
     #[cfg(feature = "indexd")]
@@ -294,6 +358,11 @@ pub(crate) enum BackendDO {
         object: Object,
         inner: renterd::download::DownloadableFile,
     },
+    #[cfg(feature = "mock")]
+    Mock {
+        object: Object,
+        content: bytes::Bytes,
+    },
 }
 
 impl BackendDO {
@@ -304,6 +373,8 @@ impl BackendDO {
             Self::Indexd { object, .. } => object,
             #[cfg(feature = "renterd")]
             Self::Renterd { object, .. } => object,
+            #[cfg(feature = "mock")]
+            Self::Mock { object, .. } => object,
         }
     }
 
@@ -315,6 +386,10 @@ impl BackendDO {
             Self::Indexd { inner, .. } => Download::Indexd(inner.open(offset).await?),
             #[cfg(feature = "renterd")]
             Self::Renterd { inner, .. } => Download::Renterd(inner.open(offset).await?),
+            #[cfg(feature = "mock")]
+            Self::Mock { content, .. } => {
+                Download::Mock(futures_util::io::Cursor::new(content.clone()))
+            }
         })
     }
 }
@@ -325,6 +400,8 @@ pub enum Download {
     Indexd(indexd::download::Download),
     #[cfg(feature = "renterd")]
     Renterd(renterd::download::Download),
+    #[cfg(feature = "mock")]
+    Mock(futures_util::io::Cursor<bytes::Bytes>),
 }
 
 impl Download {
@@ -334,6 +411,8 @@ impl Download {
             Self::Indexd(indexd) => indexd.len(),
             #[cfg(feature = "renterd")]
             Self::Renterd(renterd) => renterd.len(),
+            #[cfg(feature = "mock")]
+            Self::Mock(cursor) => cursor.get_ref().len() as u64,
         }
     }
 }
@@ -350,6 +429,8 @@ impl AsyncRead for Download {
             Self::Indexd(indexd) => Pin::new(indexd).poll_read(cx, buf),
             #[cfg(feature = "renterd")]
             Self::Renterd(renterd) => Pin::new(renterd).poll_read(cx, buf),
+            #[cfg(feature = "mock")]
+            Self::Mock(cursor) => Pin::new(cursor).poll_read(cx, buf),
         }
     }
 }
@@ -362,6 +443,8 @@ impl Resource for Download {
             Self::Indexd(indexd) => indexd.offset(),
             #[cfg(feature = "renterd")]
             Self::Renterd(renterd) => renterd.offset(),
+            #[cfg(feature = "mock")]
+            Self::Mock(cursor) => cursor.position(),
         }
     }
 
@@ -371,6 +454,11 @@ impl Resource for Download {
             Self::Indexd(indexd) => indexd.can_reuse(),
             #[cfg(feature = "renterd")]
             Self::Renterd(renterd) => renterd.can_reuse(),
+            #[cfg(feature = "mock")]
+            Self::Mock(cursor) => {
+                // check if anything left to read
+                cursor.position() < cursor.get_ref().len() as u64
+            }
         }
     }
 
@@ -380,6 +468,8 @@ impl Resource for Download {
             Self::Indexd(indexd) => indexd.finalize().await,
             #[cfg(feature = "renterd")]
             Self::Renterd(renterd) => renterd.finalize().await,
+            #[cfg(feature = "mock")]
+            Self::Mock(_) => Ok(()),
         }
     }
 }
@@ -418,6 +508,8 @@ impl Backend {
             (Self::Renterd(renterd), ObjectId::Renterd(id)) => {
                 Ok(renterd.object(id).await.map(Object::from)?)
             }
+            #[cfg(feature = "mock")]
+            (Self::Mock(mock), ObjectId::Mock(id)) => Ok(mock.object(id).map(Object::from)?),
             _ => Err(crate::Error::BackendMismatch),
         }
     }
@@ -433,6 +525,8 @@ impl Backend {
             (Self::Renterd(renterd), ObjectId::Renterd(id)) => {
                 Ok(renterd.delete_object(id).await?)
             }
+            #[cfg(feature = "mock")]
+            (Self::Mock(mock), ObjectId::Mock(id)) => Ok(mock.delete_object(id)?),
             _ => Err(crate::Error::BackendMismatch),
         }
     }
@@ -448,6 +542,15 @@ impl Backend {
             (Self::Renterd(renterd), ObjectId::Renterd(id)) => {
                 Ok(BackendDO::from(renterd.download(id).await?))
             }
+            #[cfg(feature = "mock")]
+            (Self::Mock(mock), ObjectId::Mock(id)) => {
+                let object = mock.object(id)?;
+                let content = object.content.clone();
+                Ok(BackendDO::Mock {
+                    object: object.into(),
+                    content,
+                })
+            }
             _ => Err(crate::Error::BackendMismatch),
         }
     }
@@ -455,7 +558,7 @@ impl Backend {
     async fn upload(
         &self,
         name_hint: impl AsRef<str>,
-        content: impl AsyncRead + Send + Unpin + 'static,
+        mut content: impl AsyncRead + Send + Unpin + 'static,
         metadata: Option<Metadata<'static>>,
     ) -> Result<Object, crate::Error> {
         match (&self, metadata) {
@@ -491,6 +594,30 @@ impl Backend {
                 let object = renterd.object(&id).await?;
                 Ok(object.into())
             }
+            #[cfg(feature = "mock")]
+            (Self::Mock(mock), metadata) => {
+                let metadata = match metadata {
+                    Some(Metadata::Mock(m)) => Some(m.to_owned()),
+                    None => None,
+                    _ => return Err(crate::Error::BackendMismatch),
+                }
+                .unwrap_or_default();
+                let id = name_hint.as_ref().to_string();
+                let mut buf = vec![];
+                futures_util::AsyncReadExt::read_to_end(&mut content, &mut buf).await?;
+                let now = Utc::now();
+                let object = mock::MockObject {
+                    id,
+                    created_at: now,
+                    updated_at: now,
+                    mime_type: None,
+                    etag: None,
+                    metadata,
+                    content: buf.into(),
+                };
+                mock.insert_object(object.clone())?;
+                Ok(object.into())
+            }
             _ => Err(crate::Error::BackendMismatch),
         }
     }
@@ -515,6 +642,7 @@ impl Backend {
             >,
             _,
         ) = match &self {
+            #[cfg(feature = "indexd")]
             Self::Indexd(indexd) => {
                 let (objects, cursor) = indexd.list_objects().await?;
                 (
@@ -522,6 +650,7 @@ impl Backend {
                     cursor,
                 )
             }
+            #[cfg(feature = "renterd")]
             Self::Renterd(renterd) => (
                 Box::new(
                     renterd
@@ -529,10 +658,20 @@ impl Backend {
                         .map_err(crate::Error::from)
                         .try_filter_map(|any| async move {
                             Ok(match any {
-                                AnyObject::File(file) => Some(file.into()),
-                                AnyObject::Folder(_) => None,
+                                renterd::object::AnyObject::File(file) => Some(file.into()),
+                                renterd::object::AnyObject::Folder(_) => None,
                             })
                         })
+                        .boxed(),
+                ),
+                None,
+            ),
+            #[cfg(feature = "mock")]
+            Self::Mock(mock) => (
+                Box::new(
+                    mock.list_objects()
+                        .map_err(crate::Error::from)
+                        .try_filter_map(|o| async move { Ok(Some(o.into())) })
                         .boxed(),
                 ),
                 None,
@@ -558,6 +697,7 @@ impl Backend {
                     + Unpin,
             >,
         > = match &self {
+            #[cfg(feature = "indexd")]
             Self::Indexd(indexd) => Some(Box::new(
                 indexd
                     .object_events(cursor)
@@ -565,7 +705,10 @@ impl Backend {
                     .try_filter_map(|e| async move { Ok(Some(e.into())) })
                     .boxed(),
             )),
+            #[cfg(feature = "renterd")]
             Self::Renterd(_) => None,
+            #[cfg(feature = "mock")]
+            Self::Mock(_) => None,
         };
         Ok(stream)
     }
@@ -610,11 +753,15 @@ impl ObjectEvent {
     pub(crate) fn cursor(&self) -> Option<ObjectsCursor> {
         let id = self.object_id();
         match id {
+            #[cfg(feature = "indexd")]
             ObjectId::Indexd(indexd_id) => Some(ObjectsCursor {
                 id: indexd_id.clone().into_inner(),
                 after: self.timestamp().clone(),
             }),
+            #[cfg(feature = "renterd")]
             ObjectId::Renterd(_) => None,
+            #[cfg(feature = "mock")]
+            ObjectId::Mock(_) => None,
         }
     }
 }

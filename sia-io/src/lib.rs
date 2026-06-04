@@ -26,6 +26,8 @@ pub mod chunk;
 pub mod confidential;
 #[cfg(feature = "indexd")]
 pub mod indexd;
+#[cfg(feature = "mock")]
+pub(crate) mod mock;
 pub mod object;
 #[cfg(feature = "renterd")]
 pub mod renterd;
@@ -140,6 +142,8 @@ pub(crate) enum Backend {
     Indexd(indexd::client::Client),
     #[cfg(feature = "renterd")]
     Renterd(renterd::client::Client),
+    #[cfg(feature = "mock")]
+    Mock(mock::MockClient),
 }
 
 #[cfg(feature = "indexd")]
@@ -161,6 +165,8 @@ pub enum Metadata<'a> {
     Indexd(&'a [u8]),
     #[cfg(feature = "renterd")]
     Renterd(&'a HashMap<String, String>),
+    #[cfg(feature = "mock")]
+    Mock(&'a HashMap<String, String>),
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +177,9 @@ pub enum Error {
     #[cfg(feature = "renterd")]
     #[error(transparent)]
     RenterdError(#[from] renterd::client::ClientError),
+    #[cfg(feature = "mock")]
+    #[error(transparent)]
+    MockError(#[from] mock::MockError),
     #[error("backend and input type mismatch")]
     BackendMismatch,
     #[error("cached error: {0}")]
@@ -208,6 +217,18 @@ impl Drop for Client {
         if let Some(handle) = self.object_event_loop_handle.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(feature = "mock")]
+impl Client {
+    pub async fn mock() -> Self {
+        Self::builder()
+            .backend(Backend::Mock(mock::MockClient::default()))
+            .cache(Cache::default())
+            .build()
+            .await
+            .unwrap()
     }
 }
 
@@ -339,7 +360,7 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Backend, Client, indexd, renterd};
+    use crate::{Client, indexd, renterd};
     use futures_util::io::Cursor;
     use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};
     use std::io::SeekFrom;
@@ -355,7 +376,7 @@ mod tests {
             .try_init();
         dotenv::dotenv().ok();
         let indexd = indexd::tests::connect().await?;
-        integration_test1(indexd).await?;
+        integration_test1(Client::builder().backend(indexd).build().await?).await?;
         Ok(())
     }
 
@@ -368,12 +389,22 @@ mod tests {
             .try_init();
         dotenv::dotenv().ok();
         let renterd = renterd::tests::new_client().await?;
-        integration_test1(renterd).await?;
+        integration_test1(Client::builder().backend(renterd).build().await?).await?;
         Ok(())
     }
 
-    async fn integration_test1(backend: impl Into<Backend>) -> Result<(), anyhow::Error> {
-        let client = Client::builder().backend(backend).build().await?;
+    #[tokio::test]
+    async fn mock_test1() -> Result<(), anyhow::Error> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+        dotenv::dotenv().ok();
+        integration_test1(Client::mock().await).await?;
+        Ok(())
+    }
+
+    async fn integration_test1(client: Client) -> Result<(), anyhow::Error> {
         assert!(client.num_objects() < 10);
 
         while let Some(object) = client.list_objects().try_next().await? {
