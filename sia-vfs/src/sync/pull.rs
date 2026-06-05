@@ -6,16 +6,25 @@ use crate::vfs::entity::EntityHandler;
 use crate::vfs::file::FileKind;
 use crate::vfs::{Timestamp, Vfs, VfsError, VfsResult, entity};
 use crate::{blob, chunk, object};
-use futures_util::{StreamExt, TryStream, TryStreamExt};
+use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
 use sia_io::object::Object as SiaObject;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 pub struct PullTask<Mode> {
     vfs: Vfs<Mode>,
+    max_concurrency: usize,
 }
 
 impl<Mode> PullTask<Mode> {
+    pub(crate) fn new(vfs: Vfs<Mode>, max_concurrency: NonZeroUsize) -> Self {
+        Self {
+            vfs,
+            max_concurrency: max_concurrency.get(),
+        }
+    }
+
     pub async fn run(&mut self) -> Result<(), Error> {
         let mut erroneous_object_ids = self.vfs.known_object_ids().await?;
 
@@ -41,15 +50,9 @@ impl<Mode> PullTask<Mode> {
             }
         }
 
-        for sia_object in chunks.into_iter().chain(blobs).chain(entities) {
-            match self.sync_object(sia_object).await {
-                Ok(id) => {
-                    erroneous_object_ids.remove(&id);
-                }
-                Err(_) => {
-                    //todo: log this error
-                }
-            }
+        for group in [chunks, blobs, entities] {
+            let processed = self.process_objects(group).await;
+            erroneous_object_ids.retain(|oid| !processed.contains(oid));
         }
 
         // mark all objects we didn't see or that failed in this run as erroneous
@@ -59,6 +62,23 @@ impl<Mode> PullTask<Mode> {
             .map_err(VfsError::DbError)?;
         tx.commit().await.map_err(VfsError::DbError)?;
         Ok(())
+    }
+
+    async fn process_objects(&self, sia_objects: Vec<SiaObject>) -> Vec<ObjectId> {
+        stream::iter(sia_objects)
+            .map(|obj| self.sync_object(obj))
+            .buffer_unordered(self.max_concurrency)
+            .filter_map(|res| async move {
+                match res {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        // log::warn!("sync failed: {e:?}");
+                        None
+                    }
+                }
+            })
+            .collect()
+            .await
     }
 
     async fn sync_object(&self, sia_object: SiaObject) -> Result<ObjectId, Error> {
@@ -208,6 +228,7 @@ mod tests {
     use futures_util::AsyncWriteExt;
     use sia_io::Metadata;
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
     use std::ops::Deref;
 
     #[tokio::test]
@@ -488,7 +509,7 @@ mod tests {
 
         setup(vfs.clone()).await?;
 
-        let mut task = PullTask { vfs: vfs.clone() };
+        let mut task = PullTask::new(vfs.clone(), NonZeroUsize::new(1).unwrap());
         for _ in 0..runs {
             task.run().await?;
         }
