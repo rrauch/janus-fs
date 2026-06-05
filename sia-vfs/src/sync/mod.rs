@@ -4,8 +4,7 @@ pub use pull::PullTask;
 
 use crate::blob::BlobError;
 use crate::vfs::VfsError;
-use crate::vfs::entity::{EntityError, EntityHandler};
-use futures_util::{StreamExt, TryStream, TryStreamExt};
+use crate::vfs::entity::EntityError;
 use thiserror::Error;
 
 const METADATA_VFS_VERSION: &'static str = "SIA-VFS";

@@ -5,7 +5,6 @@ use crate::vfs::cache::Cache;
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
 use crate::vfs::{Inode, InodeId, OwnedName};
-use derive_where::derive_where;
 use sia_io::Client as Sia;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
