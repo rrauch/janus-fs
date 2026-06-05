@@ -642,7 +642,7 @@ fn write_into_vec(vec: &mut Vec<u8>, offset: usize, data: &[u8]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::blob::BlobMut;
     use crate::blob::io::{BlobReader, BlobWriter};
     use crate::chunk::{Chunk, ChunkId, ChunkSink, ChunkSource};
@@ -650,16 +650,22 @@ mod tests {
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use std::collections::HashMap;
     use std::io::{Error, ErrorKind, SeekFrom};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     static ONE_MB: &[u8] = include_bytes!("../../../sia-io/testdata/1mb.bin");
 
     #[derive(Debug, Clone)]
-    struct MockBackend(Arc<Mutex<HashMap<ChunkId, Chunk>>>);
+    pub(crate) struct MockBackend(Arc<Mutex<HashMap<ChunkId, Chunk>>>);
 
     impl Default for MockBackend {
         fn default() -> Self {
             Self(Arc::new(Mutex::new(HashMap::default())))
+        }
+    }
+
+    impl MockBackend {
+        pub fn get(&self) -> MutexGuard<'_, HashMap<ChunkId, Chunk>> {
+            self.0.lock().unwrap()
         }
     }
 

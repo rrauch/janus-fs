@@ -27,7 +27,7 @@ pub mod confidential;
 #[cfg(feature = "indexd")]
 pub mod indexd;
 #[cfg(feature = "mock")]
-pub(crate) mod mock;
+pub mod mock;
 pub mod object;
 #[cfg(feature = "renterd")]
 pub mod renterd;

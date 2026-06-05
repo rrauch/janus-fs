@@ -4,14 +4,16 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStream, stream};
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 pub type MockError = anyhow::Error;
 
 #[derive(Debug, Clone)]
 pub struct MockClient {
-    pub objects: Arc<Mutex<HashMap<String, MockObject>>>,
+    pub objects: Arc<Mutex<HashMap<MockObjectId, MockObject>>>,
 }
 
 impl Default for MockClient {
@@ -23,8 +25,7 @@ impl Default for MockClient {
 }
 
 impl MockClient {
-    pub fn object(&self, id: impl AsRef<str>) -> Result<MockObject, MockError> {
-        let id = id.as_ref();
+    pub fn object(&self, id: &MockObjectId) -> Result<MockObject, MockError> {
         self.objects
             .lock()
             .unwrap()
@@ -39,8 +40,7 @@ impl MockClient {
         Ok(())
     }
 
-    pub fn delete_object(&self, id: impl AsRef<str>) -> Result<(), MockError> {
-        let id = id.as_ref();
+    pub fn delete_object(&self, id: &MockObjectId) -> Result<(), MockError> {
         let _ = self
             .objects
             .lock()
@@ -64,9 +64,49 @@ impl MockClient {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct MockObjectId(String);
+
+impl Display for MockObjectId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl AsRef<str> for MockObjectId {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl TryFrom<String> for MockObjectId {
+    type Error = MockError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.starts_with("mock:") && value.len() > 5 {
+            Ok(Self(value))
+        } else {
+            Err(anyhow!("id needs to start with 'mock:'"))
+        }
+    }
+}
+
+impl FromStr for MockObjectId {
+    type Err = MockError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.starts_with("mock:") && s.len() > 5 {
+            Ok(Self(s.to_string()))
+        } else {
+            Err(anyhow!("id needs to start with 'mock:'"))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockObject {
-    pub id: String,
+    pub id: MockObjectId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub mime_type: Option<MimeType>,

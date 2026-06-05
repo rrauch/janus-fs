@@ -5,7 +5,7 @@ use crate::chunk::chunk_map::ChunkMap;
 use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
 use crate::gen_flatbuffers::vfs::blob::{Blob as FlatBlob, BlobBuilder, Chunk as FlatChunk};
 use crate::object::ObjectId;
-use crate::sync::{Error as SyncError, SyncTask};
+use crate::sync::{Error as SyncError, PullTask};
 use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsResult};
 use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
@@ -201,7 +201,7 @@ impl<Mode: Read> Vfs<Mode> {
     }
 }
 
-impl<Mode> SyncTask<Mode> {
+impl<Mode> PullTask<Mode> {
     pub(crate) async fn blob_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
         sia_client: &Sia,

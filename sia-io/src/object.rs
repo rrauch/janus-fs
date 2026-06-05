@@ -38,7 +38,7 @@ pub enum ObjectId {
     #[cfg(feature = "renterd")]
     Renterd(renterd::object::FileId),
     #[cfg(feature = "mock")]
-    Mock(String),
+    Mock(mock::MockObjectId),
 }
 
 impl Serialize for ObjectId {
@@ -52,7 +52,7 @@ impl Serialize for ObjectId {
             #[cfg(feature = "renterd")]
             Self::Renterd(id) => Cow::Owned(id.to_string()),
             #[cfg(feature = "mock")]
-            Self::Mock(id) => Cow::Borrowed(id.as_str()),
+            Self::Mock(id) => Cow::Borrowed(id.as_ref()),
         };
 
         serializer.serialize_str(id.as_ref())
@@ -95,6 +95,9 @@ pub enum ObjectIdError {
     #[cfg(feature = "renterd")]
     #[error(transparent)]
     RenterdError(#[from] <renterd::object::FileId as FromStr>::Err),
+    #[cfg(feature = "mock")]
+    #[error(transparent)]
+    MockError(#[from] <mock::MockObjectId as FromStr>::Err),
     #[error("'{0}' is not a supported object id")]
     UnsupportedId(String),
 }
@@ -113,6 +116,13 @@ impl FromStr for ObjectId {
             if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
                 // most likely a indexd id
                 return Ok(indexd::object::ObjectId::from_str(s)?.into());
+            }
+        }
+
+        #[cfg(feature = "mock")]
+        {
+            if s.starts_with("mock:") {
+                return Ok(mock::MockObjectId::from_str(s)?.into());
             }
         }
 
@@ -153,8 +163,8 @@ impl From<renterd::object::FileId> for ObjectId {
 }
 
 #[cfg(feature = "mock")]
-impl From<String> for ObjectId {
-    fn from(value: String) -> Self {
+impl From<mock::MockObjectId> for ObjectId {
+    fn from(value: mock::MockObjectId) -> Self {
         Self::Mock(value)
     }
 }
@@ -559,7 +569,7 @@ impl Backend {
         &self,
         name_hint: impl AsRef<str>,
         mut content: impl AsyncRead + Send + Unpin + 'static,
-        metadata: Option<Metadata<'static>>,
+        metadata: Option<Metadata<'_>>,
     ) -> Result<Object, crate::Error> {
         match (&self, metadata) {
             #[cfg(feature = "indexd")]
@@ -602,7 +612,7 @@ impl Backend {
                     _ => return Err(crate::Error::BackendMismatch),
                 }
                 .unwrap_or_default();
-                let id = name_hint.as_ref().to_string();
+                let id = mock::MockObjectId::try_from(format!("mock:{}", name_hint.as_ref()))?;
                 let mut buf = vec![];
                 futures_util::AsyncReadExt::read_to_end(&mut content, &mut buf).await?;
                 let now = Utc::now();
@@ -866,7 +876,7 @@ impl Client {
         &self,
         name_hint: impl AsRef<str>,
         content: impl AsyncRead + Send + Unpin + 'static,
-        metadata: Option<Metadata<'static>>,
+        metadata: Option<Metadata<'_>>,
     ) -> Result<Object, crate::Error> {
         let object = self.backend.upload(name_hint, content, metadata).await?;
         self.cache

@@ -7,7 +7,7 @@ use crate::gen_flatbuffers::vfs::entity::{
     EntityBuilder,
 };
 use crate::object::ObjectId;
-use crate::sync::{Error as SyncError, SyncTask};
+use crate::sync::{Error as SyncError, PullTask};
 use crate::vfs::{
     Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError, VfsResult,
 };
@@ -680,7 +680,7 @@ impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
     }
 }
 
-impl<Mode> SyncTask<Mode> {
+impl<Mode> PullTask<Mode> {
     pub(crate) async fn entity_sync<T: EntityHandler, TX: TxScope>(
         tx: &mut Transaction<TX>,
         sia_client: &Sia,

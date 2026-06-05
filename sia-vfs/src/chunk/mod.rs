@@ -3,7 +3,7 @@ mod compression;
 
 use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
 use crate::object::ObjectId;
-use crate::sync::{Error as SyncError, SyncTask};
+use crate::sync::{Error as SyncError, PullTask};
 use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsResult, Write};
 use crate::{ContentId, object};
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ pub(crate) const METADATA_CHUNK_ID: &'static str = "CHUNK-ID";
 
 pub type ChunkId = ContentId<Chunk>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     id: ChunkId,
     content: Bytes,
@@ -77,6 +77,10 @@ impl Chunk {
             }
         }
         content[num_words * 8..].iter().all(|&b| b == 0)
+    }
+
+    pub(crate) fn to_bytes(&self) -> Bytes {
+        self.content.clone()
     }
 }
 
@@ -164,7 +168,7 @@ impl<Mode: Read> Vfs<Mode> {
     }
 }
 
-impl<Mode> SyncTask<Mode> {
+impl<Mode> PullTask<Mode> {
     pub(crate) async fn chunk_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
         chunk_id: &str,
@@ -185,7 +189,10 @@ impl<C: TxScope> Transaction<C>
 where
     Self: DbRead,
 {
-    async fn chunk_by_id(&mut self, chunk_id: &ChunkId) -> Result<Option<Chunk>, crate::db::Error> {
+    pub(crate) async fn chunk_by_id(
+        &mut self,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<Chunk>, crate::db::Error> {
         let id = chunk_id.as_slice();
         let r = match sqlx::query!("SELECT mode, object_id, data FROM chunk WHERE id = ?", id)
             .fetch_optional(self.conn())
