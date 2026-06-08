@@ -7,17 +7,19 @@ use crate::gen_flatbuffers::vfs::entity::{
     EntityBuilder,
 };
 use crate::object::ObjectId;
+use crate::object::metadata::MetadataMut;
 use crate::sync::{Error as SyncError, PullTask};
 use crate::vfs::{
-    Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError, VfsResult,
+    Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError, VfsId, VfsResult,
 };
 use crate::{ContentId, TypedUuid, object};
 use derive_where::derive_where;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
 use futures_util::AsyncReadExt;
+use futures_util::io::Cursor;
 use sia_io::Client as Sia;
-use sia_io::object::Object as SiaObject;
 use sia_io::object::ObjectId as SiaObjectId;
+use sia_io::object::{Object as SiaObject, UploadableObject};
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io::ErrorKind;
@@ -180,6 +182,14 @@ impl<T: EntityHandler> SyncedEntity<T> {
 }
 
 pub type LocalEntity<T> = RawEntity<T, LocalMode>;
+
+impl<T: EntityHandler> LocalEntity<T> {
+    pub(crate) fn into_synced(self, object_id: ObjectId) -> SyncedEntity<T> {
+        let (inner, _) = Arc::unwrap_or_clone(self.0);
+        RawEntity(Arc::new((inner, SyncedMode { object_id })))
+    }
+}
+
 pub type DraftEntity<T> = RawEntity<T, DraftMode>;
 
 #[derive(Debug, Error)]
@@ -217,7 +227,7 @@ pub enum EntityError {
 }
 
 pub trait EntityHandler: Sized {
-    type Body: for<'a> Yokeable<'a> + Clone;
+    type Body: for<'a> Yokeable<'a, Output: Clone> + Clone;
     const DB_TYPE: &'static str;
     const METADATA_TYPE: &'static str;
 
@@ -235,7 +245,7 @@ pub trait EntityHandler: Sized {
     fn references(entity: &RawEntityInner<Self>) -> Vec<EntityRef<'_>>;
 }
 
-#[derive_where(Debug, PartialEq, Eq)]
+#[derive_where(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RawEntityInner<T: EntityHandler> {
     revision: Revision,
     created: Timestamp,
@@ -272,7 +282,7 @@ impl<T: EntityHandler> RawEntityInner<T> {
     }
 }
 
-#[derive(Yokeable, Debug, PartialEq, Eq)]
+#[derive(Yokeable, Clone, Debug, PartialEq, Eq)]
 struct Metadata<'a> {
     id: &'a EntityId,
     name: &'a Name,
@@ -367,6 +377,28 @@ impl<T: EntityHandler, Mode> RawEntity<T, Mode> {
     }
     pub(crate) fn to_flatbuffer(&self) -> Arc<[u8]> {
         self.0.0.metadata.backing_cart().clone()
+    }
+
+    pub(crate) fn to_uploadable_object(
+        &self,
+        vfs_id: &VfsId,
+    ) -> UploadableObject<object::metadata::Metadata<'_>, Cursor<Arc<[u8]>>> {
+        let mut metadata = MetadataMut::with_vfs_template(vfs_id, METADATA_OBJECT_TYPE);
+        metadata.insert(METADATA_ENTITY_ID.to_string(), self.entity_id().to_string());
+        metadata.insert(
+            METADATA_ENTITY_REVISION.to_string(),
+            self.revision().to_string(),
+        );
+        metadata.insert(
+            METADATA_ENTITY_TYPE.to_string(),
+            T::METADATA_TYPE.to_string(),
+        );
+
+        UploadableObject::new(
+            format!("/entities/{}/{}", self.entity_id(), self.revision()),
+            Cursor::new(self.to_flatbuffer()),
+            Some(metadata.freeze()),
+        )
     }
 
     pub(crate) fn references(&self) -> Vec<EntityRef<'_>> {
@@ -532,7 +564,7 @@ impl<C: TxScope> Transaction<C>
 where
     Self: DbRead,
 {
-    pub(super) async fn entity_by_key<T: EntityHandler>(
+    pub(crate) async fn entity_by_key<T: EntityHandler>(
         &mut self,
         key: &EntityKey,
     ) -> Result<Option<Entity<T>>, DbError> {

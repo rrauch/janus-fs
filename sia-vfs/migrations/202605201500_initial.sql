@@ -796,13 +796,14 @@ CREATE TABLE sync_job_queue
 (
     id             INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
-    blob_id        BLOB REFERENCES blob (id),
-    chunk_id       BLOB REFERENCES chunk (id),
+    blob_id        BLOB UNIQUE REFERENCES blob (id),
+    chunk_id       BLOB UNIQUE REFERENCES chunk (id),
     entity_id      BLOB,
     entity_rev     BLOB,
     estimated_size INTEGER NOT NULL CHECK (estimated_size > 0),
 
     FOREIGN KEY (entity_id, entity_rev) REFERENCES entity (id, revision),
+    UNIQUE (entity_id, entity_rev),
 
     CHECK (
         (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL) OR

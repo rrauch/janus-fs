@@ -1,11 +1,14 @@
 use crate::gen_flatbuffers::object::metadata::{
     Entry, EntryArgs, Metadata as FlatMetadata, MetadataArgs,
 };
-use crate::object::METADATA_MAGIC_NUMBER;
+use crate::object::{METADATA_MAGIC_NUMBER, METADATA_VFS_OBJECT_TYPE};
+use crate::sync::{METADATA_VFS_ID, METADATA_VFS_VERSION};
+use crate::vfs::VfsId;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
-use sia_io::Metadata as IoMetadata;
+use sia_io::{Metadata as IoMetadata, MetadataSource};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::iter;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use thiserror::Error;
@@ -23,6 +26,17 @@ pub enum MetadataError {
 
 #[derive(Debug, Clone)]
 pub struct Metadata<'a>(Inner<'a>);
+
+impl<'a> TryFrom<Cow<'a, [u8]>> for Metadata<'a> {
+    type Error = MetadataError;
+
+    fn try_from(value: Cow<'a, [u8]>) -> Result<Self, Self::Error> {
+        match value {
+            Cow::Owned(owned) => Metadata::<'static>::try_from(Arc::from(owned)),
+            Cow::Borrowed(borrowed) => Self::try_from(borrowed),
+        }
+    }
+}
 
 impl<'a> TryFrom<&'a [u8]> for Metadata<'a> {
     type Error = MetadataError;
@@ -56,6 +70,15 @@ fn try_from_flatbuffer(value: &[u8]) -> Result<FlatMetadata<'_>, MetadataError> 
     }
 
     Ok(flatbuffers::root::<FlatMetadata>(body)?)
+}
+
+impl<'a> From<Cow<'a, HashMap<String, String>>> for Metadata<'a> {
+    fn from(value: Cow<'a, HashMap<String, String>>) -> Self {
+        match value {
+            Cow::Owned(owned) => Metadata::<'static>::from(owned),
+            Cow::Borrowed(borrowed) => Self::from(borrowed),
+        }
+    }
 }
 
 impl<'a> From<&'a HashMap<String, String>> for Metadata<'a> {
@@ -114,6 +137,18 @@ impl Flatbuffer<'_> {
             Self::Owned(yoke) => &yoke.get().0,
         }
     }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (&str, &str)> + '_> {
+        if let Some(entries) = self.get().entries() {
+            Box::new(
+                entries
+                    .iter()
+                    .map(|e| (e.key(), e.value().unwrap_or_default())),
+            )
+        } else {
+            Box::new(iter::empty())
+        }
+    }
 }
 
 impl Metadata<'_> {
@@ -149,6 +184,43 @@ impl Metadata<'_> {
             Inner::HashMap(map) => map.get(key.as_ref()).map(|s| s.as_str()),
         }
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        let iter: Box<dyn Iterator<Item = (&str, &str)>> = match &self.0 {
+            Inner::HashMap(map) => Box::new(map.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
+            Inner::Flatbuffer(fb) => Box::new(fb.iter()),
+        };
+
+        iter
+    }
+
+    pub fn into_mut(self) -> MetadataMut {
+        self.into()
+    }
+}
+
+impl<'a> MetadataSource for Metadata<'a> {
+    fn to_bytes(&self) -> Cow<'_, [u8]> {
+        match &self.0 {
+            Inner::Flatbuffer(Flatbuffer::Owned(yoke)) => {
+                Cow::Borrowed(yoke.backing_cart().as_ref())
+            }
+            _ => {
+                let mm = self.clone().into_mut();
+                Cow::Owned(mm.into())
+            }
+        }
+    }
+
+    fn to_map(&self) -> Cow<'_, HashMap<String, String>> {
+        match &self.0 {
+            Inner::HashMap(map) => Cow::Borrowed(map.as_ref()),
+            Inner::Flatbuffer(_) => {
+                let mm = self.clone().into_mut();
+                Cow::Owned(mm.0)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +230,19 @@ pub struct MetadataMut(HashMap<String, String>);
 impl MetadataMut {
     pub fn empty() -> Self {
         Self(HashMap::new())
+    }
+    pub fn with_vfs_template(vfs_id: &VfsId, object_type: &str) -> Self {
+        let mut map = HashMap::new();
+        map.insert(METADATA_VFS_VERSION.to_string(), "1".to_string());
+        map.insert(METADATA_VFS_ID.to_string(), vfs_id.to_string());
+        map.insert(
+            METADATA_VFS_OBJECT_TYPE.to_string(),
+            object_type.to_string(),
+        );
+        Self(map)
+    }
+    pub fn freeze(self) -> Metadata<'static> {
+        self.into()
     }
 }
 
@@ -172,6 +257,19 @@ impl Deref for MetadataMut {
 impl DerefMut for MetadataMut {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl<'a> From<Metadata<'a>> for MetadataMut {
+    fn from(value: Metadata<'a>) -> Self {
+        match value.0 {
+            Inner::HashMap(map) => Self(map.into_owned()),
+            Inner::Flatbuffer(fb) => Self(
+                fb.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -226,6 +324,7 @@ impl From<MetadataMut> for HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{Metadata, MetadataMut};
+    use sia_io::MetadataSource;
     use std::sync::Arc;
 
     #[test]
@@ -241,26 +340,36 @@ mod tests {
         let metadata = Metadata::try_from(fb.as_slice())?;
         assert_eq!(metadata_mut.len(), metadata.len());
         assert_eq!(
-            metadata_mut.get("key1").map(|v| v.as_str()),
+            metadata_mut.get("key1").map(String::as_str),
             metadata.get("key1")
         );
         assert_eq!(
-            metadata_mut.get("key2").map(|v| v.as_str()),
+            metadata_mut.get("key2").map(String::as_str),
             metadata.get("key2")
         );
         drop(metadata);
 
         //owned
-        let metadata = Metadata::try_from(Arc::from(fb))?;
+        let metadata = Metadata::try_from(Arc::from(fb.clone()))?;
         assert_eq!(metadata_mut.len(), metadata.len());
         assert_eq!(
-            metadata_mut.get("key1").map(|v| v.as_str()),
+            metadata_mut.get("key1").map(String::as_str),
             metadata.get("key1")
         );
         assert_eq!(
-            metadata_mut.get("key2").map(|v| v.as_str()),
+            metadata_mut.get("key2").map(String::as_str),
             metadata.get("key2")
         );
+
+        let map = <Metadata as MetadataSource>::to_map(&metadata);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("key1").map(String::as_str), Some("value1"));
+        assert_eq!(map.get("key2").map(String::as_str), Some("value2"));
+        assert_eq!(map.get("key3").map(String::as_str), None);
+
+        let metadata = Metadata::from(map.into_owned());
+        let bytes = <Metadata as MetadataSource>::to_bytes(&metadata);
+        assert_eq!(bytes, fb);
 
         Ok(())
     }

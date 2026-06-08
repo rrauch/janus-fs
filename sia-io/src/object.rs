@@ -8,7 +8,7 @@ use crate::mock;
 use crate::renterd;
 use crate::scheduler::Scheduler;
 use crate::scheduler::resource_manager::Resource;
-use crate::{Backend, Client, ETag, Metadata, MimeType};
+use crate::{Backend, Client, ETag, Metadata, MetadataSource, MimeType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_io::{AsyncRead, AsyncSeek};
@@ -290,11 +290,11 @@ impl Object {
     pub fn metadata(&self) -> Metadata<'_> {
         match &self {
             #[cfg(feature = "indexd")]
-            Self::Indexd { inner, .. } => Metadata::Indexd(inner.metadata()),
+            Self::Indexd { inner, .. } => Metadata::Indexd(Cow::Borrowed(inner.metadata())),
             #[cfg(feature = "renterd")]
-            Self::Renterd { inner, .. } => Metadata::Renterd(inner.metadata()),
+            Self::Renterd { inner, .. } => Metadata::Renterd(Cow::Borrowed(inner.metadata())),
             #[cfg(feature = "mock")]
-            Self::Mock { inner, .. } => Metadata::Mock(&inner.metadata),
+            Self::Mock { inner, .. } => Metadata::Mock(Cow::Borrowed(&inner.metadata)),
         }
     }
 }
@@ -574,7 +574,7 @@ impl Backend {
         match (&self, metadata) {
             #[cfg(feature = "indexd")]
             (Self::Indexd(indexd), Some(Metadata::Indexd(metadata))) => Ok(indexd
-                .upload(content, Some(metadata.to_owned()))
+                .upload(content, Some(metadata.into_owned()))
                 .await?
                 .into()),
             (Self::Indexd(indexd), None) => Ok(indexd.upload(content, None).await?.into()),
@@ -622,7 +622,7 @@ impl Backend {
                     updated_at: now,
                     mime_type: None,
                     etag: None,
-                    metadata,
+                    metadata: metadata.into_owned(),
                     content: buf.into(),
                 };
                 mock.insert_object(object.clone())?;
@@ -803,6 +803,22 @@ impl DownloadableObject {
     }
 }
 
+pub struct UploadableObject<M, C> {
+    name_hint: Cow<'static, str>,
+    content: C,
+    metadata: Option<M>,
+}
+
+impl<M: MetadataSource, C: AsyncRead + Send + Unpin + 'static> UploadableObject<M, C> {
+    pub fn new(name_hint: impl Into<Cow<'static, str>>, content: C, metadata: Option<M>) -> Self {
+        Self {
+            name_hint: name_hint.into(),
+            content,
+            metadata,
+        }
+    }
+}
+
 #[self_referencing]
 struct IterHolder<K: 'static> {
     set: Arc<papaya::HashMap<K, ()>>,
@@ -872,13 +888,30 @@ impl Client {
     }
 
     #[inline]
-    pub async fn upload(
+    pub async fn upload<M: MetadataSource, C: AsyncRead + Send + Unpin + 'static>(
         &self,
-        name_hint: impl AsRef<str>,
-        content: impl AsyncRead + Send + Unpin + 'static,
-        metadata: Option<Metadata<'_>>,
+        uploadable_object: UploadableObject<M, C>,
     ) -> Result<Object, crate::Error> {
-        let object = self.backend.upload(name_hint, content, metadata).await?;
+        let metadata = uploadable_object
+            .metadata
+            .as_ref()
+            .map(|m| match &self.backend {
+                #[cfg(feature = "indexd")]
+                Backend::Indexd(_) => Metadata::Indexd(m.to_bytes()),
+                #[cfg(feature = "renterd")]
+                Backend::Renterd(_) => Metadata::Renterd(m.to_map()),
+                #[cfg(feature = "mock")]
+                Backend::Mock(_) => Metadata::Mock(m.to_map()),
+            });
+
+        let object = self
+            .backend
+            .upload(
+                uploadable_object.name_hint,
+                uploadable_object.content,
+                metadata,
+            )
+            .await?;
         self.cache
             .insert_object(object.clone(), &self.backend)
             .await?;

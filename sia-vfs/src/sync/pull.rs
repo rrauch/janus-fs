@@ -4,7 +4,7 @@ use crate::sync::{Error, METADATA_VFS_VERSION};
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::EntityHandler;
 use crate::vfs::file::FileKind;
-use crate::vfs::{Timestamp, Vfs, VfsError, VfsResult, entity};
+use crate::vfs::{Timestamp, Vfs, VfsResult, entity};
 use crate::{blob, chunk, object};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
 use sia_io::object::Object as SiaObject;
@@ -36,7 +36,7 @@ impl<Mode> PullTask<Mode> {
         let mut entities = vec![];
 
         let mut stream = self.vfs.backend_objects().await?;
-        while let Some(sia_object) = stream.try_next().await.map_err(VfsError::IoError)? {
+        while let Some(sia_object) = stream.try_next().await? {
             let metadata: Metadata = sia_object
                 .metadata()
                 .try_into()
@@ -58,9 +58,8 @@ impl<Mode> PullTask<Mode> {
         // mark all objects we didn't see or that failed in this run as erroneous
         let mut tx = self.vfs.tx_rw().await?;
         tx.mark_object_error(erroneous_object_ids.into_iter())
-            .await
-            .map_err(VfsError::DbError)?;
-        tx.commit().await.map_err(VfsError::DbError)?;
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -86,8 +85,7 @@ impl<Mode> PullTask<Mode> {
         let mut tx = self.vfs.tx_rw().await?;
         let id = match tx
             .create_or_mark_object(&remote_location, Timestamp::now())
-            .await
-            .map_err(VfsError::DbError)?
+            .await?
         {
             ObjectCreateResult::Existing(existing) => existing.id(),
             ObjectCreateResult::New(id) => {
@@ -160,7 +158,7 @@ impl<Mode> PullTask<Mode> {
                 id
             }
         };
-        tx.commit().await.map_err(VfsError::DbError)?;
+        tx.commit().await?;
         Ok(id)
     }
 }
@@ -217,17 +215,13 @@ mod tests {
     use crate::blob::io::tests::MockBackend;
     use crate::blob::{Blob, BlobMut};
     use crate::chunk::Chunk;
-    use crate::sync::{METADATA_VFS_ID, METADATA_VFS_VERSION, PullTask};
+    use crate::sync::PullTask;
     use crate::vfs::directory::DirectoryDraft;
     use crate::vfs::entity::{DraftEntity, EntityHandler};
     use crate::vfs::file::FileDraft;
     use crate::vfs::tests::new_vfs_with_opts;
-    use crate::vfs::{OwnedName, ReadWrite, StorageMode, Vfs, VfsId, entity};
-    use crate::{blob, chunk, object};
-    use bytes::Bytes;
+    use crate::vfs::{OwnedName, ReadWrite, StorageMode, Vfs, VfsId};
     use futures_util::AsyncWriteExt;
-    use sia_io::Metadata;
-    use std::collections::HashMap;
     use std::num::NonZeroUsize;
     use std::ops::Deref;
 
@@ -266,7 +260,7 @@ mod tests {
                     assert_eq!(*object.id().deref(), 1);
                     assert_eq!(
                         object.remote_location(),
-                        format!("mock:{}.chunk", chunk.id())
+                        format!("mock:/chunks/{}.chunk", chunk.id())
                     );
 
                     let stored_chunk = tx.chunk_by_id(chunk.id()).await?.unwrap();
@@ -300,7 +294,10 @@ mod tests {
                     assert_eq!(objects.len(), 1);
                     let object = objects.get(0).unwrap();
                     assert_eq!(*object.id().deref(), 1);
-                    assert_eq!(object.remote_location(), format!("mock:{}.blob", blob.id()));
+                    assert_eq!(
+                        object.remote_location(),
+                        format!("mock:/blobs/{}.blob", blob.id())
+                    );
 
                     let stored_blob = tx.blob_by_id(blob.id()).await?.unwrap();
                     assert_eq!(stored_blob.id(), blob.id());
@@ -522,78 +519,22 @@ mod tests {
         vfs: &Vfs<ReadWrite>,
         entity: &DraftEntity<T>,
     ) -> anyhow::Result<()> {
-        let id = format!("{}-{}.entity", entity.entity_id(), entity.revision());
-        let content = Bytes::from(entity.to_flatbuffer().to_vec());
-
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            entity::METADATA_ENTITY_ID.to_string(),
-            entity.entity_id().to_string(),
-        );
-        metadata.insert(
-            entity::METADATA_ENTITY_REVISION.to_string(),
-            entity.revision().to_string(),
-        );
-        metadata.insert(
-            entity::METADATA_ENTITY_TYPE.to_string(),
-            <T as EntityHandler>::METADATA_TYPE.to_string(),
-        );
-
-        upload_mock_object(
-            vfs,
-            id,
-            Some(content),
-            entity::METADATA_OBJECT_TYPE,
-            metadata,
-        )
-        .await
+        vfs.sia_client()
+            .upload(entity.to_uploadable_object(vfs.id()))
+            .await?;
+        Ok(())
     }
 
     async fn upload_blob_object(vfs: &Vfs<ReadWrite>, blob: &Blob) -> anyhow::Result<()> {
-        let id = format!("{}.blob", blob.id());
-
-        let content = Bytes::from(blob.to_flatbuffer());
-
-        let mut metadata = HashMap::new();
-        metadata.insert(blob::METADATA_BLOB_ID.to_string(), blob.id().to_string());
-
-        upload_mock_object(vfs, id, Some(content), blob::METADATA_OBJECT_TYPE, metadata).await
+        vfs.sia_client()
+            .upload(blob.to_uploadable_object(vfs.id()))
+            .await?;
+        Ok(())
     }
 
     async fn upload_chunk_object(vfs: &Vfs<ReadWrite>, chunk: &Chunk) -> anyhow::Result<()> {
-        let id = format!("{}.chunk", chunk.id());
-
-        let mut metadata = HashMap::new();
-        metadata.insert(chunk::METADATA_CHUNK_ID.to_string(), chunk.id().to_string());
-
-        upload_mock_object(
-            vfs,
-            id,
-            Some(chunk.to_bytes()),
-            chunk::METADATA_OBJECT_TYPE,
-            metadata,
-        )
-        .await
-    }
-
-    async fn upload_mock_object(
-        vfs: &Vfs<ReadWrite>,
-        id: String,
-        content: Option<Bytes>,
-        object_type: &str,
-        mut metadata: HashMap<String, String>,
-    ) -> anyhow::Result<()> {
-        let content = futures_util::io::Cursor::new(content.unwrap_or_default());
-
-        metadata.insert(METADATA_VFS_VERSION.to_string(), "1".to_string());
-        metadata.insert(METADATA_VFS_ID.to_string(), vfs.id().to_string());
-        metadata.insert(
-            object::METADATA_VFS_OBJECT_TYPE.to_string(),
-            object_type.to_string(),
-        );
-
         vfs.sia_client()
-            .upload(id, content, Some(Metadata::Mock(&metadata)))
+            .upload(chunk.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }

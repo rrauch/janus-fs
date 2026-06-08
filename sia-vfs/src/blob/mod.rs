@@ -5,14 +5,16 @@ use crate::chunk::chunk_map::ChunkMap;
 use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
 use crate::gen_flatbuffers::vfs::blob::{Blob as FlatBlob, BlobBuilder, Chunk as FlatChunk};
 use crate::object::ObjectId;
+use crate::object::metadata::{Metadata, MetadataMut};
 use crate::sync::{Error as SyncError, PullTask};
-use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsResult};
+use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsId, VfsResult};
 use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
+use futures_util::io::Cursor;
 use sia_io::Client as Sia;
-use sia_io::object::Object as SiaObject;
 use sia_io::object::ObjectId as SiaObjectId;
+use sia_io::object::{Object as SiaObject, UploadableObject};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -112,6 +114,20 @@ impl Blob {
         b.finished_data().to_vec()
     }
 
+    pub(crate) fn to_uploadable_object(
+        &self,
+        vfs_id: &VfsId,
+    ) -> UploadableObject<Metadata<'_>, Cursor<Vec<u8>>> {
+        let mut metadata = MetadataMut::with_vfs_template(vfs_id, METADATA_OBJECT_TYPE);
+        metadata.insert(METADATA_BLOB_ID.to_string(), self.id.to_string());
+
+        UploadableObject::new(
+            format!("/blobs/{}.blob", self.id()),
+            Cursor::new(self.to_flatbuffer()),
+            Some(metadata.freeze()),
+        )
+    }
+
     pub fn id(&self) -> &BlobId {
         &self.id
     }
@@ -134,6 +150,11 @@ impl Blob {
 
     pub(crate) fn chunk_map(&self) -> &ChunkMap {
         &self.chunk_map
+    }
+    pub(crate) fn into_synced(self, object_id: ObjectId) -> Blob {
+        let mut blob_mut = BlobMut::from(self);
+        blob_mut.mode = StorageMode::Synced(object_id);
+        blob_mut.finalize()
     }
 }
 

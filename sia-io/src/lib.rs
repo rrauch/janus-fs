@@ -7,6 +7,7 @@ use futures_util::TryStreamExt;
 use mime::Mime;
 use serde::{Deserialize, Deserializer};
 use sia_storage::ObjectsCursor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -162,11 +163,16 @@ impl From<renterd::client::Client> for Backend {
 
 pub enum Metadata<'a> {
     #[cfg(feature = "indexd")]
-    Indexd(&'a [u8]),
+    Indexd(Cow<'a, [u8]>),
     #[cfg(feature = "renterd")]
-    Renterd(&'a HashMap<String, String>),
+    Renterd(Cow<'a, HashMap<String, String>>),
     #[cfg(feature = "mock")]
-    Mock(&'a HashMap<String, String>),
+    Mock(Cow<'a, HashMap<String, String>>),
+}
+
+pub trait MetadataSource {
+    fn to_bytes(&self) -> Cow<'_, [u8]>;
+    fn to_map(&self) -> Cow<'_, HashMap<String, String>>;
 }
 
 #[derive(Debug, Error)]
@@ -360,12 +366,27 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Client, indexd, renterd};
+    use crate::object::UploadableObject;
+    use crate::{Client, MetadataSource, indexd, renterd};
     use futures_util::io::Cursor;
     use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};
+    use std::borrow::Cow;
+    use std::collections::HashMap;
     use std::io::SeekFrom;
 
     static ONE_MB: &[u8] = include_bytes!("../testdata/1mb.bin");
+
+    struct MockMetadata;
+
+    impl MetadataSource for MockMetadata {
+        fn to_bytes(&self) -> Cow<'_, [u8]> {
+            unimplemented!()
+        }
+
+        fn to_map(&self) -> Cow<'_, HashMap<String, String>> {
+            unimplemented!()
+        }
+    }
 
     #[ignore]
     #[tokio::test]
@@ -414,7 +435,11 @@ mod tests {
         assert_eq!(client.num_objects(), 0);
 
         let file1 = client
-            .upload("/dir1/subdir1/file1", Cursor::new(ONE_MB), None)
+            .upload(UploadableObject::new(
+                "/dir1/subdir1/file1",
+                Cursor::new(ONE_MB),
+                None::<MockMetadata>,
+            ))
             .await?;
 
         assert_eq!(client.num_objects(), 1);

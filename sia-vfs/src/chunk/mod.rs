@@ -3,14 +3,17 @@ mod compression;
 
 use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
 use crate::object::ObjectId;
+use crate::object::metadata::{Metadata, MetadataMut};
 use crate::sync::{Error as SyncError, PullTask};
-use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsResult, Write};
+use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsId, VfsResult, Write};
 use crate::{ContentId, object};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::AsyncReadExt;
+use futures_util::io::Cursor;
 use sia_io::Client as Sia;
 use sia_io::object::ObjectId as SiaObjectId;
+use sia_io::object::UploadableObject;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -79,8 +82,18 @@ impl Chunk {
         content[num_words * 8..].iter().all(|&b| b == 0)
     }
 
-    pub(crate) fn to_bytes(&self) -> Bytes {
-        self.content.clone()
+    pub(crate) fn to_uploadable_object(
+        &self,
+        vfs_id: &VfsId,
+    ) -> UploadableObject<Metadata<'_>, Cursor<Bytes>> {
+        let mut metadata = MetadataMut::with_vfs_template(vfs_id, METADATA_OBJECT_TYPE);
+        metadata.insert(METADATA_CHUNK_ID.to_string(), self.id.to_string());
+
+        UploadableObject::new(
+            format!("/chunks/{}.chunk", self.id()),
+            Cursor::new(self.content.clone()),
+            Some(metadata.freeze()),
+        )
     }
 }
 
@@ -245,7 +258,7 @@ impl<C: TxScope> Transaction<C>
 where
     Self: DbWrite,
 {
-    async fn register_remote_chunk(
+    pub(crate) async fn register_remote_chunk(
         &mut self,
         chunk_id: &ChunkId,
         object_id: ObjectId,

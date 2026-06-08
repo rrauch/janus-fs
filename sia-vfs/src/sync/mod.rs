@@ -1,14 +1,16 @@
 mod pull;
+pub mod push;
 
 pub use pull::PullTask;
 
 use crate::blob::BlobError;
+use crate::db::Error as DbError;
 use crate::vfs::VfsError;
 use crate::vfs::entity::EntityError;
 use thiserror::Error;
 
-const METADATA_VFS_VERSION: &'static str = "SIA-VFS";
-const METADATA_VFS_ID: &'static str = "VFS-ID";
+pub(crate) const METADATA_VFS_VERSION: &'static str = "SIA-VFS";
+pub(crate) const METADATA_VFS_ID: &'static str = "VFS-ID";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -24,4 +26,6 @@ pub enum Error {
     InvalidChunkId,
     #[error(transparent)]
     BlobError(#[from] BlobError),
+    #[error(transparent)]
+    DbError(#[from] DbError),
 }
