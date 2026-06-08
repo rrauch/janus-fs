@@ -6,9 +6,12 @@ use crate::gen_flatbuffers::vfs::entity::{
     DirectoryEntry as FlatDirEntry, Entity as FlatEntity, EntityBody as FlatEntityBody,
     EntityBuilder,
 };
-use crate::object::ObjectId;
 use crate::object::metadata::MetadataMut;
-use crate::sync::{Error as SyncError, PullTask};
+use crate::object::{ObjectCreateResult, ObjectId};
+use crate::sync::push::{EntityType, JobItem, PushTask};
+use crate::sync::{Error as SyncError, Error, PullTask};
+use crate::vfs::directory::DirectoryKind;
+use crate::vfs::file::FileKind;
 use crate::vfs::{
     Inode, InodeId, Name, NameError, OwnedName, StorageMode, Timestamp, VfsError, VfsId, VfsResult,
 };
@@ -722,7 +725,7 @@ impl<Mode> PullTask<Mode> {
         object_id: ObjectId,
     ) -> Result<(), SyncError>
     where
-        Transaction<TX>: crate::db::Read + crate::db::Write,
+        Transaction<TX>: DbRead + DbWrite,
     {
         let entity_id = EntityId::try_from_str(entity_id).ok_or_else(|| EntityError::InvalidId)?;
         let rev = Revision::try_from_str(rev).ok_or_else(|| EntityError::InvalidRevision)?;
@@ -750,6 +753,148 @@ impl<Mode> PullTask<Mode> {
         }
 
         Ok(())
+    }
+}
+
+impl PushTask {
+    pub(crate) async fn process_entity<E: EntityHandler, TX: TxScope>(
+        &mut self,
+        entity_key: EntityKey,
+        mut tx: Transaction<TX>,
+    ) -> Result<(), Error>
+    where
+        Transaction<TX>: DbRead,
+    {
+        let entity = match tx
+            .entity_by_key::<E>(&entity_key)
+            .await?
+            .ok_or_else(|| DbError::from(DataError::EntityNotFound(entity_key)))?
+        {
+            Entity::Synced(_) => {
+                // already synced
+                return Ok(());
+            }
+            Entity::Local(entity) => entity,
+        };
+        drop(tx);
+
+        let object = self
+            .vfs()
+            .sia_client()
+            .upload(entity.to_uploadable_object(self.vfs().id()))
+            .await?;
+
+        let mut tx = self.vfs().tx_rw().await?;
+        let remote_location = object.id().to_string();
+        let object_id = match tx
+            .create_or_mark_object(remote_location.as_str(), Timestamp::now())
+            .await?
+        {
+            ObjectCreateResult::New(oid) => oid,
+            ObjectCreateResult::Existing(o) => o.id().clone(),
+        };
+
+        let entity = entity.into_synced(object_id);
+        tx.register_entity(entity).await?;
+        tx.remove_sync_job_entity(&entity_key).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn queue_entities<TX: TxScope>(
+        &mut self,
+        tx: &mut Transaction<TX>,
+    ) -> Result<usize, Error>
+    where
+        Transaction<TX>: DbWrite,
+    {
+        let mut num_items = 0;
+        for (key, entity_type) in tx.pushable_entity_keys().await? {
+            let fb = if entity_type == EntityType::File {
+                let file = match tx.entity_by_key::<FileKind>(&key).await? {
+                    Some(Entity::Local(file)) => file,
+                    _ => continue,
+                };
+                file.to_flatbuffer()
+            } else if entity_type == EntityType::Dir {
+                let dir = match tx.entity_by_key::<DirectoryKind>(&key).await? {
+                    Some(Entity::Local(dir)) => dir,
+                    _ => continue,
+                };
+                dir.to_flatbuffer()
+            } else {
+                continue;
+            };
+
+            let estimated_size = fb.len() as u64 + 32;
+            let item = JobItem::Entity(key, entity_type);
+            if tx.enqueue_sync_job_item(&item, estimated_size).await? {
+                num_items += 1;
+            }
+        }
+
+        Ok(num_items)
+    }
+}
+
+impl<C: TxScope> Transaction<C>
+where
+    Self: DbRead,
+{
+    async fn pushable_entity_keys(&mut self) -> Result<Vec<(EntityKey, EntityType)>, DbError> {
+        Ok(sqlx::query!(
+            "SELECT id, revision, entity_type FROM entity WHERE mode = 'L' AND ref_count > 0"
+        )
+        .fetch_all(self.conn())
+        .await?
+        .into_iter()
+        .filter_map(|r| {
+            EntityId::try_from_bytes(r.id)
+                .map(|id| {
+                    Revision::try_from_bytes(r.revision)
+                        .map(|rev| (EntityKey::new(id, rev), r.entity_type))
+                })
+                .flatten()
+                .map(|(key, s)| match s.as_str() {
+                    <FileKind as EntityHandler>::DB_TYPE => Some((key, EntityType::File)),
+                    <DirectoryKind as EntityHandler>::DB_TYPE => Some((key, EntityType::Dir)),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect())
+    }
+
+    pub(crate) async fn entity_item(
+        &mut self,
+        id: i64,
+    ) -> Result<(EntityKey, EntityType), DbError> {
+        let r = sqlx::query!(
+            "SELECT q.entity_id, q.entity_rev, e.entity_type \
+                 FROM sync_job_queue q \
+                 JOIN entity e ON e.id = q.entity_id AND e.revision = q.entity_rev \
+                 WHERE q.id = ?",
+            id
+        )
+        .fetch_one(self.conn())
+        .await?;
+
+        let entity_id = r
+            .entity_id
+            .and_then(EntityId::try_from_bytes)
+            .ok_or_else(|| DataError::ConversionError("entity_id missing or invalid".into()))?;
+        let revision = r
+            .entity_rev
+            .and_then(Revision::try_from_bytes)
+            .ok_or_else(|| DataError::ConversionError("entity_rev missing or invalid".into()))?;
+
+        let entity_type = match r.entity_type.as_str() {
+            <FileKind as EntityHandler>::DB_TYPE => EntityType::File,
+            <DirectoryKind as EntityHandler>::DB_TYPE => EntityType::Dir,
+            _ => Err(DataError::ConversionError("invalid entity type".into()))?,
+        };
+
+        Ok((EntityKey::new(entity_id, revision), entity_type))
     }
 }
 
@@ -870,5 +1015,26 @@ where
             .inode_by_id(inode_id)
             .await?
             .ok_or_else(|| DbError::DataError(DataError::InodeNotFound(inode_id)))?)
+    }
+
+    async fn remove_sync_job_entity(&mut self, entity_key: &EntityKey) -> Result<(), DbError> {
+        let entity_id = entity_key.id().as_slice();
+        let entity_rev = entity_key.revision().as_slice();
+        let affected_rows = sqlx::query!(
+            "DELETE FROM sync_job_queue WHERE type = 'E' AND entity_id = ? AND entity_rev = ?",
+            entity_id,
+            entity_rev
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if affected_rows != 1 {
+            Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: affected_rows,
+            })?
+        }
+        Ok(())
     }
 }

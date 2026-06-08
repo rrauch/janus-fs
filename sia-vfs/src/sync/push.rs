@@ -1,12 +1,11 @@
 use crate::blob::BlobId;
 use crate::chunk::ChunkId;
 use crate::db::{DataError, Error as DbError, Read, Transaction, TxScope, Write};
-use crate::object::ObjectCreateResult;
 use crate::sync::Error;
 use crate::vfs::directory::DirectoryKind;
-use crate::vfs::entity::{Entity, EntityHandler, EntityId, EntityKey, Revision};
+use crate::vfs::entity::EntityKey;
 use crate::vfs::file::FileKind;
-use crate::vfs::{ROOT_INODE_ID, ReadWrite, StorageMode, Timestamp, Vfs};
+use crate::vfs::{ROOT_INODE_ID, ReadWrite, Timestamp, Vfs};
 use std::ops::Deref;
 
 pub struct PushTask {
@@ -16,6 +15,9 @@ pub struct PushTask {
 impl PushTask {
     pub(crate) fn new(vfs: Vfs<ReadWrite>) -> Self {
         Self { vfs }
+    }
+    pub(crate) fn vfs(&self) -> &Vfs<ReadWrite> {
+        &self.vfs
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
@@ -72,134 +74,6 @@ impl PushTask {
         }
     }
 
-    async fn process_chunk<TX: TxScope>(
-        &mut self,
-        chunk_id: ChunkId,
-        mut tx: Transaction<TX>,
-    ) -> Result<(), Error>
-    where
-        Transaction<TX>: Read,
-    {
-        // double-check the chunk is still local
-        if !tx.is_chunk_local(&chunk_id).await? {
-            // has been synced since last check
-            return Ok(());
-        }
-
-        let chunk = tx
-            .chunk_by_id(&chunk_id)
-            .await?
-            .ok_or_else(|| DbError::from(DataError::ChunkNotFound(chunk_id)))?;
-        drop(tx);
-
-        let object = self
-            .vfs
-            .sia_client()
-            .upload(chunk.to_uploadable_object(self.vfs.id()))
-            .await?;
-
-        let mut tx = self.vfs.tx_rw().await?;
-        let remote_location = object.id().to_string();
-        let object_id = match tx
-            .create_or_mark_object(remote_location.as_str(), Timestamp::now())
-            .await?
-        {
-            ObjectCreateResult::New(oid) => oid,
-            ObjectCreateResult::Existing(o) => o.id().clone(),
-        };
-
-        tx.register_remote_chunk(&chunk_id, object_id).await?;
-        tx.remove_sync_job_chunk(&chunk_id).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn process_blob<TX: TxScope>(
-        &mut self,
-        blob_id: BlobId,
-        mut tx: Transaction<TX>,
-    ) -> Result<(), Error>
-    where
-        Transaction<TX>: Read,
-    {
-        let blob = tx
-            .blob_by_id(&blob_id)
-            .await?
-            .ok_or_else(|| DbError::from(DataError::BlobNotFound(blob_id)))?;
-
-        if let StorageMode::Synced(_) = &blob.mode() {
-            // no need to sync
-            return Ok(());
-        }
-        drop(tx);
-
-        let object = self
-            .vfs
-            .sia_client()
-            .upload(blob.to_uploadable_object(self.vfs.id()))
-            .await?;
-
-        let mut tx = self.vfs.tx_rw().await?;
-        let remote_location = object.id().to_string();
-        let object_id = match tx
-            .create_or_mark_object(remote_location.as_str(), Timestamp::now())
-            .await?
-        {
-            ObjectCreateResult::New(oid) => oid,
-            ObjectCreateResult::Existing(o) => o.id().clone(),
-        };
-
-        let blob = blob.into_synced(object_id);
-        tx.register_blob(&blob).await?;
-        tx.remove_sync_job_blob(blob.id()).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn process_entity<E: EntityHandler, TX: TxScope>(
-        &mut self,
-        entity_key: EntityKey,
-        mut tx: Transaction<TX>,
-    ) -> Result<(), Error>
-    where
-        Transaction<TX>: Read,
-    {
-        let entity = match tx
-            .entity_by_key::<E>(&entity_key)
-            .await?
-            .ok_or_else(|| DbError::from(DataError::EntityNotFound(entity_key)))?
-        {
-            Entity::Synced(_) => {
-                // already synced
-                return Ok(());
-            }
-            Entity::Local(entity) => entity,
-        };
-        drop(tx);
-
-        let object = self
-            .vfs
-            .sia_client()
-            .upload(entity.to_uploadable_object(self.vfs.id()))
-            .await?;
-
-        let mut tx = self.vfs.tx_rw().await?;
-        let remote_location = object.id().to_string();
-        let object_id = match tx
-            .create_or_mark_object(remote_location.as_str(), Timestamp::now())
-            .await?
-        {
-            ObjectCreateResult::New(oid) => oid,
-            ObjectCreateResult::Existing(o) => o.id().clone(),
-        };
-
-        let entity = entity.into_synced(object_id);
-        tx.register_entity(entity).await?;
-        tx.remove_sync_job_entity(&entity_key).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     async fn create_new_queue<TX: TxScope>(
         &mut self,
         tx: &mut Transaction<TX>,
@@ -216,88 +90,16 @@ impl PushTask {
 
         Ok(num_items)
     }
-
-    async fn queue_chunks<TX: TxScope>(&mut self, tx: &mut Transaction<TX>) -> Result<usize, Error>
-    where
-        Transaction<TX>: Write,
-    {
-        let mut num_items = 0;
-        for (chunk_id, len) in tx.pushable_chunk_ids().await? {
-            let estimated_size = len + 32;
-            let item = JobItem::Chunk(chunk_id);
-            if tx.enqueue_sync_job_item(&item, estimated_size).await? {
-                num_items += 1;
-            }
-        }
-
-        Ok(num_items)
-    }
-
-    async fn queue_blobs<TX: TxScope>(&mut self, tx: &mut Transaction<TX>) -> Result<usize, Error>
-    where
-        Transaction<TX>: Write,
-    {
-        let mut num_items = 0;
-        for blob_id in tx.pushable_blob_ids().await? {
-            let blob = match tx.blob_by_id(&blob_id).await? {
-                Some(blob) => blob,
-                None => continue,
-            };
-            let fb = blob.to_flatbuffer();
-            let estimated_size = fb.len() as u64 + 32;
-            let item = JobItem::Blob(blob_id);
-            if tx.enqueue_sync_job_item(&item, estimated_size).await? {
-                num_items += 1;
-            }
-        }
-
-        Ok(num_items)
-    }
-
-    async fn queue_entities<TX: TxScope>(
-        &mut self,
-        tx: &mut Transaction<TX>,
-    ) -> Result<usize, Error>
-    where
-        Transaction<TX>: Write,
-    {
-        let mut num_items = 0;
-        for (key, entity_type) in tx.pushable_entity_keys().await? {
-            let fb = if entity_type == EntityType::File {
-                let file = match tx.entity_by_key::<FileKind>(&key).await? {
-                    Some(Entity::Local(file)) => file,
-                    _ => continue,
-                };
-                file.to_flatbuffer()
-            } else if entity_type == EntityType::Dir {
-                let dir = match tx.entity_by_key::<DirectoryKind>(&key).await? {
-                    Some(Entity::Local(dir)) => dir,
-                    _ => continue,
-                };
-                dir.to_flatbuffer()
-            } else {
-                continue;
-            };
-
-            let estimated_size = fb.len() as u64 + 32;
-            let item = JobItem::Entity(key, entity_type);
-            if tx.enqueue_sync_job_item(&item, estimated_size).await? {
-                num_items += 1;
-            }
-        }
-
-        Ok(num_items)
-    }
 }
 
-enum JobItem {
+pub(crate) enum JobItem {
     Chunk(ChunkId),
     Blob(BlobId),
     Entity(EntityKey, EntityType),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum EntityType {
+pub(crate) enum EntityType {
     File,
     Dir,
 }
@@ -331,69 +133,6 @@ where
         )
     }
 
-    async fn is_chunk_local(&mut self, chunk_id: &ChunkId) -> Result<bool, DbError> {
-        let id = chunk_id.as_slice();
-        let mode = sqlx::query!("SELECT mode FROM chunk WHERE id = ?", id)
-            .map(|r| r.mode)
-            .fetch_one(self.conn())
-            .await?;
-        Ok(match mode.as_str() {
-            "L" => true,
-            _ => false,
-        })
-    }
-
-    async fn chunk_item(&mut self, id: i64) -> Result<ChunkId, DbError> {
-        Ok(ChunkId::try_from_bytes(
-            sqlx::query!("SELECT chunk_id FROM sync_job_queue WHERE id = ?", id)
-                .fetch_one(self.conn())
-                .await?
-                .chunk_id
-                .ok_or_else(|| DataError::ConversionError("chunk_id is missing".into()))?,
-        )
-        .ok_or_else(|| DataError::ConversionError("invalid chunk id".into()))?)
-    }
-
-    async fn blob_item(&mut self, id: i64) -> Result<BlobId, DbError> {
-        Ok(BlobId::try_from_bytes(
-            sqlx::query!("SELECT blob_id FROM sync_job_queue WHERE id = ?", id)
-                .fetch_one(self.conn())
-                .await?
-                .blob_id
-                .ok_or_else(|| DataError::ConversionError("blob_id is missing".into()))?,
-        )
-        .ok_or_else(|| DataError::ConversionError("invalid blob id".into()))?)
-    }
-
-    async fn entity_item(&mut self, id: i64) -> Result<(EntityKey, EntityType), DbError> {
-        let r = sqlx::query!(
-            "SELECT q.entity_id, q.entity_rev, e.entity_type \
-                 FROM sync_job_queue q \
-                 JOIN entity e ON e.id = q.entity_id AND e.revision = q.entity_rev \
-                 WHERE q.id = ?",
-            id
-        )
-        .fetch_one(self.conn())
-        .await?;
-
-        let entity_id = r
-            .entity_id
-            .and_then(EntityId::try_from_bytes)
-            .ok_or_else(|| DataError::ConversionError("entity_id missing or invalid".into()))?;
-        let revision = r
-            .entity_rev
-            .and_then(Revision::try_from_bytes)
-            .ok_or_else(|| DataError::ConversionError("entity_rev missing or invalid".into()))?;
-
-        let entity_type = match r.entity_type.as_str() {
-            <FileKind as EntityHandler>::DB_TYPE => EntityType::File,
-            <DirectoryKind as EntityHandler>::DB_TYPE => EntityType::Dir,
-            _ => Err(DataError::ConversionError("invalid entity type".into()))?,
-        };
-
-        Ok((EntityKey::new(entity_id, revision), entity_type))
-    }
-
     async fn has_push_items(&mut self) -> Result<bool, DbError> {
         Ok(sqlx::query!(
             "SELECT EXISTS (
@@ -408,52 +147,6 @@ where
         .map(|r| r.has_items)
         .fetch_one(self.conn())
         .await?)
-    }
-
-    async fn pushable_chunk_ids(&mut self) -> Result<Vec<(ChunkId, u64)>, DbError> {
-        Ok(
-            sqlx::query!("SELECT id, LENGTH(data) AS \"data_len: u64\" FROM chunk WHERE mode = 'L' AND ref_count > 0")
-                .fetch_all(self.conn())
-                .await?
-                .into_iter()
-                .filter_map(|r| ChunkId::try_from_bytes(r.id).map(|c| (c, r.data_len.unwrap_or_default())))
-                .collect(),
-        )
-    }
-
-    async fn pushable_blob_ids(&mut self) -> Result<Vec<BlobId>, DbError> {
-        Ok(
-            sqlx::query!("SELECT id FROM blob WHERE mode = 'L' AND ref_count > 0")
-                .fetch_all(self.conn())
-                .await?
-                .into_iter()
-                .filter_map(|r| BlobId::try_from_bytes(r.id))
-                .collect(),
-        )
-    }
-
-    async fn pushable_entity_keys(&mut self) -> Result<Vec<(EntityKey, EntityType)>, DbError> {
-        Ok(sqlx::query!(
-            "SELECT id, revision, entity_type FROM entity WHERE mode = 'L' AND ref_count > 0"
-        )
-        .fetch_all(self.conn())
-        .await?
-        .into_iter()
-        .filter_map(|r| {
-            EntityId::try_from_bytes(r.id)
-                .map(|id| {
-                    Revision::try_from_bytes(r.revision)
-                        .map(|rev| (EntityKey::new(id, rev), r.entity_type))
-                })
-                .flatten()
-                .map(|(key, s)| match s.as_str() {
-                    <FileKind as EntityHandler>::DB_TYPE => Some((key, EntityType::File)),
-                    <DirectoryKind as EntityHandler>::DB_TYPE => Some((key, EntityType::Dir)),
-                    _ => None,
-                })
-                .flatten()
-        })
-        .collect())
     }
 }
 
@@ -492,7 +185,7 @@ where
         Ok(())
     }
 
-    async fn enqueue_sync_job_item(
+    pub(crate) async fn enqueue_sync_job_item(
         &mut self,
         item: &JobItem,
         estimated_size: u64,
@@ -521,65 +214,6 @@ where
         ).execute(self.conn()).await?.rows_affected() > 0;
 
         Ok(inserted)
-    }
-
-    async fn remove_sync_job_entity(&mut self, entity_key: &EntityKey) -> Result<(), DbError> {
-        let entity_id = entity_key.id().as_slice();
-        let entity_rev = entity_key.revision().as_slice();
-        let affected_rows = sqlx::query!(
-            "DELETE FROM sync_job_queue WHERE type = 'E' AND entity_id = ? AND entity_rev = ?",
-            entity_id,
-            entity_rev
-        )
-        .execute(self.conn())
-        .await?
-        .rows_affected();
-
-        if affected_rows != 1 {
-            Err(DataError::UnexpectedAffectedRows {
-                expected: 1,
-                actual: affected_rows,
-            })?
-        }
-        Ok(())
-    }
-
-    async fn remove_sync_job_blob(&mut self, blob_id: &BlobId) -> Result<(), DbError> {
-        let blob_id = blob_id.as_slice();
-        let affected_rows = sqlx::query!(
-            "DELETE FROM sync_job_queue WHERE type = 'B' AND blob_id = ?",
-            blob_id
-        )
-        .execute(self.conn())
-        .await?
-        .rows_affected();
-
-        if affected_rows != 1 {
-            Err(DataError::UnexpectedAffectedRows {
-                expected: 1,
-                actual: affected_rows,
-            })?
-        }
-        Ok(())
-    }
-
-    async fn remove_sync_job_chunk(&mut self, chunk_id: &ChunkId) -> Result<(), DbError> {
-        let chunk_id = chunk_id.as_slice();
-        let affected_rows = sqlx::query!(
-            "DELETE FROM sync_job_queue WHERE type = 'C' AND chunk_id = ?",
-            chunk_id
-        )
-        .execute(self.conn())
-        .await?
-        .rows_affected();
-
-        if affected_rows != 1 {
-            Err(DataError::UnexpectedAffectedRows {
-                expected: 1,
-                actual: affected_rows,
-            })?
-        }
-        Ok(())
     }
 }
 

@@ -2,12 +2,13 @@ pub mod io;
 
 use crate::chunk::ChunkId;
 use crate::chunk::chunk_map::ChunkMap;
-use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
+use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite, Write};
 use crate::gen_flatbuffers::vfs::blob::{Blob as FlatBlob, BlobBuilder, Chunk as FlatChunk};
-use crate::object::ObjectId;
 use crate::object::metadata::{Metadata, MetadataMut};
-use crate::sync::{Error as SyncError, PullTask};
-use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsId, VfsResult};
+use crate::object::{ObjectCreateResult, ObjectId};
+use crate::sync::push::{JobItem, PushTask};
+use crate::sync::{Error as SyncError, Error, PullTask};
+use crate::vfs::{Read, StorageMode, Timestamp, Vfs, VfsError, VfsId, VfsResult};
 use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
@@ -250,6 +251,74 @@ impl<Mode> PullTask<Mode> {
     }
 }
 
+impl PushTask {
+    pub(crate) async fn process_blob<TX: TxScope>(
+        &mut self,
+        blob_id: BlobId,
+        mut tx: Transaction<TX>,
+    ) -> Result<(), Error>
+    where
+        Transaction<TX>: crate::db::Read,
+    {
+        let blob = tx
+            .blob_by_id(&blob_id)
+            .await?
+            .ok_or_else(|| crate::db::Error::from(DataError::BlobNotFound(blob_id)))?;
+
+        if let StorageMode::Synced(_) = &blob.mode() {
+            // no need to sync
+            return Ok(());
+        }
+        drop(tx);
+
+        let object = self
+            .vfs()
+            .sia_client()
+            .upload(blob.to_uploadable_object(self.vfs().id()))
+            .await?;
+
+        let mut tx = self.vfs().tx_rw().await?;
+        let remote_location = object.id().to_string();
+        let object_id = match tx
+            .create_or_mark_object(remote_location.as_str(), Timestamp::now())
+            .await?
+        {
+            ObjectCreateResult::New(oid) => oid,
+            ObjectCreateResult::Existing(o) => o.id().clone(),
+        };
+
+        let blob = blob.into_synced(object_id);
+        tx.register_blob(&blob).await?;
+        tx.remove_sync_job_blob(blob.id()).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn queue_blobs<TX: TxScope>(
+        &mut self,
+        tx: &mut Transaction<TX>,
+    ) -> Result<usize, Error>
+    where
+        Transaction<TX>: Write,
+    {
+        let mut num_items = 0;
+        for blob_id in tx.pushable_blob_ids().await? {
+            let blob = match tx.blob_by_id(&blob_id).await? {
+                Some(blob) => blob,
+                None => continue,
+            };
+            let fb = blob.to_flatbuffer();
+            let estimated_size = fb.len() as u64 + 32;
+            let item = JobItem::Blob(blob_id);
+            if tx.enqueue_sync_job_item(&item, estimated_size).await? {
+                num_items += 1;
+            }
+        }
+
+        Ok(num_items)
+    }
+}
+
 impl<C: TxScope> Transaction<C>
 where
     Self: DbRead,
@@ -308,6 +377,28 @@ where
             })?
         }
         Ok(Some(blob))
+    }
+
+    async fn pushable_blob_ids(&mut self) -> Result<Vec<BlobId>, crate::db::Error> {
+        Ok(
+            sqlx::query!("SELECT id FROM blob WHERE mode = 'L' AND ref_count > 0")
+                .fetch_all(self.conn())
+                .await?
+                .into_iter()
+                .filter_map(|r| BlobId::try_from_bytes(r.id))
+                .collect(),
+        )
+    }
+
+    pub(crate) async fn blob_item(&mut self, id: i64) -> Result<BlobId, crate::db::Error> {
+        Ok(BlobId::try_from_bytes(
+            sqlx::query!("SELECT blob_id FROM sync_job_queue WHERE id = ?", id)
+                .fetch_one(self.conn())
+                .await?
+                .blob_id
+                .ok_or_else(|| DataError::ConversionError("blob_id is missing".into()))?,
+        )
+        .ok_or_else(|| DataError::ConversionError("invalid blob id".into()))?)
     }
 }
 
@@ -373,6 +464,25 @@ where
             ).execute(self.conn()).await?;
         }
 
+        Ok(())
+    }
+
+    async fn remove_sync_job_blob(&mut self, blob_id: &BlobId) -> Result<(), crate::db::Error> {
+        let blob_id = blob_id.as_slice();
+        let affected_rows = sqlx::query!(
+            "DELETE FROM sync_job_queue WHERE type = 'B' AND blob_id = ?",
+            blob_id
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if affected_rows != 1 {
+            Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: affected_rows,
+            })?
+        }
         Ok(())
     }
 }

@@ -2,10 +2,11 @@ pub(crate) mod chunk_map;
 mod compression;
 
 use crate::db::{DataError, Read as DbRead, Transaction, TxScope, Write as DbWrite};
-use crate::object::ObjectId;
 use crate::object::metadata::{Metadata, MetadataMut};
-use crate::sync::{Error as SyncError, PullTask};
-use crate::vfs::{Read, StorageMode, Vfs, VfsError, VfsId, VfsResult, Write};
+use crate::object::{ObjectCreateResult, ObjectId};
+use crate::sync::push::{JobItem, PushTask};
+use crate::sync::{Error as SyncError, Error, PullTask};
+use crate::vfs::{Read, StorageMode, Timestamp, Vfs, VfsError, VfsId, VfsResult, Write};
 use crate::{ContentId, object};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -198,6 +199,69 @@ impl<Mode> PullTask<Mode> {
     }
 }
 
+impl PushTask {
+    pub(crate) async fn process_chunk<TX: TxScope>(
+        &mut self,
+        chunk_id: ChunkId,
+        mut tx: Transaction<TX>,
+    ) -> Result<(), Error>
+    where
+        Transaction<TX>: crate::db::Read,
+    {
+        // double-check the chunk is still local
+        if !tx.is_chunk_local(&chunk_id).await? {
+            // has been synced since last check
+            return Ok(());
+        }
+
+        let chunk = tx
+            .chunk_by_id(&chunk_id)
+            .await?
+            .ok_or_else(|| crate::db::Error::from(DataError::ChunkNotFound(chunk_id)))?;
+        drop(tx);
+
+        let object = self
+            .vfs()
+            .sia_client()
+            .upload(chunk.to_uploadable_object(self.vfs().id()))
+            .await?;
+
+        let mut tx = self.vfs().tx_rw().await?;
+        let remote_location = object.id().to_string();
+        let object_id = match tx
+            .create_or_mark_object(remote_location.as_str(), Timestamp::now())
+            .await?
+        {
+            ObjectCreateResult::New(oid) => oid,
+            ObjectCreateResult::Existing(o) => o.id().clone(),
+        };
+
+        tx.register_remote_chunk(&chunk_id, object_id).await?;
+        tx.remove_sync_job_chunk(&chunk_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn queue_chunks<TX: TxScope>(
+        &mut self,
+        tx: &mut Transaction<TX>,
+    ) -> Result<usize, Error>
+    where
+        Transaction<TX>: crate::db::Write,
+    {
+        let mut num_items = 0;
+        for (chunk_id, len) in tx.pushable_chunk_ids().await? {
+            let estimated_size = len + 32;
+            let item = JobItem::Chunk(chunk_id);
+            if tx.enqueue_sync_job_item(&item, estimated_size).await? {
+                num_items += 1;
+            }
+        }
+
+        Ok(num_items)
+    }
+}
+
 impl<C: TxScope> Transaction<C>
 where
     Self: DbRead,
@@ -251,6 +315,40 @@ where
             })?;
         }
         Ok(Some(chunk))
+    }
+
+    async fn is_chunk_local(&mut self, chunk_id: &ChunkId) -> Result<bool, crate::db::Error> {
+        let id = chunk_id.as_slice();
+        let mode = sqlx::query!("SELECT mode FROM chunk WHERE id = ?", id)
+            .map(|r| r.mode)
+            .fetch_one(self.conn())
+            .await?;
+        Ok(match mode.as_str() {
+            "L" => true,
+            _ => false,
+        })
+    }
+
+    async fn pushable_chunk_ids(&mut self) -> Result<Vec<(ChunkId, u64)>, crate::db::Error> {
+        Ok(
+            sqlx::query!("SELECT id, LENGTH(data) AS \"data_len: u64\" FROM chunk WHERE mode = 'L' AND ref_count > 0")
+                .fetch_all(self.conn())
+                .await?
+                .into_iter()
+                .filter_map(|r| ChunkId::try_from_bytes(r.id).map(|c| (c, r.data_len.unwrap_or_default())))
+                .collect(),
+        )
+    }
+
+    pub(crate) async fn chunk_item(&mut self, id: i64) -> Result<ChunkId, crate::db::Error> {
+        Ok(ChunkId::try_from_bytes(
+            sqlx::query!("SELECT chunk_id FROM sync_job_queue WHERE id = ?", id)
+                .fetch_one(self.conn())
+                .await?
+                .chunk_id
+                .ok_or_else(|| DataError::ConversionError("chunk_id is missing".into()))?,
+        )
+        .ok_or_else(|| DataError::ConversionError("invalid chunk id".into()))?)
     }
 }
 
@@ -347,5 +445,24 @@ where
         .await?;
 
         Ok(true)
+    }
+
+    async fn remove_sync_job_chunk(&mut self, chunk_id: &ChunkId) -> Result<(), crate::db::Error> {
+        let chunk_id = chunk_id.as_slice();
+        let affected_rows = sqlx::query!(
+            "DELETE FROM sync_job_queue WHERE type = 'C' AND chunk_id = ?",
+            chunk_id
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if affected_rows != 1 {
+            Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: affected_rows,
+            })?
+        }
+        Ok(())
     }
 }
