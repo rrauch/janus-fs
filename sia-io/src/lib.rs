@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::chunk::ChunkDownloader;
 use crate::scheduler::Scheduler;
+use crate::upload::UploadError;
 #[cfg(feature = "indexd")]
 pub use sia_storage::SealedObject;
 
@@ -34,6 +35,7 @@ pub mod object;
 pub mod renterd;
 pub mod scheduler;
 pub(crate) mod tagged;
+pub mod upload;
 
 pub struct MimeTypeKind;
 pub type MimeType = TaggedValue<MimeTypeKind, String>;
@@ -175,6 +177,16 @@ pub trait MetadataSource {
     fn to_map(&self) -> Cow<'_, HashMap<String, String>>;
 }
 
+impl<T: MetadataSource> MetadataSource for Box<T> {
+    fn to_bytes(&self) -> Cow<'_, [u8]> {
+        self.as_ref().to_bytes()
+    }
+
+    fn to_map(&self) -> Cow<'_, HashMap<String, String>> {
+        self.as_ref().to_map()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[cfg(feature = "indexd")]
@@ -196,6 +208,8 @@ pub enum Error {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     ConfigError(#[from] ConfigError),
+    #[error(transparent)]
+    UploadError(#[from] UploadError),
 }
 
 #[derive(Debug, Error)]
@@ -366,7 +380,7 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 
 #[cfg(test)]
 mod tests {
-    use crate::object::UploadableObject;
+    use crate::upload::UploadableObject;
     use crate::{Client, MetadataSource, indexd, renterd};
     use futures_util::io::Cursor;
     use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};

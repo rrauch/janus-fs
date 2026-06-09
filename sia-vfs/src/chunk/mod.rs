@@ -14,7 +14,7 @@ use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
 use sia_io::Client as Sia;
 use sia_io::object::ObjectId as SiaObjectId;
-use sia_io::object::UploadableObject;
+use sia_io::upload::UploadableObject;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::sync::Arc;

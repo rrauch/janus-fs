@@ -8,7 +8,7 @@ use crate::mock;
 use crate::renterd;
 use crate::scheduler::Scheduler;
 use crate::scheduler::resource_manager::Resource;
-use crate::{Backend, Client, ETag, Metadata, MetadataSource, MimeType};
+use crate::{Backend, Client, ETag, Metadata, MimeType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_io::{AsyncRead, AsyncSeek};
@@ -565,73 +565,6 @@ impl Backend {
         }
     }
 
-    async fn upload(
-        &self,
-        name_hint: impl AsRef<str>,
-        mut content: impl AsyncRead + Send + Unpin + 'static,
-        metadata: Option<Metadata<'_>>,
-    ) -> Result<Object, crate::Error> {
-        match (&self, metadata) {
-            #[cfg(feature = "indexd")]
-            (Self::Indexd(indexd), Some(Metadata::Indexd(metadata))) => Ok(indexd
-                .upload(content, Some(metadata.into_owned()))
-                .await?
-                .into()),
-            (Self::Indexd(indexd), None) => Ok(indexd.upload(content, None).await?.into()),
-            #[cfg(feature = "renterd")]
-            (Self::Renterd(renterd), metadata) => {
-                let metadata = match metadata {
-                    Some(Metadata::Renterd(m)) => Some(m.to_owned()),
-                    None => None,
-                    _ => return Err(crate::Error::BackendMismatch),
-                };
-
-                let id = renterd
-                    .object_id(None, name_hint)
-                    .map_err(renterd::client::ClientError::ObjectKeyError)?;
-
-                renterd
-                    .upload(
-                        &id,
-                        None,
-                        metadata
-                            .as_ref()
-                            .map(|m| m.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
-                        content,
-                    )
-                    .await?;
-
-                let object = renterd.object(&id).await?;
-                Ok(object.into())
-            }
-            #[cfg(feature = "mock")]
-            (Self::Mock(mock), metadata) => {
-                let metadata = match metadata {
-                    Some(Metadata::Mock(m)) => Some(m.to_owned()),
-                    None => None,
-                    _ => return Err(crate::Error::BackendMismatch),
-                }
-                .unwrap_or_default();
-                let id = mock::MockObjectId::try_from(format!("mock:{}", name_hint.as_ref()))?;
-                let mut buf = vec![];
-                futures_util::AsyncReadExt::read_to_end(&mut content, &mut buf).await?;
-                let now = Utc::now();
-                let object = mock::MockObject {
-                    id,
-                    created_at: now,
-                    updated_at: now,
-                    mime_type: None,
-                    etag: None,
-                    metadata: metadata.into_owned(),
-                    content: buf.into(),
-                };
-                mock.insert_object(object.clone())?;
-                Ok(object.into())
-            }
-            _ => Err(crate::Error::BackendMismatch),
-        }
-    }
-
     pub(super) async fn list_objects(
         &self,
     ) -> Result<
@@ -803,22 +736,6 @@ impl DownloadableObject {
     }
 }
 
-pub struct UploadableObject<M, C> {
-    name_hint: Cow<'static, str>,
-    content: C,
-    metadata: Option<M>,
-}
-
-impl<M: MetadataSource, C: AsyncRead + Send + Unpin + 'static> UploadableObject<M, C> {
-    pub fn new(name_hint: impl Into<Cow<'static, str>>, content: C, metadata: Option<M>) -> Self {
-        Self {
-            name_hint: name_hint.into(),
-            content,
-            metadata,
-        }
-    }
-}
-
 #[self_referencing]
 struct IterHolder<K: 'static> {
     set: Arc<papaya::HashMap<K, ()>>,
@@ -885,37 +802,5 @@ impl Client {
             cache: self.cache.clone(),
             downloader: self.chunk_downloader.clone(),
         }))
-    }
-
-    #[inline]
-    pub async fn upload<M: MetadataSource, C: AsyncRead + Send + Unpin + 'static>(
-        &self,
-        uploadable_object: UploadableObject<M, C>,
-    ) -> Result<Object, crate::Error> {
-        let metadata = uploadable_object
-            .metadata
-            .as_ref()
-            .map(|m| match &self.backend {
-                #[cfg(feature = "indexd")]
-                Backend::Indexd(_) => Metadata::Indexd(m.to_bytes()),
-                #[cfg(feature = "renterd")]
-                Backend::Renterd(_) => Metadata::Renterd(m.to_map()),
-                #[cfg(feature = "mock")]
-                Backend::Mock(_) => Metadata::Mock(m.to_map()),
-            });
-
-        let object = self
-            .backend
-            .upload(
-                uploadable_object.name_hint,
-                uploadable_object.content,
-                metadata,
-            )
-            .await?;
-        self.cache
-            .insert_object(object.clone(), &self.backend)
-            .await?;
-        self.known_object_ids.pin().insert(object.id().clone(), ());
-        Ok(object)
     }
 }

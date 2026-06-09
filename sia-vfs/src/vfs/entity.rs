@@ -21,8 +21,9 @@ use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffse
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
 use sia_io::Client as Sia;
+use sia_io::object::Object as SiaObject;
 use sia_io::object::ObjectId as SiaObjectId;
-use sia_io::object::{Object as SiaObject, UploadableObject};
+use sia_io::upload::UploadableObject;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io::ErrorKind;
