@@ -6,21 +6,40 @@ use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::EntityKey;
 use crate::vfs::file::FileKind;
 use crate::vfs::{ROOT_INODE_ID, ReadWrite, Timestamp, Vfs};
+use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::time::Duration;
+
+const BACKOFF_INITIAL_DELAY: Duration = Duration::from_secs(2);
+const BACKOFF_MAX_DELAY: Duration = Duration::from_secs(60);
+const BACKOFF_MULTIPLIER: f64 = 1.5;
 
 pub struct PushTask {
     vfs: Vfs<ReadWrite>,
+    max_attempts: usize,
 }
 
 impl PushTask {
-    pub(crate) fn new(vfs: Vfs<ReadWrite>) -> Self {
-        Self { vfs }
+    pub(crate) fn new(vfs: Vfs<ReadWrite>, max_attempts: NonZeroUsize) -> Self {
+        Self {
+            vfs,
+            max_attempts: max_attempts.get(),
+        }
     }
     pub(crate) fn vfs(&self) -> &Vfs<ReadWrite> {
         &self.vfs
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
+        let res = self._run().await;
+        // clean up
+        let mut tx = self.vfs.tx_rw().await?;
+        tx.clear_sync_job().await?;
+        tx.commit().await?;
+        res
+    }
+
+    async fn _run(&mut self) -> Result<(), Error> {
         let mut tx = self.vfs.tx_rw().await?;
         tx.clear_sync_job().await?;
         if !tx.has_push_items().await? {
@@ -44,19 +63,15 @@ impl PushTask {
         }
 
         self.process_queue().await?;
-
-        // clean up
-        let mut tx = self.vfs.tx_rw().await?;
-        tx.clear_sync_job().await?;
-        tx.commit().await?;
-
         Ok(())
     }
 
     async fn process_queue(&mut self) -> Result<(), Error> {
+        let mut attempt = 0;
+
         loop {
             let mut tx = self.vfs.tx().await?;
-            if let Err(err) = match tx.next_sync_item().await {
+            let result = match tx.next_sync_item().await {
                 Ok(Some(JobItem::Chunk(chunk_id))) => self.process_chunk(chunk_id, tx).await,
                 Ok(Some(JobItem::Blob(blob_id))) => self.process_blob(blob_id, tx).await,
                 Ok(Some(JobItem::Entity(key, entity_type))) => match entity_type {
@@ -67,9 +82,25 @@ impl PushTask {
                     return Ok(());
                 }
                 Err(err) => Err(err.into()),
-            } {
-                //todo: log error & back off
-                eprintln!("{:?}", err);
+            };
+
+            match result {
+                Ok(()) => {
+                    attempt = 0;
+                }
+                Err(err) => {
+                    attempt += 1;
+                    eprintln!("process_queue error (attempt {}): {:?}", attempt, err); //todo: logging
+
+                    if attempt >= self.max_attempts {
+                        return Err(Error::TooManyErrors);
+                    }
+
+                    let delay_ms = (BACKOFF_INITIAL_DELAY.as_millis() as f64
+                        * BACKOFF_MULTIPLIER.powi(attempt as i32 - 1))
+                    .min(BACKOFF_MAX_DELAY.as_millis() as f64);
+                    tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                }
             }
         }
     }
@@ -222,6 +253,7 @@ mod tests {
     use crate::sync::push::PushTask;
     use crate::vfs::tests::new_vfs;
     use futures_util::AsyncWriteExt;
+    use std::num::NonZeroUsize;
 
     #[tokio::test]
     async fn basic_push() -> anyhow::Result<()> {
@@ -239,7 +271,7 @@ mod tests {
         fh.write_all(b"This is a test").await?;
         fh.commit().await?;
 
-        let mut task = PushTask::new(vfs.clone());
+        let mut task = PushTask::new(vfs.clone(), NonZeroUsize::new(10).unwrap());
         task.run().await?;
 
         let file = vfs.inode_by_id(file.inode_id()).await?.unwrap();

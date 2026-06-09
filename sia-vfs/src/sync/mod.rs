@@ -28,4 +28,6 @@ pub enum Error {
     BlobError(#[from] BlobError),
     #[error(transparent)]
     DbError(#[from] DbError),
+    #[error("too many errors")]
+    TooManyErrors,
 }
