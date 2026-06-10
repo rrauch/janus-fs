@@ -54,11 +54,9 @@ impl Drop for Syncer {
 }
 
 impl Syncer {
-    pub(crate) fn new<Mode: Send + 'static>(
+    pub(crate) fn new<Mode: Send + Sync + 'static>(
         sync_frequency: Duration,
         initial_sync_delay: Duration,
-        max_attempts: NonZeroUsize,
-        max_concurrency: NonZeroUsize,
     ) -> (Self, oneshot::Sender<Vfs<Mode>>)
     where
         Vfs<Mode>: Syncee,
@@ -74,7 +72,7 @@ impl Syncer {
             };
             tokio::time::sleep(initial_sync_delay).await;
             loop {
-                if let Err(err) = vfs.sync(max_attempts, max_concurrency).await {
+                if let Err(err) = vfs.sync().await {
                     //todo: logging
                     eprintln!("{}", err);
                 }
@@ -86,31 +84,23 @@ impl Syncer {
 }
 
 #[async_trait]
-pub trait Syncee {
-    async fn sync(
-        &self,
-        max_attempts: NonZeroUsize,
-        max_concurrency: NonZeroUsize,
-    ) -> Result<(), Error>;
+pub(crate) trait Syncee {
+    async fn sync(&self) -> Result<(), Error>;
 }
 
 #[async_trait]
 impl Syncee for Vfs<ReadWrite> {
-    async fn sync(
-        &self,
-        max_attempts: NonZeroUsize,
-        max_concurrency: NonZeroUsize,
-    ) -> Result<(), Error> {
-        push(self.clone(), max_attempts).await?;
-        pull(self.clone(), max_concurrency).await?;
+    async fn sync(&self) -> Result<(), Error> {
+        push(self.clone(), self.max_sync_attempts()).await?;
+        pull(self.clone(), self.max_sync_concurrency()).await?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl Syncee for Vfs<ReadOnly> {
-    async fn sync(&self, _: NonZeroUsize, max_concurrency: NonZeroUsize) -> Result<(), Error> {
-        pull(self.clone(), max_concurrency).await?;
+    async fn sync(&self) -> Result<(), Error> {
+        pull(self.clone(), self.max_sync_concurrency()).await?;
         Ok(())
     }
 }
@@ -125,4 +115,13 @@ pub(crate) async fn pull<Mode>(vfs: Vfs<Mode>, max_concurrency: NonZeroUsize) ->
     let _permit = SYNC_SEMAPHORE.acquire().await.expect("semaphore closed");
     let mut task = PullTask::new(vfs, max_concurrency);
     task.run().await
+}
+
+impl<Mode> Vfs<Mode>
+where
+    Self: Syncee,
+{
+    pub async fn sync(&self) -> Result<(), Error> {
+        <Self as Syncee>::sync(self).await
+    }
 }

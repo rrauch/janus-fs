@@ -485,7 +485,7 @@ impl<T: EntityHandler> DerefMut for InodeMut<T> {
 pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 
 #[bon::bon]
-impl<Mode: Send + 'static> Vfs<Mode>
+impl<Mode: Send + Sync + 'static> Vfs<Mode>
 where
     Vfs<Mode>: Syncee,
 {
@@ -517,12 +517,7 @@ where
         //todo: check that PageSize & max_chunk_size align
 
         let reaper = Reaper::new(db.clone());
-        let (syncer, syncer_tx) = Syncer::new(
-            sync_frequency,
-            initial_sync_delay,
-            max_sync_attempts,
-            max_sync_concurrency,
-        );
+        let (syncer, syncer_tx) = Syncer::new(sync_frequency, initial_sync_delay);
 
         let this = Self(
             Arc::new(Inner {
@@ -534,6 +529,8 @@ where
                 file_write_locks: FileWriteLocks::new(),
                 sia_client,
                 syncer,
+                max_sync_attempts,
+                max_sync_concurrency,
             }),
             PhantomData,
         );
@@ -554,6 +551,8 @@ struct Inner {
     file_write_locks: FileWriteLocks,
     sia_client: Arc<Sia>,
     syncer: Syncer,
+    max_sync_attempts: NonZeroUsize,
+    max_sync_concurrency: NonZeroUsize,
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -591,6 +590,14 @@ impl<Mode> Vfs<Mode> {
 
     pub(crate) fn max_chunk_size(&self) -> usize {
         self.0.max_chunk_size
+    }
+
+    pub(crate) fn max_sync_attempts(&self) -> NonZeroUsize {
+        self.0.max_sync_attempts
+    }
+
+    pub(crate) fn max_sync_concurrency(&self) -> NonZeroUsize {
+        self.0.max_sync_concurrency
     }
 }
 
