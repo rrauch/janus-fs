@@ -1023,6 +1023,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elsa"
+version = "1.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9abf33c656a7256451ebb7d0082c5a471820c31269e49d807c538c252352186e"
+dependencies = [
+ "stable_deref_trait",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3588,6 +3597,7 @@ dependencies = [
  "chrono",
  "derive-where",
  "dotenv",
+ "elsa",
  "flatbuffers",
  "flatbuffers-build",
  "futures-channel",

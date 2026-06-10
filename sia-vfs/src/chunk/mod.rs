@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
 use sia_io::Client as Sia;
-use sia_io::object::ObjectId as SiaObjectId;
+use sia_io::object::{Object as SiaObject, ObjectId as SiaObjectId};
 use sia_io::upload::UploadableObject;
 use std::io::ErrorKind;
 use std::ops::Deref;
@@ -200,33 +200,37 @@ impl<Mode> PullTask<Mode> {
 }
 
 impl PushTask {
-    pub(crate) async fn process_chunk<TX: TxScope>(
+    pub(crate) async fn prepare_chunk<TX: TxScope>(
         &mut self,
         chunk_id: ChunkId,
-        mut tx: Transaction<TX>,
-    ) -> Result<(), Error>
+        tx: &mut Transaction<TX>,
+    ) -> Result<Option<Chunk>, Error>
     where
-        Transaction<TX>: crate::db::Read,
+        Transaction<TX>: crate::db::Write,
     {
+        tx.mark_sync_job_chunk_pending(&chunk_id).await?;
+
         // double-check the chunk is still local
         if !tx.is_chunk_local(&chunk_id).await? {
             // has been synced since last check
-            return Ok(());
+            tx.remove_sync_job_chunk(&chunk_id).await?;
+            return Ok(None);
         }
 
-        let chunk = tx
-            .chunk_by_id(&chunk_id)
-            .await?
-            .ok_or_else(|| crate::db::Error::from(DataError::ChunkNotFound(chunk_id)))?;
-        drop(tx);
+        Ok(Some(tx.chunk_by_id(&chunk_id).await?.ok_or_else(|| {
+            crate::db::Error::from(DataError::ChunkNotFound(chunk_id))
+        })?))
+    }
 
-        let object = self
-            .vfs()
-            .sia_client()
-            .upload(chunk.to_uploadable_object(self.vfs().id()))
-            .await?;
-
-        let mut tx = self.vfs().tx_rw().await?;
+    pub(crate) async fn process_chunk<TX: TxScope>(
+        &mut self,
+        chunk: &Chunk,
+        object: SiaObject,
+        tx: &mut Transaction<TX>,
+    ) -> Result<(), Error>
+    where
+        Transaction<TX>: crate::db::Write,
+    {
         let remote_location = object.id().to_string();
         let object_id = match tx
             .create_or_mark_object(remote_location.as_str(), Timestamp::now())
@@ -236,9 +240,8 @@ impl PushTask {
             ObjectCreateResult::Existing(o) => o.id().clone(),
         };
 
-        tx.register_remote_chunk(&chunk_id, object_id).await?;
-        tx.remove_sync_job_chunk(&chunk_id).await?;
-        tx.commit().await?;
+        tx.register_remote_chunk(chunk.id(), object_id).await?;
+        tx.remove_sync_job_chunk(chunk.id()).await?;
         Ok(())
     }
 
@@ -451,6 +454,28 @@ where
         let chunk_id = chunk_id.as_slice();
         let affected_rows = sqlx::query!(
             "DELETE FROM sync_job_queue WHERE type = 'C' AND chunk_id = ?",
+            chunk_id
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if affected_rows != 1 {
+            Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: affected_rows,
+            })?
+        }
+        Ok(())
+    }
+
+    async fn mark_sync_job_chunk_pending(
+        &mut self,
+        chunk_id: &ChunkId,
+    ) -> Result<(), crate::db::Error> {
+        let chunk_id = chunk_id.as_slice();
+        let affected_rows = sqlx::query!(
+            "UPDATE sync_job_queue SET pending = 1 WHERE type = 'C' AND chunk_id = ? AND pending = 0",
             chunk_id
         )
         .execute(self.conn())

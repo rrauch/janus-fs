@@ -7,6 +7,7 @@ use crate::blob::BlobError;
 use crate::db::Error as DbError;
 use crate::vfs::VfsError;
 use crate::vfs::entity::EntityError;
+use sia_io::upload::UploadError;
 use thiserror::Error;
 
 pub(crate) const METADATA_VFS_VERSION: &'static str = "SIA-VFS";
@@ -16,6 +17,8 @@ pub(crate) const METADATA_VFS_ID: &'static str = "VFS-ID";
 pub enum Error {
     #[error(transparent)]
     VfsError(#[from] VfsError),
+    #[error(transparent)]
+    UploadError(#[from] UploadError),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]

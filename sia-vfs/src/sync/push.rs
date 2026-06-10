@@ -1,11 +1,13 @@
-use crate::blob::BlobId;
-use crate::chunk::ChunkId;
+use crate::blob::{Blob, BlobId};
+use crate::chunk::{Chunk, ChunkId};
 use crate::db::{DataError, Error as DbError, Read, Transaction, TxScope, Write};
 use crate::sync::Error;
 use crate::vfs::directory::DirectoryKind;
-use crate::vfs::entity::EntityKey;
+use crate::vfs::entity::{EntityKey, LocalEntity};
 use crate::vfs::file::FileKind;
-use crate::vfs::{ROOT_INODE_ID, ReadWrite, Timestamp, Vfs};
+use crate::vfs::{ROOT_INODE_ID, ReadWrite, Timestamp, Vfs, VfsId};
+use elsa::FrozenVec;
+use sia_io::upload::{MultiUploader, UploadError};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::time::Duration;
@@ -17,6 +19,28 @@ const BACKOFF_MULTIPLIER: f64 = 1.5;
 pub struct PushTask {
     vfs: Vfs<ReadWrite>,
     max_attempts: usize,
+}
+
+enum Pending {
+    Chunk(Chunk),
+    Blob(Blob),
+    File(LocalEntity<FileKind>),
+    Dir(LocalEntity<DirectoryKind>),
+}
+
+impl Pending {
+    async fn enqueue<'a>(
+        &'a self,
+        vfs_id: &VfsId,
+        uploader: &mut MultiUploader<'a>,
+    ) -> Result<(), UploadError> {
+        match self {
+            Self::Chunk(c) => uploader.enqueue(c.to_uploadable_object(vfs_id)).await,
+            Self::Blob(b) => uploader.enqueue(b.to_uploadable_object(vfs_id)).await,
+            Self::File(f) => uploader.enqueue(f.to_uploadable_object(vfs_id)).await,
+            Self::Dir(d) => uploader.enqueue(d.to_uploadable_object(vfs_id)).await,
+        }
+    }
 }
 
 impl PushTask {
@@ -70,24 +94,8 @@ impl PushTask {
         let mut attempt = 0;
 
         loop {
-            let mut tx = self.vfs.tx().await?;
-            let result = match tx.next_sync_item().await {
-                Ok(Some(JobItem::Chunk(chunk_id))) => self.process_chunk(chunk_id, tx).await,
-                Ok(Some(JobItem::Blob(blob_id))) => self.process_blob(blob_id, tx).await,
-                Ok(Some(JobItem::Entity(key, entity_type))) => match entity_type {
-                    EntityType::File => self.process_entity::<FileKind, _>(key, tx).await,
-                    EntityType::Dir => self.process_entity::<DirectoryKind, _>(key, tx).await,
-                },
-                Ok(None) => {
-                    return Ok(());
-                }
-                Err(err) => Err(err.into()),
-            };
-
-            match result {
-                Ok(()) => {
-                    attempt = 0;
-                }
+            match self._process_queue().await {
+                Ok(()) => return Ok(()),
                 Err(err) => {
                     attempt += 1;
                     eprintln!("process_queue error (attempt {}): {:?}", attempt, err); //todo: logging
@@ -102,6 +110,91 @@ impl PushTask {
                     tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
                 }
             }
+        }
+    }
+
+    async fn next_queue_item<TX: TxScope>(
+        &mut self,
+        tx: &mut Transaction<TX>,
+        max_estimated_size: Option<u64>,
+    ) -> Result<Option<Pending>, Error>
+    where
+        Transaction<TX>: Write,
+    {
+        Ok(match tx.next_sync_item(max_estimated_size).await? {
+            Some(JobItem::Chunk(id)) => self.prepare_chunk(id, tx).await?.map(Pending::Chunk),
+            Some(JobItem::Blob(id)) => self.prepare_blob(id, tx).await?.map(Pending::Blob),
+            Some(JobItem::Entity(key, EntityType::File)) => self
+                .prepare_entity::<FileKind, _>(key, tx)
+                .await?
+                .map(Pending::File),
+            Some(JobItem::Entity(key, EntityType::Dir)) => self
+                .prepare_entity::<DirectoryKind, _>(key, tx)
+                .await?
+                .map(Pending::Dir),
+            None => None,
+        })
+    }
+
+    async fn _process_queue(&mut self) -> Result<(), Error> {
+        let mut tx = self.vfs.tx_rw().await?;
+        tx.reset_pending_job_items().await?;
+        tx.commit().await?;
+
+        let mut pending = FrozenVec::new();
+        let mut uploader = self.vfs.sia_client().prepare_multi_upload();
+        let vfs_id = self.vfs.id().clone();
+
+        loop {
+            let mut tx = self.vfs.tx_rw().await?;
+            while !uploader.is_full() {
+                let item = self
+                    .next_queue_item(&mut tx, Some(uploader.space_remaining()))
+                    .await?;
+
+                if let Some(item) = item {
+                    let r = pending.push_get(Box::new(item));
+                    r.enqueue(&vfs_id, &mut uploader).await?;
+                } else {
+                    if uploader.is_empty() {
+                        // Uploader is empty but no item fits the size budget. Take the next item
+                        // regardless of size to avoid stalling on oversized items.
+                        if let Some(item) = self.next_queue_item(&mut tx, None).await? {
+                            let r = pending.push_get(Box::new(item));
+                            r.enqueue(&vfs_id, &mut uploader).await?;
+                        }
+                    }
+                    break;
+                }
+            }
+            tx.commit().await?;
+
+            if uploader.is_empty() {
+                return Ok(());
+            }
+
+            let objects = uploader.process().await?;
+            let items = std::mem::take(&mut pending).into_vec();
+            assert_eq!(objects.len(), items.len());
+            let mut tx = self.vfs.tx_rw().await?;
+            for (item, object) in items.into_iter().zip(objects) {
+                match item.as_ref() {
+                    Pending::Chunk(chunk) => {
+                        self.process_chunk(chunk, object, &mut tx).await?;
+                    }
+                    Pending::Blob(blob) => {
+                        self.process_blob(blob.clone(), object, &mut tx).await?;
+                    }
+                    Pending::File(file) => {
+                        self.process_entity(file.clone(), object, &mut tx).await?;
+                    }
+                    Pending::Dir(dir) => {
+                        self.process_entity(dir.clone(), object, &mut tx).await?;
+                    }
+                }
+            }
+            tx.commit().await?;
+            uploader = self.vfs.sia_client().prepare_multi_upload();
         }
     }
 
@@ -139,13 +232,22 @@ impl<C: TxScope> Transaction<C>
 where
     Self: Read,
 {
-    async fn next_sync_item(&mut self) -> Result<Option<JobItem>, DbError> {
+    async fn next_sync_item(
+        &mut self,
+        max_estimated_size: Option<u64>,
+    ) -> Result<Option<JobItem>, DbError> {
+        let max_estimated_size = max_estimated_size
+            .unwrap_or(u64::MAX)
+            .try_into()
+            .unwrap_or(i64::MAX);
+
         Ok(
             match sqlx::query!(
-                "SELECT id, type FROM sync_job_queue ORDER BY estimated_size DESC LIMIT 1"
+                "SELECT id, type FROM sync_job_queue WHERE pending = 0 AND estimated_size <= ? ORDER BY estimated_size DESC LIMIT 1",
+                max_estimated_size,
             )
-            .fetch_optional(self.conn())
-            .await?
+                .fetch_optional(self.conn())
+                .await?
             {
                 None => None,
                 Some(r) => {
@@ -187,6 +289,13 @@ where
 {
     async fn clear_sync_job(&mut self) -> Result<(), DbError> {
         let _ = sqlx::query!("DELETE FROM sync_job")
+            .execute(self.conn())
+            .await?;
+        Ok(())
+    }
+
+    async fn reset_pending_job_items(&mut self) -> Result<(), DbError> {
+        let _ = sqlx::query!("UPDATE sync_job_queue SET pending = 0 WHERE pending != 0")
             .execute(self.conn())
             .await?;
         Ok(())
@@ -271,7 +380,7 @@ mod tests {
         fh.write_all(b"This is a test").await?;
         fh.commit().await?;
 
-        let mut task = PushTask::new(vfs.clone(), NonZeroUsize::new(10).unwrap());
+        let mut task = PushTask::new(vfs.clone(), NonZeroUsize::new(1).unwrap());
         task.run().await?;
 
         let file = vfs.inode_by_id(file.inode_id()).await?.unwrap();

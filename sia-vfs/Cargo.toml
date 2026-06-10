@@ -23,6 +23,7 @@ chrono = "0.4"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
 flatbuffers = "=25.12.19"
 lz4_flex = { version = "0.13", optional = true }
+elsa = "1.11"
 futures-channel = "0.3"
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }

@@ -758,14 +758,16 @@ impl<Mode> PullTask<Mode> {
 }
 
 impl PushTask {
-    pub(crate) async fn process_entity<E: EntityHandler, TX: TxScope>(
+    pub(crate) async fn prepare_entity<E: EntityHandler, TX: TxScope>(
         &mut self,
         entity_key: EntityKey,
-        mut tx: Transaction<TX>,
-    ) -> Result<(), Error>
+        tx: &mut Transaction<TX>,
+    ) -> Result<Option<LocalEntity<E>>, Error>
     where
-        Transaction<TX>: DbRead,
+        Transaction<TX>: DbWrite,
     {
+        tx.mark_sync_job_entity_pending(&entity_key).await?;
+
         let entity = match tx
             .entity_by_key::<E>(&entity_key)
             .await?
@@ -773,19 +775,24 @@ impl PushTask {
         {
             Entity::Synced(_) => {
                 // already synced
-                return Ok(());
+                tx.remove_sync_job_entity(&entity_key).await?;
+                return Ok(None);
             }
             Entity::Local(entity) => entity,
         };
-        drop(tx);
 
-        let object = self
-            .vfs()
-            .sia_client()
-            .upload(entity.to_uploadable_object(self.vfs().id()))
-            .await?;
+        Ok(Some(entity))
+    }
 
-        let mut tx = self.vfs().tx_rw().await?;
+    pub(crate) async fn process_entity<E: EntityHandler, TX: TxScope>(
+        &mut self,
+        entity: LocalEntity<E>,
+        object: SiaObject,
+        tx: &mut Transaction<TX>,
+    ) -> Result<(), Error>
+    where
+        Transaction<TX>: DbWrite,
+    {
         let remote_location = object.id().to_string();
         let object_id = match tx
             .create_or_mark_object(remote_location.as_str(), Timestamp::now())
@@ -794,11 +801,10 @@ impl PushTask {
             ObjectCreateResult::New(oid) => oid,
             ObjectCreateResult::Existing(o) => o.id().clone(),
         };
-
+        let entity_key = EntityKey::new(entity.entity_id().clone(), entity.revision().clone());
         let entity = entity.into_synced(object_id);
         tx.register_entity(entity).await?;
         tx.remove_sync_job_entity(&entity_key).await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -1029,6 +1035,31 @@ where
         .execute(self.conn())
         .await?
         .rows_affected();
+
+        if affected_rows != 1 {
+            Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: affected_rows,
+            })?
+        }
+        Ok(())
+    }
+
+    async fn mark_sync_job_entity_pending(
+        &mut self,
+        entity_key: &EntityKey,
+    ) -> Result<(), DbError> {
+        let entity_id = entity_key.id().as_slice();
+        let entity_rev = entity_key.revision().as_slice();
+
+        let affected_rows = sqlx::query!(
+            "UPDATE sync_job_queue SET pending = 1 WHERE type = 'E' AND entity_id = ? AND entity_rev = ? AND pending = 0",
+            entity_id,
+            entity_rev
+        )
+            .execute(self.conn())
+            .await?
+            .rows_affected();
 
         if affected_rows != 1 {
             Err(DataError::UnexpectedAffectedRows {

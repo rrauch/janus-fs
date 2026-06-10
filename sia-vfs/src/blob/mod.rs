@@ -253,14 +253,16 @@ impl<Mode> PullTask<Mode> {
 }
 
 impl PushTask {
-    pub(crate) async fn process_blob<TX: TxScope>(
+    pub(crate) async fn prepare_blob<TX: TxScope>(
         &mut self,
         blob_id: BlobId,
-        mut tx: Transaction<TX>,
-    ) -> Result<(), Error>
+        tx: &mut Transaction<TX>,
+    ) -> Result<Option<Blob>, Error>
     where
-        Transaction<TX>: crate::db::Read,
+        Transaction<TX>: crate::db::Write,
     {
+        tx.mark_sync_job_blob_pending(&blob_id).await?;
+
         let blob = tx
             .blob_by_id(&blob_id)
             .await?
@@ -268,17 +270,22 @@ impl PushTask {
 
         if let StorageMode::Synced(_) = &blob.mode() {
             // no need to sync
-            return Ok(());
+            tx.remove_sync_job_blob(blob.id()).await?;
+            Ok(None)
+        } else {
+            Ok(Some(blob))
         }
-        drop(tx);
+    }
 
-        let object = self
-            .vfs()
-            .sia_client()
-            .upload(blob.to_uploadable_object(self.vfs().id()))
-            .await?;
-
-        let mut tx = self.vfs().tx_rw().await?;
+    pub(crate) async fn process_blob<TX: TxScope>(
+        &mut self,
+        blob: Blob,
+        object: SiaObject,
+        tx: &mut Transaction<TX>,
+    ) -> Result<(), Error>
+    where
+        Transaction<TX>: crate::db::Write,
+    {
         let remote_location = object.id().to_string();
         let object_id = match tx
             .create_or_mark_object(remote_location.as_str(), Timestamp::now())
@@ -291,7 +298,6 @@ impl PushTask {
         let blob = blob.into_synced(object_id);
         tx.register_blob(&blob).await?;
         tx.remove_sync_job_blob(blob.id()).await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -472,6 +478,28 @@ where
         let blob_id = blob_id.as_slice();
         let affected_rows = sqlx::query!(
             "DELETE FROM sync_job_queue WHERE type = 'B' AND blob_id = ?",
+            blob_id
+        )
+        .execute(self.conn())
+        .await?
+        .rows_affected();
+
+        if affected_rows != 1 {
+            Err(DataError::UnexpectedAffectedRows {
+                expected: 1,
+                actual: affected_rows,
+            })?
+        }
+        Ok(())
+    }
+
+    async fn mark_sync_job_blob_pending(
+        &mut self,
+        blob_id: &BlobId,
+    ) -> Result<(), crate::db::Error> {
+        let blob_id = blob_id.as_slice();
+        let affected_rows = sqlx::query!(
+            "UPDATE sync_job_queue SET pending = 1 WHERE type = 'B' AND blob_id = ? AND pending = 0",
             blob_id
         )
         .execute(self.conn())

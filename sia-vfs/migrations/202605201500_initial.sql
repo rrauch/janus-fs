@@ -801,6 +801,7 @@ CREATE TABLE sync_job_queue
     entity_id      BLOB,
     entity_rev     BLOB,
     estimated_size INTEGER NOT NULL CHECK (estimated_size > 0),
+    pending        INTEGER NOT NULL DEFAULT 0 CHECK (pending IN (0, 1)),
 
     FOREIGN KEY (entity_id, entity_rev) REFERENCES entity (id, revision),
     UNIQUE (entity_id, entity_rev),
@@ -813,7 +814,7 @@ CREATE TABLE sync_job_queue
 );
 
 CREATE TRIGGER sync_job_queue_no_updates
-    BEFORE UPDATE
+    BEFORE UPDATE OF id, type, blob_id, chunk_id, entity_id, entity_rev, estimated_size
     ON sync_job_queue
     FOR EACH ROW
 BEGIN
