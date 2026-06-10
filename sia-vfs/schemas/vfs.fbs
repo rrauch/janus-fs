@@ -1,0 +1,49 @@
+include "content_id.fbs";
+
+namespace entity;
+
+struct ContentId {
+  bytes: [ubyte:32];
+}
+
+struct Uuid {
+  bytes: [ubyte:16];
+}
+
+table File {
+  len: uint64;
+  blob_id: common.ContentId (required);
+}
+
+struct DirectoryEntry {
+  id: Uuid;
+  revision: common.ContentId;
+}
+
+table Directory {
+  entries: [DirectoryEntry];
+}
+
+union EntityBody { File, Directory }
+
+table Entity {
+  id: Uuid (required);
+  name: string (required);
+  created: int64;
+  last_modified: int64;
+  body: EntityBody (required);
+}
+
+namespace blob;
+
+struct Chunk {
+  offset: uint64;
+  len: uint64;
+  chunk_id: common.ContentId;
+  chunk_offset: uint64;
+}
+
+table Blob {
+    len: uint64;
+    chunks: [Chunk];
+}

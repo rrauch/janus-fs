@@ -1,0 +1,54 @@
+[package]
+name = "sia-vfs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["indexd", "lz4", "renterd", "zstd"]
+indexd = ["sia-io/indexd"]
+lz4 = ["dep:lz4_flex"]
+renterd = ["sia-io/renterd"]
+zstd = ["dep:zstd"]
+
+[dependencies]
+sia-io = { path = "../sia-io", default-features = false }
+
+async-trait = "0.1"
+blake3 = "1.8"
+bon = "3.9"
+bytemuck = { version = "1.25", features = ["derive"] }
+bytes = "1"
+bytesize = "2.3"
+chrono = "0.4"
+derive-where = { version = "1.6", features = ["zeroize", "serde"] }
+flatbuffers = "=25.12.19"
+lz4_flex = { version = "0.13", optional = true }
+elsa = "1.11"
+futures-channel = "0.3"
+futures-io = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
+moka = { version = "0.12", features = ["future"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
+thiserror = "2"
+tokio = { version = "1.51", features = ["rt", "sync"] }
+tracing = "0.1"
+twox-hash = { version = "2.1", features = ["xxhash3_64", "std"] }
+typed-path = "0.12"
+uuid = { version = "1.23", features = ["v7", "bytemuck"] }
+yoke = "0.8"
+zstd = { version = "0.13", optional = true }
+
+[dev-dependencies]
+sia-io = { path = "../sia-io", default-features = false, features = ["mock"] }
+
+anyhow = "1.0"
+dotenv = "0.15"
+tempfile = "3"
+tokio = { version = "1.51", features = ["full"] }
+tracing-subscriber = "0.3"
+
+[build-dependencies]
+anyhow = { workspace = true }
+flatbuffers-build = { version = "=0.2.4", features = ["vendored"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+tokio = { workspace = true, features = ["full"] }

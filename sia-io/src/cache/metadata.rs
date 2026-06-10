@@ -150,6 +150,10 @@ impl Cache {
                 Object::Renterd { inner, .. } => {
                     l2.insert_renterd_object(inner.as_ref().clone()).await?;
                 }
+                #[cfg(feature = "mock")]
+                Object::Mock { .. } => {
+                    // do nothing
+                }
             }
         }
         self.0.metadata.l1.insert(object.id().clone(), object).await;
@@ -166,6 +170,10 @@ impl Cache {
                 #[cfg(feature = "renterd")]
                 ObjectId::Renterd(id) => {
                     l2.invalidate_renterd_object(id).await?;
+                }
+                #[cfg(feature = "mock")]
+                ObjectId::Mock(_) => {
+                    // do nothing
                 }
             }
         }
@@ -200,6 +208,8 @@ async fn retrieve_object<L2: L2MetadataCache>(
                 .transpose()?,
             #[cfg(feature = "renterd")]
             ObjectId::Renterd(id) => l2.get_renterd_object(id).await?.map(|o| o.into()),
+            #[cfg(feature = "mock")]
+            ObjectId::Mock(_) => None,
         }
     } else {
         None
@@ -227,6 +237,10 @@ async fn retrieve_object<L2: L2MetadataCache>(
             #[cfg(feature = "renterd")]
             Object::Renterd { inner, .. } => {
                 l2.insert_renterd_object(inner.as_ref().clone()).await?;
+            }
+            #[cfg(feature = "mock")]
+            Object::Mock { .. } => {
+                // do nothing
             }
         }
     }
