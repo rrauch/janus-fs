@@ -11,6 +11,7 @@ use crate::db::{
     ReadWrite as DbReadWrite, Transaction, TxScope, Write as DbWrite,
 };
 use crate::object::ObjectId;
+use crate::sync::{Syncee, Syncer};
 use crate::vfs::cache::{Cache, CacheSettings};
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
@@ -26,10 +27,12 @@ use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use twox_hash::XxHash3_64;
 
@@ -482,7 +485,10 @@ impl<T: EntityHandler> DerefMut for InodeMut<T> {
 pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
 
 #[bon::bon]
-impl<Mode> Vfs<Mode> {
+impl<Mode: Send + 'static> Vfs<Mode>
+where
+    Vfs<Mode>: Syncee,
+{
     #[builder(derive(Debug))]
     pub async fn new(
         vfs_id: VfsId,
@@ -492,6 +498,10 @@ impl<Mode> Vfs<Mode> {
         #[builder(default = 25)] max_db_connections: u8,
         #[builder(default)] cache_settings: CacheSettings,
         #[builder(default = 64 * 1024)] max_chunk_size: usize,
+        #[builder(default = Duration::from_secs(300))] sync_frequency: Duration,
+        #[builder(default = Duration::from_secs(10))] initial_sync_delay: Duration,
+        #[builder(default = NonZeroUsize::new(10).unwrap())] max_sync_attempts: NonZeroUsize,
+        #[builder(default = NonZeroUsize::new(10).unwrap())] max_sync_concurrency: NonZeroUsize,
     ) -> Result<Self, VfsError> {
         let cache = Cache::new(&cache_settings);
         let sia_client = Arc::new(sia_client);
@@ -507,8 +517,14 @@ impl<Mode> Vfs<Mode> {
         //todo: check that PageSize & max_chunk_size align
 
         let reaper = Reaper::new(db.clone());
+        let (syncer, syncer_tx) = Syncer::new(
+            sync_frequency,
+            initial_sync_delay,
+            max_sync_attempts,
+            max_sync_concurrency,
+        );
 
-        Ok(Self(
+        let this = Self(
             Arc::new(Inner {
                 vfs_id,
                 db,
@@ -517,13 +533,14 @@ impl<Mode> Vfs<Mode> {
                 dead_fh_reaper: reaper,
                 file_write_locks: FileWriteLocks::new(),
                 sia_client,
+                syncer,
             }),
             PhantomData,
-        ))
-    }
+        );
 
-    pub fn id(&self) -> &VfsId {
-        &self.0.vfs_id
+        syncer_tx.send(this.clone()).expect("syncer to be alive");
+
+        Ok(this)
     }
 }
 
@@ -536,6 +553,7 @@ struct Inner {
     dead_fh_reaper: Reaper,
     file_write_locks: FileWriteLocks,
     sia_client: Arc<Sia>,
+    syncer: Syncer,
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -551,6 +569,10 @@ impl Read for ReadWrite {}
 impl Write for ReadWrite {}
 
 impl<Mode> Vfs<Mode> {
+    pub fn id(&self) -> &VfsId {
+        &self.0.vfs_id
+    }
+
     pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
         Ok(self.0.db.read().await?)
     }
@@ -854,6 +876,7 @@ pub(crate) mod tests {
                 .sia_client(sia_client)
                 .db_file(path)
                 .vfs_id(vfs_id)
+                .initial_sync_delay(Duration::from_secs(u64::MAX))
                 .build()
                 .await?,
             temp_dir,

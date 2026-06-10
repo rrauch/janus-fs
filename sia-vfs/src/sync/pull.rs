@@ -18,7 +18,7 @@ pub struct PullTask<Mode> {
 }
 
 impl<Mode> PullTask<Mode> {
-    pub(crate) fn new(vfs: Vfs<Mode>, max_concurrency: NonZeroUsize) -> Self {
+    pub(super) fn new(vfs: Vfs<Mode>, max_concurrency: NonZeroUsize) -> Self {
         Self {
             vfs,
             max_concurrency: max_concurrency.get(),

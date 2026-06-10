@@ -172,7 +172,7 @@ pub enum Metadata<'a> {
     Mock(Cow<'a, HashMap<String, String>>),
 }
 
-pub trait MetadataSource {
+pub trait MetadataSource: Send {
     fn to_bytes(&self) -> Cow<'_, [u8]>;
     fn to_map(&self) -> Cow<'_, HashMap<String, String>>;
 }

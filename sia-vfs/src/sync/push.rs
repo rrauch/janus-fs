@@ -44,7 +44,7 @@ impl Pending {
 }
 
 impl PushTask {
-    pub(crate) fn new(vfs: Vfs<ReadWrite>, max_attempts: NonZeroUsize) -> Self {
+    pub(super) fn new(vfs: Vfs<ReadWrite>, max_attempts: NonZeroUsize) -> Self {
         Self {
             vfs,
             max_attempts: max_attempts.get(),
