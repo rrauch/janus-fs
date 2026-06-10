@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::chunk::ChunkDownloader;
 use crate::scheduler::Scheduler;
+use crate::upload::UploadError;
 #[cfg(feature = "indexd")]
 pub use sia_storage::SealedObject;
 
@@ -27,11 +28,14 @@ pub mod chunk;
 pub mod confidential;
 #[cfg(feature = "indexd")]
 pub mod indexd;
+#[cfg(feature = "mock")]
+pub mod mock;
 pub mod object;
 #[cfg(feature = "renterd")]
 pub mod renterd;
 pub mod scheduler;
 pub(crate) mod tagged;
+pub mod upload;
 
 pub struct MimeTypeKind;
 pub type MimeType = TaggedValue<MimeTypeKind, String>;
@@ -141,6 +145,8 @@ pub(crate) enum Backend {
     Indexd(indexd::client::Client),
     #[cfg(feature = "renterd")]
     Renterd(renterd::client::Client),
+    #[cfg(feature = "mock")]
+    Mock(mock::MockClient),
 }
 
 #[cfg(feature = "indexd")]
@@ -162,6 +168,23 @@ pub enum Metadata<'a> {
     Indexd(Cow<'a, [u8]>),
     #[cfg(feature = "renterd")]
     Renterd(Cow<'a, HashMap<String, String>>),
+    #[cfg(feature = "mock")]
+    Mock(Cow<'a, HashMap<String, String>>),
+}
+
+pub trait MetadataSource: Send {
+    fn to_bytes(&self) -> Cow<'_, [u8]>;
+    fn to_map(&self) -> Cow<'_, HashMap<String, String>>;
+}
+
+impl<T: MetadataSource> MetadataSource for Box<T> {
+    fn to_bytes(&self) -> Cow<'_, [u8]> {
+        self.as_ref().to_bytes()
+    }
+
+    fn to_map(&self) -> Cow<'_, HashMap<String, String>> {
+        self.as_ref().to_map()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -172,6 +195,9 @@ pub enum Error {
     #[cfg(feature = "renterd")]
     #[error(transparent)]
     RenterdError(#[from] renterd::client::ClientError),
+    #[cfg(feature = "mock")]
+    #[error(transparent)]
+    MockError(#[from] mock::MockError),
     #[error("backend and input type mismatch")]
     BackendMismatch,
     #[error("cached error: {0}")]
@@ -182,6 +208,8 @@ pub enum Error {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     ConfigError(#[from] ConfigError),
+    #[error(transparent)]
+    UploadError(#[from] UploadError),
 }
 
 #[derive(Debug, Error)]
@@ -194,6 +222,7 @@ pub enum ConfigError {
     InvalidMaxConcurrentDownloads,
 }
 
+#[derive(Debug)]
 pub struct Client {
     backend: Backend,
     cache: Cache,
@@ -208,6 +237,18 @@ impl Drop for Client {
         if let Some(handle) = self.object_event_loop_handle.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(feature = "mock")]
+impl Client {
+    pub async fn mock() -> Self {
+        Self::builder()
+            .backend(Backend::Mock(mock::MockClient::default()))
+            .cache(Cache::default())
+            .build()
+            .await
+            .unwrap()
     }
 }
 
@@ -339,12 +380,27 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Backend, Client, indexd, renterd};
+    use crate::upload::UploadableObject;
+    use crate::{Client, MetadataSource, indexd, renterd};
     use futures_util::io::Cursor;
     use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};
+    use std::borrow::Cow;
+    use std::collections::HashMap;
     use std::io::SeekFrom;
 
     static ONE_MB: &[u8] = include_bytes!("../testdata/1mb.bin");
+
+    struct MockMetadata;
+
+    impl MetadataSource for MockMetadata {
+        fn to_bytes(&self) -> Cow<'_, [u8]> {
+            unimplemented!()
+        }
+
+        fn to_map(&self) -> Cow<'_, HashMap<String, String>> {
+            unimplemented!()
+        }
+    }
 
     #[ignore]
     #[tokio::test]
@@ -355,7 +411,7 @@ mod tests {
             .try_init();
         dotenv::dotenv().ok();
         let indexd = indexd::tests::connect().await?;
-        integration_test1(indexd).await?;
+        integration_test1(Client::builder().backend(indexd).build().await?).await?;
         Ok(())
     }
 
@@ -368,12 +424,22 @@ mod tests {
             .try_init();
         dotenv::dotenv().ok();
         let renterd = renterd::tests::new_client().await?;
-        integration_test1(renterd).await?;
+        integration_test1(Client::builder().backend(renterd).build().await?).await?;
         Ok(())
     }
 
-    async fn integration_test1(backend: impl Into<Backend>) -> Result<(), anyhow::Error> {
-        let client = Client::builder().backend(backend).build().await?;
+    #[tokio::test]
+    async fn mock_test1() -> Result<(), anyhow::Error> {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+        dotenv::dotenv().ok();
+        integration_test1(Client::mock().await).await?;
+        Ok(())
+    }
+
+    async fn integration_test1(client: Client) -> Result<(), anyhow::Error> {
         assert!(client.num_objects() < 10);
 
         while let Some(object) = client.list_objects().try_next().await? {
@@ -383,7 +449,11 @@ mod tests {
         assert_eq!(client.num_objects(), 0);
 
         let file1 = client
-            .upload("/dir1/subdir1/file1", Cursor::new(ONE_MB), None)
+            .upload(UploadableObject::new(
+                "/dir1/subdir1/file1",
+                Cursor::new(ONE_MB),
+                None::<MockMetadata>,
+            ))
             .await?;
 
         assert_eq!(client.num_objects(), 1);

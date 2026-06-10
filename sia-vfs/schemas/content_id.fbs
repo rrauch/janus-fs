@@ -1,0 +1,5 @@
+namespace common;
+
+struct ContentId {
+  bytes: [ubyte:32];
+}

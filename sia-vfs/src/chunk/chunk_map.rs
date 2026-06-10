@@ -28,7 +28,7 @@ pub struct ChunkRange<'a> {
     pub chunk_offset: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChunkMap {
     len: u64,
     /// Keyed by range start offset. Invariant: non-overlapping, sorted, coalesced.

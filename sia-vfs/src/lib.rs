@@ -1,16 +1,19 @@
-use crate::gen_flatbuffers::vfs::entity::{ContentId as FlatContentId, Uuid as FlatUuid};
+use crate::gen_flatbuffers::vfs::common::ContentId as FlatContentId;
+use crate::gen_flatbuffers::vfs::entity::Uuid as FlatUuid;
 use bytemuck::TransparentWrapper;
+pub use bytesize::ByteSize;
 use derive_where::derive_where;
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
-
-pub use bytesize::ByteSize;
+use std::str::FromStr;
 
 pub mod blob;
 pub mod chunk;
 pub(crate) mod db;
+pub(crate) mod object;
+pub mod sync;
 pub mod vfs;
 
 #[derive_where(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,6 +28,12 @@ unsafe impl<T: 'static> bytemuck::Zeroable for TypedUuid<T> {}
 unsafe impl<T: 'static> bytemuck::Pod for TypedUuid<T> {}
 
 impl<T> TypedUuid<T> {
+    pub(crate) fn try_from_str(input: &str) -> Option<Self> {
+        uuid::Uuid::from_str(input)
+            .ok()
+            .map(|id| Self(id, PhantomData))
+    }
+
     pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<Self> {
         let bytes = match input.try_into() {
             Ok(bytes) => bytes,
@@ -50,7 +59,7 @@ impl<T> TypedUuid<T> {
         unsafe { &*(self.0.as_bytes().as_ptr() as *const FlatUuid) }
     }
 
-    pub(crate) fn generate() -> Self {
+    pub(crate) fn _generate() -> Self {
         Self(uuid::Uuid::now_v7(), PhantomData)
     }
 
@@ -91,6 +100,19 @@ unsafe impl<T: 'static> bytemuck::Zeroable for ContentId<T> {}
 unsafe impl<T: 'static> bytemuck::Pod for ContentId<T> {}
 
 impl<T> ContentId<T> {
+    pub(crate) fn try_from_str(input: &str) -> Option<Self> {
+        if input.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in input.as_bytes().chunks_exact(2).enumerate() {
+            let hi = (chunk[0] as char).to_digit(16)?;
+            let lo = (chunk[1] as char).to_digit(16)?;
+            bytes[i] = ((hi << 4) | lo) as u8;
+        }
+        Some(Self(bytes, PhantomData))
+    }
+
     pub(crate) fn try_from_bytes(input: Vec<u8>) -> Option<Self> {
         let bytes = match input.try_into() {
             Ok(bytes) => bytes,
@@ -165,5 +187,10 @@ impl<T> ContentId<T> {
 #[allow(warnings)]
 #[rustfmt::skip]
 mod gen_flatbuffers {
-    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
+    pub mod object {
+        include!(concat!(env!("OUT_DIR"), "/flatbuffers/object/mod.rs"));
+    }
+    pub mod vfs {
+        include!(concat!(env!("OUT_DIR"), "/flatbuffers/vfs/mod.rs"));
+    }
 }

@@ -1,26 +1,26 @@
 CREATE TABLE entity
 (
-    id              BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                            LENGTH(id) = 16),
-    revision        BLOB    NOT NULL CHECK (TYPEOF(revision) = 'blob' AND
-                                            LENGTH(revision) = 32),
-    ref_count       INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
-    name            TEXT    NOT NULL CHECK (LENGTH(name) > 0 AND
-                                            LENGTH(name) <= 255 AND
-                                            LENGTH(TRIM(name)) = LENGTH(name) AND
-                                            name NOT LIKE '%/%'),
+    id          BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                        LENGTH(id) = 16),
+    revision    BLOB    NOT NULL CHECK (TYPEOF(revision) = 'blob' AND
+                                        LENGTH(revision) = 32),
+    ref_count   INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    name        TEXT    NOT NULL CHECK (LENGTH(name) > 0 AND
+                                        LENGTH(name) <= 255 AND
+                                        LENGTH(TRIM(name)) = LENGTH(name) AND
+                                        name NOT LIKE '%/%'),
 
-    entity_type     TEXT    NOT NULL CHECK (entity_type IN ('D', 'F')),
-    mode            TEXT    NOT NULL CHECK (mode IN ('S', 'L')),
-    remote_location TEXT,
-    data            BLOB,
+    entity_type TEXT    NOT NULL CHECK (entity_type IN ('D', 'F')),
+    mode        TEXT    NOT NULL CHECK (mode IN ('S', 'L')),
+    object_id   INTEGER REFERENCES object (id),
+    data        BLOB,
 
     PRIMARY KEY (id, revision),
 
-    -- Make sure synced entities have a remote_location and no data while local ones have data and no remote_location
+    -- Make sure synced entities have an object and no data while local ones have data and no object
     CHECK (
-        (mode = 'S' AND remote_location IS NOT NULL AND data IS NULL) OR
-        (mode = 'L' AND remote_location IS NULL AND data IS NOT NULL)
+        (mode = 'S' AND object_id IS NOT NULL AND data IS NULL) OR
+        (mode = 'L' AND object_id IS NULL AND data IS NOT NULL)
         )
 );
 
@@ -32,7 +32,7 @@ CREATE TRIGGER entity_update_only_local_to_synced_or_refcount
     ON entity
     FOR EACH ROW
     WHEN OLD.mode IS NOT NEW.mode
-        OR OLD.remote_location IS NOT NEW.remote_location
+        OR OLD.object_id IS NOT NEW.object_id
         OR OLD.data IS NOT NEW.data
         OR OLD.id IS NOT NEW.id
         OR OLD.revision IS NOT NEW.revision
@@ -41,14 +41,43 @@ CREATE TRIGGER entity_update_only_local_to_synced_or_refcount
 BEGIN
     SELECT RAISE(ABORT, 'entity update: only L->S mode transition allowed') WHERE NOT (
         OLD.mode = 'L' AND NEW.mode = 'S'
-            AND OLD.remote_location IS NULL
-            AND NEW.remote_location IS NOT NULL
+            AND OLD.object_id IS NULL
+            AND NEW.object_id IS NOT NULL
             AND OLD.id = NEW.id
             AND OLD.revision = NEW.revision
             AND OLD.name = NEW.name
             AND OLD.entity_type = NEW.entity_type
-            AND OLD.data IS NEW.data
+            AND NEW.data IS NULL
         );
+END;
+
+-- entity-object ref_count
+CREATE TRIGGER entity_insert_object_refcount
+    AFTER INSERT
+    ON entity
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+END;
+
+CREATE TRIGGER entity_update_object_refcount
+    AFTER UPDATE
+    ON entity
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT OLD.object_id
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
+END;
+
+CREATE TRIGGER entity_delete_object_refcount
+    AFTER DELETE
+    ON entity
+    FOR EACH ROW
+    WHEN OLD.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
 END;
 
 -- Automatic GC of local entries
@@ -135,12 +164,12 @@ CREATE TABLE blob
     size      INTEGER          NOT NULL CHECK (size >= 0
 ) ,
     mode            TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
-    remote_location TEXT,
+    object_id INTEGER REFERENCES object (id),
 
-    -- Make sure synced blobs have a remote_location
+    -- Make sure synced blobs have an object
     CHECK (
-        (mode = 'S' AND remote_location IS NOT NULL) OR
-        (mode = 'L' AND remote_location IS NULL)
+        (mode = 'S' AND object_id IS NOT NULL) OR
+        (mode = 'L' AND object_id IS NULL)
         )
 );
 
@@ -152,7 +181,7 @@ CREATE TRIGGER blob_update_only_local_to_synced_or_refcount
     ON blob
     FOR EACH ROW
     WHEN OLD.mode IS NOT NEW.mode
-        OR OLD.remote_location IS NOT NEW.remote_location
+        OR OLD.object_id IS NOT NEW.object_id
         OR OLD.id IS NOT NEW.id
         OR OLD.size IS NOT NEW.size
 BEGIN
@@ -160,9 +189,38 @@ BEGIN
         OLD.mode = 'L' AND NEW.mode = 'S'
             AND OLD.id = NEW.id
             AND OLD.size = NEW.size
-            AND OLD.remote_location IS NULL
-            AND NEW.remote_location IS NOT NULL
+            AND OLD.object_id IS NULL
+            AND NEW.object_id IS NOT NULL
         );
+END;
+
+-- blob-object ref_count
+CREATE TRIGGER blob_insert_object_refcount
+    AFTER INSERT
+    ON blob
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+END;
+
+CREATE TRIGGER blob_update_object_refcount
+    AFTER UPDATE
+    ON blob
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT OLD.object_id
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
+END;
+
+CREATE TRIGGER blob_delete_object_refcount
+    AFTER DELETE
+    ON blob
+    FOR EACH ROW
+    WHEN OLD.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
 END;
 
 -- Automatic GC of local entries
@@ -179,21 +237,50 @@ END;
 
 CREATE TABLE chunk
 (
-    id              BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
-                                                     LENGTH(id) = 32),
-    ref_count       INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
-    mode            TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
-    remote_location TEXT,
-    data            BLOB,
+    id        BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                               LENGTH(id) = 32),
+    ref_count INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    mode      TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
+    object_id INTEGER REFERENCES object (id),
+    data      BLOB,
 
-    -- Make sure synced chunks have a remote_location while local ones have data
+    -- Make sure synced chunks have an object_id while local ones have data
     CHECK (
-        (mode = 'S' AND remote_location IS NOT NULL AND data IS NULL) OR
-        (mode = 'L' AND remote_location IS NULL AND data IS NOT NULL)
+        (mode = 'S' AND object_id IS NOT NULL AND data IS NULL) OR
+        (mode = 'L' AND object_id IS NULL AND data IS NOT NULL)
         )
 );
 
 CREATE INDEX chunk_mode_idx ON chunk (mode);
+
+-- chunk-object ref_count
+CREATE TRIGGER chunk_insert_object_refcount
+    AFTER INSERT
+    ON chunk
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+END;
+
+CREATE TRIGGER chunk_update_object_refcount
+    AFTER UPDATE
+    ON chunk
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT OLD.object_id
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
+END;
+
+CREATE TRIGGER chunk_delete_object_refcount
+    AFTER DELETE
+    ON chunk
+    FOR EACH ROW
+    WHEN OLD.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
+END;
 
 -- allows only mode transition or change of ref_count
 CREATE TRIGGER chunk_update_only_local_to_synced_or_refcount
@@ -201,15 +288,15 @@ CREATE TRIGGER chunk_update_only_local_to_synced_or_refcount
     ON chunk
     FOR EACH ROW
     WHEN OLD.mode IS NOT NEW.mode
-        OR OLD.remote_location IS NOT NEW.remote_location
+        OR OLD.object_id IS NOT NEW.object_id
         OR OLD.id IS NOT NEW.id
         OR OLD.data IS NOT NEW.data
 BEGIN
     SELECT RAISE(ABORT, 'chunk update: only L->S mode transition allowed') WHERE NOT (
         OLD.mode = 'L' AND NEW.mode = 'S'
             AND OLD.id = NEW.id
-            AND OLD.remote_location IS NULL
-            AND NEW.remote_location IS NOT NULL
+            AND OLD.object_id IS NULL
+            AND NEW.object_id IS NOT NULL
             AND OLD.data IS NOT NULL
             AND NEW.data IS NULL
         );
@@ -709,13 +796,15 @@ CREATE TABLE sync_job_queue
 (
     id             INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
-    blob_id        BLOB REFERENCES blob (id),
-    chunk_id       BLOB REFERENCES chunk (id),
+    blob_id        BLOB UNIQUE REFERENCES blob (id),
+    chunk_id       BLOB UNIQUE REFERENCES chunk (id),
     entity_id      BLOB,
     entity_rev     BLOB,
     estimated_size INTEGER NOT NULL CHECK (estimated_size > 0),
+    pending        INTEGER NOT NULL DEFAULT 0 CHECK (pending IN (0, 1)),
 
     FOREIGN KEY (entity_id, entity_rev) REFERENCES entity (id, revision),
+    UNIQUE (entity_id, entity_rev),
 
     CHECK (
         (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL) OR
@@ -725,7 +814,7 @@ CREATE TABLE sync_job_queue
 );
 
 CREATE TRIGGER sync_job_queue_no_updates
-    BEFORE UPDATE
+    BEFORE UPDATE OF id, type, blob_id, chunk_id, entity_id, entity_rev, estimated_size
     ON sync_job_queue
     FOR EACH ROW
 BEGIN
@@ -807,11 +896,24 @@ BEGIN
       AND revision = OLD.entity_rev;
 END;
 
+
+CREATE TABLE object
+(
+    id              INTEGER PRIMARY KEY NOT NULL,
+    remote_location TEXT                NOT NULL,
+    ref_count       INTEGER             NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    first_seen      TIMESTAMP           NOT NULL,
+    last_seen       TIMESTAMP           NOT NULL,
+    error_count     INTEGER             NOT NULL DEFAULT 0 CHECK (error_count >= 0),
+
+    UNIQUE (remote_location)
+);
+
 -- Automatic change tracking
 CREATE TABLE change_log
 (
     change TEXT NOT NULL CHECK (change IN ('I', 'U', 'D')), -- Insert, Update or Delete
-    type   TEXT NOT NULL CHECK (type IN ('C', 'I')),   -- Chunk or Inode,
+    type   TEXT NOT NULL CHECK (type IN ('C', 'I')),        -- Chunk or Inode,
     key1   BLOB NOT NULL
 );
 

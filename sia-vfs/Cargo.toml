@@ -23,6 +23,7 @@ chrono = "0.4"
 derive-where = { version = "1.6", features = ["zeroize", "serde"] }
 flatbuffers = "=25.12.19"
 lz4_flex = { version = "0.13", optional = true }
+elsa = "1.11"
 futures-channel = "0.3"
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
@@ -38,6 +39,8 @@ yoke = "0.8"
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
+sia-io = { path = "../sia-io", default-features = false, features = ["mock"] }
+
 anyhow = "1.0"
 dotenv = "0.15"
 tempfile = "3"

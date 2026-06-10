@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use futures_io::AsyncRead;
 use futures_util::{StreamExt, TryStream, TryStreamExt};
 use indexmap::IndexMap;
-use sia_storage::{Hash256, UploadOptions};
+use sia_storage::{Hash256, PackedUpload, UploadOptions};
 use sia_storage::{Object as SiaObject, ObjectsCursor};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -168,6 +168,14 @@ impl TryFrom<sia_storage::ObjectEvent> for ObjectEvent {
 impl Client {
     pub async fn object(&self, object_id: &ObjectId) -> Result<Object, ClientError> {
         Ok(self.sdk().object(object_id.as_ref()).await?.into())
+    }
+
+    pub(crate) fn new_packed_upload(&self) -> PackedUpload {
+        let mut options = UploadOptions::default();
+        if let Some(max_inflight) = self.upload_max_inflight() {
+            options.max_inflight = max_inflight;
+        }
+        self.sdk().upload_packed(options)
     }
 
     pub async fn upload<U: AsyncRead + Send + Unpin + 'static>(
