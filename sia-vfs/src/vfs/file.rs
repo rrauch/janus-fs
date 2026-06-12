@@ -226,16 +226,15 @@ where
     Self: ChunkSource + ChunkSink + 'static,
 {
     pub async fn open_rw(&self, file: &File) -> VfsResult<FileHandle<ReadWrite>> {
-        let inner = match self {
-            Self::ReadWrite(rw) => rw,
-            Self::ReadOnly(_) => return Err(VfsError::ReadOnlyFileSystem),
-        };
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
 
         let blob = self
             .blob_by_id(file.blob_id())
             .await?
             .ok_or_else(|| DbError::DataError(DataError::BlobNotFound(*file.blob_id())))?;
-        let lock = inner.file_write_locks.acquire(file.inode_id).await?;
+        let lock = self.0.file_write_locks.acquire(file.inode_id).await?;
         let mut tx = self.tx_rw().await?;
         let current_file = match tx
             .inode_by_id(file.inode_id)
@@ -261,7 +260,7 @@ where
         tx.commit().await?;
         let file_id = file.inode_id;
         let file = current_file.into_mut();
-        let reaper_tx = inner.dead_fh_reaper.tx();
+        let reaper_tx = self.0.dead_fh_reaper.tx();
         Ok(FileHandle::new(
             fh_id,
             ReadWrite {
@@ -305,7 +304,7 @@ pub struct ReadOnly {
     file: File,
 }
 
-impl FileMode for ReadOnly where Vfs: ChunkSource + 'static {}
+impl FileMode for ReadOnly {}
 
 pub struct FileHandle<M: FileMode> {
     id: u64,
