@@ -12,13 +12,13 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-pub struct PullTask<Mode> {
-    vfs: Vfs<Mode>,
+pub struct PullTask {
+    vfs: Vfs,
     max_concurrency: usize,
 }
 
-impl<Mode> PullTask<Mode> {
-    pub(super) fn new(vfs: Vfs<Mode>, max_concurrency: NonZeroUsize) -> Self {
+impl PullTask {
+    pub(super) fn new(vfs: Vfs, max_concurrency: NonZeroUsize) -> Self {
         Self {
             vfs,
             max_concurrency: max_concurrency.get(),
@@ -163,7 +163,7 @@ impl<Mode> PullTask<Mode> {
     }
 }
 
-impl<Mode> Vfs<Mode> {
+impl Vfs {
     async fn known_object_ids(&self) -> VfsResult<HashSet<ObjectId>> {
         let mut tx = self.tx().await?;
         Ok(tx
@@ -220,7 +220,7 @@ mod tests {
     use crate::vfs::entity::{DraftEntity, EntityHandler};
     use crate::vfs::file::FileDraft;
     use crate::vfs::tests::new_vfs_with_opts;
-    use crate::vfs::{OwnedName, ReadWrite, StorageMode, Vfs, VfsId};
+    use crate::vfs::{OwnedName, StorageMode, Vfs, VfsId};
     use futures_util::AsyncWriteExt;
     use std::num::NonZeroUsize;
     use std::ops::Deref;
@@ -481,9 +481,9 @@ mod tests {
 
     async fn pull_test<F1, Fut1, F2, Fut2>(setup: F1, assert: F2) -> anyhow::Result<()>
     where
-        F1: FnOnce(Vfs<ReadWrite>) -> Fut1,
+        F1: FnOnce(Vfs) -> Fut1,
         Fut1: Future<Output = anyhow::Result<()>>,
-        F2: FnOnce(Vfs<ReadWrite>) -> Fut2,
+        F2: FnOnce(Vfs) -> Fut2,
         Fut2: Future<Output = anyhow::Result<()>>,
     {
         pull_test_n(1, setup, assert).await
@@ -495,9 +495,9 @@ mod tests {
         assert: F2,
     ) -> anyhow::Result<()>
     where
-        F1: FnOnce(Vfs<ReadWrite>) -> Fut1,
+        F1: FnOnce(Vfs) -> Fut1,
         Fut1: Future<Output = anyhow::Result<()>>,
-        F2: FnOnce(Vfs<ReadWrite>) -> Fut2,
+        F2: FnOnce(Vfs) -> Fut2,
         Fut2: Future<Output = anyhow::Result<()>>,
     {
         let vfs_id = VfsId::generate();
@@ -516,7 +516,7 @@ mod tests {
     }
 
     async fn upload_entity_object<T: EntityHandler>(
-        vfs: &Vfs<ReadWrite>,
+        vfs: &Vfs,
         entity: &DraftEntity<T>,
     ) -> anyhow::Result<()> {
         vfs.sia_client()
@@ -525,14 +525,14 @@ mod tests {
         Ok(())
     }
 
-    async fn upload_blob_object(vfs: &Vfs<ReadWrite>, blob: &Blob) -> anyhow::Result<()> {
+    async fn upload_blob_object(vfs: &Vfs, blob: &Blob) -> anyhow::Result<()> {
         vfs.sia_client()
             .upload(blob.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }
 
-    async fn upload_chunk_object(vfs: &Vfs<ReadWrite>, chunk: &Chunk) -> anyhow::Result<()> {
+    async fn upload_chunk_object(vfs: &Vfs, chunk: &Chunk) -> anyhow::Result<()> {
         vfs.sia_client()
             .upload(chunk.to_uploadable_object(vfs.id()))
             .await?;

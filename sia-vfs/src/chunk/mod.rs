@@ -6,7 +6,7 @@ use crate::object::metadata::{Metadata, MetadataMut};
 use crate::object::{ObjectCreateResult, ObjectId};
 use crate::sync::push::{JobItem, PushTask};
 use crate::sync::{Error as SyncError, Error, PullTask};
-use crate::vfs::{Read, StorageMode, Timestamp, Vfs, VfsError, VfsId, VfsResult, Write};
+use crate::vfs::{StorageMode, Timestamp, Vfs, VfsError, VfsId, VfsResult};
 use crate::{ContentId, object};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -149,7 +149,7 @@ pub trait ChunkSink: Send + Sync + Unpin {
 }
 
 #[async_trait]
-impl<Mode: Read + Unpin> ChunkSource for Vfs<Mode> {
+impl ChunkSource for Vfs {
     async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, std::io::Error> {
         self.cache()
             .chunk_cache()
@@ -160,8 +160,14 @@ impl<Mode: Read + Unpin> ChunkSource for Vfs<Mode> {
 }
 
 #[async_trait]
-impl<Mode: Read + Write + Unpin> ChunkSink for Vfs<Mode> {
+impl ChunkSink for Vfs {
     async fn insert_chunk(&self, chunk: Chunk) -> Result<(), std::io::Error> {
+        if self.is_read_only() {
+            return Err(std::io::Error::new(
+                ErrorKind::ReadOnlyFilesystem,
+                VfsError::ReadOnlyFileSystem,
+            ));
+        }
         let mut tx = self.tx_rw().await.map_err(std::io::Error::other)?;
         tx.register_chunk(&chunk, StorageMode::Local(Arc::from(vec![])))
             .await
@@ -175,14 +181,14 @@ impl<Mode: Read + Write + Unpin> ChunkSink for Vfs<Mode> {
     }
 }
 
-impl<Mode: Read> Vfs<Mode> {
+impl Vfs {
     async fn _get_chunk(&self, chunk_id: &ChunkId) -> VfsResult<Option<Chunk>> {
         let mut tx = self.tx().await.map_err(std::io::Error::other)?;
         Ok(tx.chunk_by_id(chunk_id).await?)
     }
 }
 
-impl<Mode> PullTask<Mode> {
+impl PullTask {
     pub(crate) async fn chunk_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
         chunk_id: &str,

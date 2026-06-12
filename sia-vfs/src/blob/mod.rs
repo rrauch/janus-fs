@@ -8,7 +8,7 @@ use crate::object::metadata::{Metadata, MetadataMut};
 use crate::object::{ObjectCreateResult, ObjectId};
 use crate::sync::push::{JobItem, PushTask};
 use crate::sync::{Error as SyncError, Error, PullTask};
-use crate::vfs::{Read, StorageMode, Timestamp, Vfs, VfsError, VfsId, VfsResult};
+use crate::vfs::{StorageMode, Timestamp, Vfs, VfsError, VfsId, VfsResult};
 use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
@@ -218,13 +218,13 @@ fn hash(chunk_map: &ChunkMap) -> BlobId {
     BlobId::new_internal(hasher.finalize())
 }
 
-impl<Mode: Read> Vfs<Mode> {
+impl Vfs {
     pub(crate) async fn blob_by_id(&self, blob_id: &BlobId) -> VfsResult<Option<Blob>> {
         Ok(self.tx().await?.blob_by_id(blob_id).await?)
     }
 }
 
-impl<Mode> PullTask<Mode> {
+impl PullTask {
     pub(crate) async fn blob_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
         sia_client: &Sia,

@@ -716,7 +716,7 @@ impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
     }
 }
 
-impl<Mode> PullTask<Mode> {
+impl PullTask {
     pub(crate) async fn entity_sync<T: EntityHandler, TX: TxScope>(
         tx: &mut Transaction<TX>,
         sia_client: &Sia,

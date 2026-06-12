@@ -5,7 +5,7 @@ use crate::sync::Error;
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::{EntityKey, LocalEntity};
 use crate::vfs::file::FileKind;
-use crate::vfs::{ROOT_INODE_ID, ReadWrite, Timestamp, Vfs, VfsId};
+use crate::vfs::{ROOT_INODE_ID, Timestamp, Vfs, VfsError, VfsId};
 use elsa::FrozenVec;
 use sia_io::upload::{MultiUploader, UploadError};
 use std::num::NonZeroUsize;
@@ -17,7 +17,7 @@ const BACKOFF_MAX_DELAY: Duration = Duration::from_secs(60);
 const BACKOFF_MULTIPLIER: f64 = 1.5;
 
 pub struct PushTask {
-    vfs: Vfs<ReadWrite>,
+    vfs: Vfs,
     max_attempts: usize,
 }
 
@@ -44,17 +44,18 @@ impl Pending {
 }
 
 impl PushTask {
-    pub(super) fn new(vfs: Vfs<ReadWrite>, max_attempts: NonZeroUsize) -> Self {
+    pub(super) fn new(vfs: Vfs, max_attempts: NonZeroUsize) -> Self {
         Self {
             vfs,
             max_attempts: max_attempts.get(),
         }
     }
-    pub(crate) fn vfs(&self) -> &Vfs<ReadWrite> {
-        &self.vfs
-    }
 
     pub async fn run(&mut self) -> Result<(), Error> {
+        if self.vfs.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem)?;
+        }
+
         let res = self._run().await;
         // clean up
         let mut tx = self.vfs.tx_rw().await?;

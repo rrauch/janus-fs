@@ -6,9 +6,7 @@ use crate::gen_flatbuffers::vfs::entity::{
 use crate::vfs::entity::{
     DraftEntity, EntityError, EntityHandler, EntityKey, EntityMut, EntityRef, RawEntityInner,
 };
-use crate::vfs::{
-    Inode, InodeId, InodeMut, Name, OwnedName, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
-};
+use crate::vfs::{Inode, InodeId, InodeMut, Name, OwnedName, TypedInode, Vfs, VfsError, VfsResult};
 use blake3::{Hash, Hasher};
 use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 use futures_util::{StreamExt, TryStream};
@@ -146,7 +144,7 @@ impl DirectoryDraft {
     }
 }
 
-impl<Mode: Read> Vfs<Mode> {
+impl Vfs {
     pub async fn list(
         &self,
         dir: &Directory,
@@ -178,8 +176,12 @@ impl<Mode: Read> Vfs<Mode> {
     }
 }
 
-impl<Mode: Read + Write> Vfs<Mode> {
+impl Vfs {
     pub async fn create_dir(&self, parent: &Directory, name: &Name) -> VfsResult<Directory> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
+
         let mut tx = self.tx_rw().await?;
         let inode_id = tx.create_dir(name, parent.inode_id()).await?;
         let dir = match tx.inode_by_id(inode_id).await? {
