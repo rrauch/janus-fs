@@ -3,10 +3,9 @@ use crate::io_scheduler::resource_manager::{
     Action, Context, Entry, QueueCtrl, Resource, ResourceManager,
 };
 use crate::io_scheduler::Scheduler;
+use crate::CHUNK_SIZE;
 use anyhow::Result;
 use anyhow::{anyhow, bail};
-use bytes::Bytes;
-use cachalot::Cachalot;
 use futures::AsyncRead;
 use futures_util::future::BoxFuture;
 use futures_util::{AsyncReadExt, FutureExt};
@@ -28,7 +27,6 @@ const VERSION_HASH_SEED: u64 = 3986469829483842332;
 
 pub(super) struct RenterdDownload {
     renterd: Client,
-    cachalot: Arc<Cachalot>,
     max_skip_ahead: u64,
     download_limiter: Arc<Semaphore>,
     max_active: usize,
@@ -41,7 +39,6 @@ pub(super) struct RenterdDownload {
 impl RenterdDownload {
     pub(super) fn new(
         renterd: Client,
-        cachalot: Arc<Cachalot>,
         max_skip_ahead: NonZeroU64,
         max_concurrent_downloads: NonZeroUsize,
         max_queue_idle: Duration,
@@ -56,7 +53,7 @@ impl RenterdDownload {
 
         let max_skip_ahead = {
             // round up to nearest multiple of chunk size
-            let chunk_size = cachalot.chunk_size() as u64;
+            let chunk_size = CHUNK_SIZE as u64;
             let max_skip_ahead = max_skip_ahead.get();
             if max_skip_ahead % chunk_size == 0 {
                 max_skip_ahead
@@ -67,7 +64,6 @@ impl RenterdDownload {
 
         let renterd_download = Self {
             renterd,
-            cachalot,
             max_skip_ahead,
             download_limiter,
             max_active,
@@ -83,7 +79,6 @@ impl RenterdDownload {
     async fn advance(
         mut reader: ObjectReader,
         dst_offset: u64,
-        cachalot: Arc<Cachalot>,
         dl: &DownloadableObject,
         version: &Version,
         max_skip_ahead: u64,
@@ -108,11 +103,7 @@ impl RenterdDownload {
             "advancing reader"
         );
 
-        let bucket = dl.bucket.as_ref().map(|s| s.as_str()).unwrap_or_default();
-        let path = dl.path.as_str();
-        let version = version.as_u64();
-
-        let chunk_size = cachalot.chunk_size() as u64;
+        let chunk_size = CHUNK_SIZE as u64;
 
         let next_chunk_in = if reader.offset % chunk_size == 0 {
             0
@@ -130,20 +121,7 @@ impl RenterdDownload {
 
         while reader.offset < dst_offset {
             let size = min(dst_offset - reader.offset, chunk_size) as usize;
-            let chunk_nr = reader.offset / chunk_size;
             let expected_offset = reader.offset + size as u64;
-
-            if size == (chunk_size as usize) || reader.offset + size as u64 >= reader.size {
-                // making sure this is a full chunk
-                // the final chunk of the file may be smaller
-                cachalot
-                    .try_get_with(bucket, path, version, chunk_nr, async {
-                        let mut buffer = vec![0u8; size];
-                        reader.read_exact(&mut buffer).await?;
-                        Ok(Bytes::from(buffer))
-                    })
-                    .await?;
-            }
 
             if reader.offset < expected_offset {
                 let bytes_to_skip = expected_offset - reader.offset;
@@ -368,7 +346,6 @@ impl ResourceManager for RenterdDownload {
                                 if let Some(reader) = queue.take_idle(idle) {
                                     let offset = waiting.offset;
                                     let data = data.clone();
-                                    let cachalot = self.cachalot.clone();
                                     let max_skip_ahead = self.max_skip_ahead;
                                     queue.prepare(
                                         waiting,
@@ -376,7 +353,6 @@ impl ResourceManager for RenterdDownload {
                                             Self::advance(
                                                 reader,
                                                 offset,
-                                                cachalot,
                                                 &data.0,
                                                 &data.1,
                                                 max_skip_ahead,

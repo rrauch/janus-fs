@@ -4,8 +4,8 @@ use crate::io_scheduler::resource_manager::ResourceManager;
 use crate::io_scheduler::Scheduler;
 use crate::vfs::file_reader::renterd_download::RenterdDownload;
 use crate::vfs::locking::ReadLock;
+use crate::CHUNK_SIZE;
 use bytes::{Buf, Bytes};
-use cachalot::Cachalot;
 use futures::{ready, AsyncRead, AsyncSeek};
 use futures_util::AsyncReadExt;
 use renterd_client::Client;
@@ -21,20 +21,16 @@ use tokio::task::JoinHandle;
 
 pub(crate) struct FileReaderManager {
     scheduler: Arc<Scheduler<RenterdDownload>>,
-    cachalot: Arc<Cachalot>,
 }
 
 impl FileReaderManager {
     pub fn new(
         renterd: Client,
-        cachalot: Cachalot,
         max_concurrent_downloads: NonZeroUsize,
         max_skip_ahead: NonZeroU64,
     ) -> anyhow::Result<Self> {
-        let cachalot = Arc::new(cachalot);
         let scheduler = RenterdDownload::new(
             renterd,
-            cachalot.clone(),
             max_skip_ahead,
             max_concurrent_downloads,
             Duration::from_millis(2000),
@@ -47,7 +43,6 @@ impl FileReaderManager {
 
         Ok(Self {
             scheduler: Arc::new(scheduler),
-            cachalot,
         })
     }
 
@@ -58,21 +53,12 @@ impl FileReaderManager {
         size: u64,
         read_lock: ReadLock,
     ) -> anyhow::Result<FileReader> {
-        FileReader::new(
-            bucket,
-            path,
-            self.scheduler.clone(),
-            self.cachalot.clone(),
-            size,
-            read_lock,
-        )
-        .await
+        FileReader::new(bucket, path, self.scheduler.clone(), size, read_lock).await
     }
 }
 
 pub struct FileReader {
     scheduler: Arc<Scheduler<RenterdDownload>>,
-    cachalot: Arc<Cachalot>,
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
     offset: u64,
     size: u64,
@@ -87,17 +73,15 @@ impl FileReader {
         bucket: String,
         path: String,
         scheduler: Arc<Scheduler<RenterdDownload>>,
-        cachalot: Arc<Cachalot>,
         size: u64,
         read_lock: ReadLock,
     ) -> anyhow::Result<Self> {
         let prepare_key = (bucket, path);
         let access_key = scheduler.prepare(&prepare_key).await?;
-        let chunk_size = cachalot.chunk_size();
+        let chunk_size = CHUNK_SIZE;
         Ok(Self {
             scheduler,
             access_key,
-            cachalot,
             offset: 0,
             size,
             chunk_size,
@@ -124,7 +108,6 @@ impl FileReader {
         if self.pending.is_none() {
             let handle = tokio::spawn(get_bytes(
                 self.scheduler.clone(),
-                self.cachalot.clone(),
                 self.access_key.clone(),
                 required_chunk,
             ));
@@ -174,7 +157,6 @@ impl FileReader {
                 next_chunk,
                 tokio::spawn(get_bytes(
                     self.scheduler.clone(),
-                    self.cachalot.clone(),
                     self.access_key.clone(),
                     next_chunk,
                 )),
@@ -193,23 +175,13 @@ impl FileReader {
 
 async fn get_bytes(
     scheduler: Arc<Scheduler<RenterdDownload>>,
-    cachalot: Arc<Cachalot>,
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
     chunk: u64,
 ) -> anyhow::Result<Bytes> {
-    let (bucket, path, version) = &access_key;
-    let chunk_size = cachalot.chunk_size();
+    let chunk_size = CHUNK_SIZE;
     let offset = chunk_size as u64 * chunk;
 
-    Ok(cachalot
-        .try_get_with(
-            bucket,
-            path,
-            version.as_u64(),
-            chunk,
-            get_from_renterd(scheduler, access_key.clone(), offset, chunk_size),
-        )
-        .await?)
+    Ok(get_from_renterd(scheduler, access_key.clone(), offset, chunk_size).await?)
 }
 
 async fn get_from_renterd(

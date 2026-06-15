@@ -5,7 +5,6 @@ mod vfs;
 use crate::nfs::SiaNfsFs;
 use crate::vfs::Vfs;
 use anyhow::Result;
-use cachalot::Cachalot;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
@@ -17,6 +16,8 @@ use tracing::log::LevelFilter;
 use tracing::Instrument;
 use url::Url;
 
+pub(crate) const CHUNK_SIZE: usize = 1024 * 64;
+
 pub struct SiaNfs {
     listener: NFSTcpListener<SiaNfsFs>,
 }
@@ -26,7 +27,6 @@ impl SiaNfs {
         renterd_endpoint: &Url,
         renterd_password: &str,
         db_path: &Path,
-        disk_cache: Option<(&Path, u64)>,
         buckets: Vec<String>,
         listen_address: &str,
         uid: u32,
@@ -41,25 +41,12 @@ impl SiaNfs {
             .verbose_logging(true)
             .build()?;
 
-        let mut cachalot_builder = Cachalot::builder(&buckets);
-        if let Some((cache_db_path, max_size)) = disk_cache {
-            cachalot_builder = cachalot_builder
-                .with_disk_cache(cache_db_path)
-                .max_size(max_size)?
-                .max_connections(20)?
-                .build();
-        } else {
-            tracing::info!("Note: disk cache is currently DISABLED");
-        };
-        let cachalot = cachalot_builder.build().await?;
-
         let db = db_init(db_path, 20, true).await?;
 
         let vfs = Arc::new(
             Vfs::new(
                 renterd,
                 db,
-                cachalot,
                 &buckets,
                 NonZeroUsize::new(5).unwrap(),
                 NonZeroU64::new(1024 * 1024 * 1).unwrap(),

@@ -11,7 +11,6 @@ use crate::vfs::inode::{Directory, File, Inode, InodeId, InodeManager, Object, O
 use crate::vfs::locking::{LockHolder, LockManager, LockRequest};
 use crate::SqlitePool;
 use anyhow::{anyhow, bail, Result};
-use cachalot::Cachalot;
 use chrono::Utc;
 use futures::pin_mut;
 use futures_util::io::Cursor;
@@ -44,7 +43,6 @@ impl Vfs {
     pub(super) async fn new(
         renterd: RenterdClient,
         db: SqlitePool,
-        cachalot: Cachalot,
         buckets: &Vec<String>,
         max_concurrent_downloads_per_file: NonZeroUsize,
         max_skip_ahead: NonZeroU64,
@@ -74,7 +72,6 @@ impl Vfs {
         let inode_manager = InodeManager::new(db, buckets).await?;
         let file_reader_manager = FileReaderManager::new(
             renterd.clone(),
-            cachalot,
             max_concurrent_downloads_per_file,
             max_skip_ahead,
         )?;
