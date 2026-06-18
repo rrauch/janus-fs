@@ -125,6 +125,17 @@ fn hash_entries(entries: &[EntityKey], hasher: &mut Hasher) {
 
 pub type Directory = TypedInode<DirectoryKind>;
 
+impl TryFrom<Inode> for Directory {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> Result<Self, Self::Error> {
+        match value {
+            Inode::Directory(dir) => Ok(dir),
+            Inode::File(file) => Err(Inode::File(file)),
+        }
+    }
+}
+
 impl Directory {
     pub fn is_root(&self) -> bool {
         self.parent.is_none()

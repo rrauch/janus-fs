@@ -2,12 +2,10 @@ mod upload;
 
 use crate::io_scheduler::Scheduler;
 use crate::nfs::upload::Upload;
-use crate::vfs::inode::{File, Inode, Object};
-use crate::vfs::Vfs;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, TryStreamExt};
 use nfsserve::nfs;
 use nfsserve::nfs::nfsstat3::{
     NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
@@ -16,55 +14,68 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, fsinfo3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use sia_vfs::vfs::directory::Directory;
+use sia_vfs::vfs::file::File;
+use sia_vfs::vfs::{Inode, InodeId, Name, Vfs};
 use std::cmp::min;
 use std::io::SeekFrom;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
 pub(crate) struct SiaNfsFs {
-    vfs: Arc<Vfs>,
+    vfs: Vfs,
     uploader: Scheduler<Upload>,
     uid: u32,
     gid: u32,
     file_mode: u32,
     dir_mode: u32,
+    root_id: InodeId,
+    fs_id: u64,
 }
 
 impl SiaNfsFs {
-    pub(super) fn new(
-        vfs: Arc<Vfs>,
+    pub(super) async fn new(
+        vfs: Vfs,
         upload_max_idle: Duration,
         uid: u32,
         gid: u32,
         file_mode: u32,
         dir_mode: u32,
-    ) -> Self {
+    ) -> Result<Self> {
+        let root_id = vfs.root().await?.inode_id();
+        let (_, fs_id) = vfs.id().as_u64_pair();
+
         let uploader = Upload::new(vfs.clone(), upload_max_idle);
-        Self {
+        Ok(Self {
             uploader,
             vfs,
             uid,
             gid,
             file_mode,
             dir_mode,
-        }
+            root_id,
+            fs_id,
+        })
     }
 }
 
 #[async_trait]
 impl NFSFileSystem for SiaNfsFs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        if self.vfs.is_read_only() {
+            VFSCapabilities::ReadOnly
+        } else {
+            VFSCapabilities::ReadWrite
+        }
     }
 
     fn root_dir(&self) -> fileid3 {
-        self.vfs.root().id().value()
+        *self.root_id
     }
 
     #[instrument(skip(self))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        Ok(self.inode_by_dir_name(dirid, filename).await?.id().value())
+        Ok(*self.inode_by_dir_name(dirid, filename).await?.id())
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -91,10 +102,10 @@ impl NFSFileSystem for SiaNfsFs {
 
         // make sure we don't read beyond eof
         let count = {
-            if offset >= file.size() {
+            if offset >= file.len() {
                 0
             } else {
-                let available = file.size() - offset;
+                let available = file.len() - offset;
                 min(count, available as u32) as usize
             }
         };
@@ -104,7 +115,7 @@ impl NFSFileSystem for SiaNfsFs {
             return Ok((vec![], true));
         }
 
-        let mut file_reader = self.vfs.read_file(&file).await.map_err(|e| {
+        let mut file_reader = self.vfs.open(&file).await.map_err(|e| {
             tracing::error!(error = %e, "failed to call read_file for file {}", id);
             NFS3ERR_SERVERFAULT
         })?;
@@ -131,7 +142,8 @@ impl NFSFileSystem for SiaNfsFs {
             return Err(NFS3ERR_IO);
         }
         let file_reader = file_reader.into_inner();
-        Ok((buf, file_reader.eof()))
+        let pos = offset + bytes_read as u64;
+        Ok((buf, pos >= file_reader.len()))
     }
 
     #[instrument(skip(self, data), fields(count = data.len()))]
@@ -144,10 +156,10 @@ impl NFSFileSystem for SiaNfsFs {
 
         let mut upload = self
             .uploader
-            .access(&file.id().value(), offset)
+            .access(&file.inode_id(), offset)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "failed to acquire upload handle for {}", file.id());
+                tracing::error!(error = %e, "failed to acquire upload handle for {}", file.inode_id());
                 NFS3ERR_NOENT
             })?;
         let upload = upload.as_mut();
@@ -157,9 +169,13 @@ impl NFSFileSystem for SiaNfsFs {
             NFS3ERR_IO
         })?;
 
+        let inode = Inode::File(upload.fsync().await.map_err(|e| {
+            tracing::error!(error = %e, "fsync error");
+            NFS3ERR_IO
+        })?);
         tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
 
-        Ok(self.to_fattr3(&upload.to_file().into()))
+        Ok(self.to_fattr3(&inode))
     }
 
     async fn create(
@@ -182,23 +198,23 @@ impl NFSFileSystem for SiaNfsFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let name = to_str(filename)?;
-        let parent = self
+        let name = try_as_name(filename)?;
+        let parent: Directory = self
             .inode_by_id(dirid)
             .await?
-            .try_into_parent()
+            .try_into()
             .map_err(|_| NFS3ERR_NOTDIR)?;
 
         let file_id = self
             .uploader
-            .prepare(&(parent.id().value(), name.to_string()))
+            .prepare(&(parent.inode_id(), name.to_owned()))
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to prepare upload");
                 NFS3ERR_IO
             })?;
 
-        Ok(file_id)
+        Ok(*file_id)
     }
 
     async fn mkdir(
@@ -206,34 +222,27 @@ impl NFSFileSystem for SiaNfsFs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let name = to_str(dirname)?;
-        let parent = self
+        let name = try_as_name(dirname)?;
+        let parent: Directory = self
             .inode_by_id(dirid)
             .await?
-            .try_into_parent()
+            .try_into()
             .map_err(|_| NFS3ERR_NOTDIR)?;
 
         let inode: Inode = self
             .vfs
-            .mkdir(&parent, name.to_string())
+            .create_dir(&parent, name)
             .await
             .map_err(|_| NFS3ERR_SERVERFAULT)?
             .into();
 
-        Ok((inode.id().value(), self.to_fattr3(&inode)))
+        Ok((*inode.id(), self.to_fattr3(&inode)))
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        let object: Object = self
-            .inode_by_dir_name(dirid, filename)
-            .await?
-            .try_into()
-            .map_err(|_| NFS3ERR_NOTSUPP)?;
+        let inode = self.inode_by_dir_name(dirid, filename).await?;
 
-        // if this is a pending upload, close it first
-        self.uploader.close(object.id().as_ref()).await;
-
-        self.vfs.rm(&object).await.map_err(|e| {
+        self.vfs.delete(inode.id()).await.map_err(|e| {
             tracing::error!(err = %e, "rm failed");
             NFS3ERR_SERVERFAULT
         })?;
@@ -248,33 +257,41 @@ impl NFSFileSystem for SiaNfsFs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        let source: Object = self
-            .inode_by_dir_name(from_dirid, from_filename)
+        let source = self.inode_by_dir_name(from_dirid, from_filename).await?;
+
+        let dest_parent: Directory = self
+            .inode_by_id(to_dirid)
             .await?
             .try_into()
             .map_err(|_| NFS3ERR_NOTSUPP)?;
 
-        let dest_parent = self
-            .inode_by_id(to_dirid)
-            .await?
-            .try_into_parent()
-            .map_err(|_| NFS3ERR_NOTSUPP)?;
+        let to_filename = try_as_name(to_filename)?;
 
-        let to_filename = to_str(to_filename)?;
-        let dest_name = if to_filename == source.name() {
-            // no name change
-            None
-        } else {
-            Some(to_filename.to_string())
-        };
+        self.vfs.mv(source.id(), &dest_parent).await.map_err(|e| {
+            tracing::error!(err = %e, "mv failed");
+            NFS3ERR_SERVERFAULT
+        })?;
 
-        self.vfs
-            .mv(&source, &dest_parent, dest_name)
-            .await
+        if to_filename != source.name() {
+            // rename
+            let to_filename = to_filename.to_owned();
+            match self.inode_by_id(*source.id()).await? {
+                Inode::Directory(dir) => {
+                    let mut dir = dir.into_mut();
+                    dir.set_name(to_filename);
+                    self.vfs.update(dir).await
+                }
+                Inode::File(file) => {
+                    let mut file = file.into_mut();
+                    file.set_name(to_filename);
+                    self.vfs.update(file).await
+                }
+            }
             .map_err(|e| {
                 tracing::error!(err = %e, "mv failed");
                 NFS3ERR_SERVERFAULT
             })?;
+        }
 
         Ok(())
     }
@@ -285,12 +302,18 @@ impl NFSFileSystem for SiaNfsFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let inode = self.inode_by_id(dirid).await?;
-        if let Inode::Object(Object::File(_)) = inode {
-            return Err(NFS3ERR_NOTDIR);
-        }
+        let dir: Directory = self
+            .inode_by_id(dirid)
+            .await?
+            .try_into()
+            .map_err(|_| NFS3ERR_NOTDIR)?;
 
-        let inodes = self.vfs.read_dir(&inode).await.map_err(|err| {
+        let stream = self.vfs.list(&dir).await.map_err(|err| {
+            tracing::error!(error = %err, "read_dir failed");
+            NFS3ERR_SERVERFAULT
+        })?;
+
+        let inodes = stream.try_collect::<Vec<_>>().await.map_err(|err| {
             tracing::error!(error = %err, "read_dir failed");
             NFS3ERR_SERVERFAULT
         })?;
@@ -302,10 +325,7 @@ impl NFSFileSystem for SiaNfsFs {
 
         let mut start_index = 0;
         if start_after > 0 {
-            if let Some(pos) = inodes
-                .iter()
-                .position(|inode| inode.id().value() == start_after)
-            {
+            if let Some(pos) = inodes.iter().position(|inode| *inode.id() == start_after) {
                 start_index = pos + 1;
             } else {
                 return Err(nfsstat3::NFS3ERR_BAD_COOKIE);
@@ -315,7 +335,7 @@ impl NFSFileSystem for SiaNfsFs {
 
         for inode in inodes[start_index..].iter() {
             ret.entries.push(DirEntry {
-                fileid: inode.id().value(),
+                fileid: *inode.id(),
                 name: inode.name().as_bytes().into(),
                 attr: self.to_fattr3(inode),
             });
@@ -345,12 +365,11 @@ impl NFSFileSystem for SiaNfsFs {
     }
 
     async fn fsinfo(&self, root_fileid: fileid3) -> std::result::Result<fsinfo3, nfsstat3> {
-        let inode = self.inode_by_id(root_fileid).await?;
-        match inode {
-            Inode::Root(_) => {}
-            Inode::Bucket(_) => {}
-            _ => return Err(nfsstat3::NFS3ERR_BADHANDLE),
+        if root_fileid != *self.root_id {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
         }
+        let inode = self.inode_by_id(root_fileid).await?;
+
         Ok(fsinfo3 {
             obj_attributes: nfs::post_op_attr::attributes(self.to_fattr3(&inode)),
             rtmax: 1024 * 1024,
@@ -388,64 +407,55 @@ impl SiaNfsFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<Inode, nfsstat3> {
-        let name = to_str(filename)?;
+        let name = try_as_name(filename)?;
         let parent = match self.vfs.inode_by_id(dirid.into()).await.map_err(|e| {
             tracing::error!(err = %e, "lookup failed");
             NFS3ERR_SERVERFAULT
         })? {
             None => Err(NFS3ERR_NOENT),
-            Some(Inode::Object(Object::File(_))) => Err(NFS3ERR_NOTDIR),
-            Some(inode) => Ok(inode),
+            Some(Inode::File(_)) => Err(NFS3ERR_NOTDIR),
+            Some(Inode::Directory(dir)) => Ok(dir),
         }?;
 
-        match self
-            .vfs
-            .inode_by_name_parent(name, &parent)
-            .await
-            .map_err(|e| {
-                tracing::error!(err = %e, "lookup failed");
-                NFS3ERR_SERVERFAULT
-            })? {
+        let path = parent.path().join(name);
+
+        match self.vfs.inode_by_path(&path).await.map_err(|e| {
+            tracing::error!(err = %e, "lookup failed");
+            NFS3ERR_SERVERFAULT
+        })? {
             Some(inode) => Ok(inode),
             None => Err(NFS3ERR_NOENT),
         }
     }
 
     fn to_fattr3(&self, inode: &Inode) -> fattr3 {
-        let size = inode.size();
+        let size = inode.len().unwrap_or(0);
         let last_modified = to_nfsstime(inode.last_modified());
 
         fattr3 {
             ftype: match inode {
-                Inode::Root(_) => ftype3::NF3DIR,
-                Inode::Bucket(_) => ftype3::NF3DIR,
-                Inode::Object(Object::Directory(_)) => ftype3::NF3DIR,
-                Inode::Object(Object::File(_)) => ftype3::NF3REG,
+                Inode::Directory(_) => ftype3::NF3DIR,
+                Inode::File(_) => ftype3::NF3REG,
             },
             mode: match inode {
-                Inode::Root(_) => 0o555,
-                Inode::Bucket(_) => self.dir_mode,
-                Inode::Object(Object::Directory(_)) => self.dir_mode,
-                Inode::Object(Object::File(_)) => self.file_mode,
+                Inode::Directory(dir) if dir.is_root() => 0o555,
+                Inode::Directory(_) => self.dir_mode,
+                Inode::File(_) => self.file_mode,
             },
             nlink: 1,
             uid: match inode {
-                Inode::Root(_) => 0,
+                Inode::Directory(dir) if dir.is_root() => 0,
                 _ => self.uid,
             },
             gid: match inode {
-                Inode::Root(_) => 0,
+                Inode::Directory(dir) if dir.is_root() => 0,
                 _ => self.gid,
             },
             size,
             used: size,
             rdev: specdata3::default(),
-            fsid: match inode {
-                Inode::Root(root) => root.id().value(),
-                Inode::Bucket(bucket) => bucket.id().value(),
-                Inode::Object(object) => object.bucket().id().value(),
-            },
-            fileid: inode.id().value(),
+            fsid: self.fs_id,
+            fileid: *inode.id(),
             atime: last_modified,
             mtime: last_modified,
             ctime: last_modified,
@@ -460,6 +470,7 @@ fn to_nfsstime(date_time: &DateTime<Utc>) -> nfstime3 {
     }
 }
 
-fn to_str(name: &filename3) -> Result<&str, nfsstat3> {
-    Ok(std::str::from_utf8(name).map_err(|_| NFS3ERR_SERVERFAULT)?)
+fn try_as_name(name: &filename3) -> Result<&Name, nfsstat3> {
+    let str = std::str::from_utf8(name).map_err(|_| NFS3ERR_SERVERFAULT)?;
+    Ok(str.try_into().map_err(|_| NFS3ERR_SERVERFAULT)?)
 }

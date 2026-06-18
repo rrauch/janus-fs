@@ -116,6 +116,17 @@ pub type File = TypedInode<FileKind>;
 pub type FileMut = InodeMut<FileKind>;
 pub(crate) type FileDraft = DraftEntity<FileKind>;
 
+impl TryFrom<Inode> for File {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> Result<Self, Self::Error> {
+        match value {
+            Inode::File(file) => Ok(file),
+            Inode::Directory(dir) => Err(Inode::Directory(dir)),
+        }
+    }
+}
+
 impl FileDraft {
     pub fn new_file_draft(name: OwnedName, blob: Blob) -> Self {
         EntityMut::new(name, blob.into()).freeze()
@@ -428,14 +439,26 @@ impl FileHandle<ReadWrite> {
         self.inner.writer.is_empty()
     }
 
-    pub async fn fsync(&mut self) -> VfsResult<()> {
+    pub fn is_closed(&self) -> bool {
+        self.inner.writer.mode.closed
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.inner.writer.error_count
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.inner.writer.pos
+    }
+
+    pub async fn fsync(&mut self) -> VfsResult<File> {
         self.flush().await?;
         let blob = self.inner.writer.fsync().await?;
         let mut tx = self.inner.vfs.tx_rw().await?;
         let file = tx.fsync(self.inner.file.clone(), blob).await?;
         tx.commit().await?;
-        self.inner.file = file.into_mut();
-        Ok(())
+        self.inner.file = file.clone().into_mut();
+        Ok(file)
     }
 
     pub async fn commit(mut self) -> VfsResult<File> {

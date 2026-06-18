@@ -111,6 +111,12 @@ impl InodeId {
     }
 }
 
+impl From<u64> for InodeId {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
 impl Deref for InodeId {
     type Target = u64;
 
@@ -174,7 +180,7 @@ impl Deref for Timestamp {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 #[repr(transparent)]
 pub struct OwnedName(Cow<'static, str>);
 

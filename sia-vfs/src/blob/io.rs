@@ -252,8 +252,9 @@ fn copy_from_chunk(chunk: &Chunk, chunk_offset: usize, max_len: u64, buf: &mut [
 }
 
 pub struct BlobIo<M> {
-    mode: M,
-    pos: u64,
+    pub(crate) mode: M,
+    pub(crate) pos: u64,
+    pub(crate) error_count: usize,
 }
 
 pub(crate) struct ReadOnly<S> {
@@ -273,6 +274,7 @@ impl<S: ChunkSource + 'static> BlobReader<S> {
                 backend: Arc::new(source),
             },
             pos: 0,
+            error_count: 0,
         }
     }
 
@@ -310,7 +312,10 @@ impl<S: ChunkSource + 'static> AsyncRead for BlobReader<S> {
                 len,
             } => {
                 let backend = self.mode.backend.clone();
-                ready!(self.mode.fetch.poll_ensure(&chunk_id, &backend, cx))?;
+                ready!(self.mode.fetch.poll_ensure(&chunk_id, &backend, cx)).map_err(|e| {
+                    self.error_count += 1;
+                    e
+                })?;
                 let chunk = self.mode.fetch.get_cached();
                 let n = copy_from_chunk(chunk, chunk_offset, len, buf);
                 self.pos += n as u64;
@@ -327,7 +332,10 @@ impl<S: ChunkSource + 'static> AsyncSeek for BlobReader<S> {
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
         let len = self.mode.blob.len();
-        let target = compute_seek_target::<false>(self.pos, len, pos)?;
+        let target = compute_seek_target::<false>(self.pos, len, pos).map_err(|e| {
+            self.error_count += 1;
+            e
+        })?;
         self.pos = target;
         Poll::Ready(Ok(target))
     }
@@ -339,7 +347,7 @@ pub(crate) struct ReadWrite<B> {
     pipeline: WritePipeline,
     max_chunk_size: usize,
     backend: Arc<B>,
-    closed: bool,
+    pub(crate) closed: bool,
 }
 
 impl<B: ChunkSource + ChunkSink + 'static> ReadWrite<B> {
@@ -504,6 +512,7 @@ impl<B: ChunkSource + ChunkSink + 'static> BlobWriter<B> {
                 closed: false,
             },
             pos: 0,
+            error_count: 0,
         }
     }
 
@@ -549,7 +558,10 @@ impl<B: ChunkSource + ChunkSink + 'static> AsyncRead for BlobWriter<B> {
         if pos >= self.mode.blob.len() && !self.mode.pipeline.is_dirty() {
             return Poll::Ready(Ok(0));
         }
-        let n = ready!(self.mode.poll_read_impl(pos, buf, cx))?;
+        let n = ready!(self.mode.poll_read_impl(pos, buf, cx)).map_err(|e| {
+            self.error_count += 1;
+            e
+        })?;
         self.pos += n as u64;
         Poll::Ready(Ok(n))
     }
@@ -562,7 +574,10 @@ impl<B: ChunkSource + ChunkSink + 'static> AsyncSeek for BlobWriter<B> {
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
         let len = self.mode.blob.len();
-        let target = compute_seek_target::<true>(self.pos, len, pos)?;
+        let target = compute_seek_target::<true>(self.pos, len, pos).map_err(|e| {
+            self.error_count += 1;
+            e
+        })?;
         self.pos = target;
         Poll::Ready(Ok(target))
     }
@@ -575,19 +590,28 @@ impl<B: ChunkSource + ChunkSink + 'static> AsyncWrite for BlobWriter<B> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let pos = self.pos;
-        let n = ready!(self.mode.poll_write_impl(pos, buf, cx))?;
+        let n = ready!(self.mode.poll_write_impl(pos, buf, cx)).map_err(|e| {
+            self.error_count += 1;
+            e
+        })?;
         self.pos += n as u64;
         Poll::Ready(Ok(n))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.mode.check_closed()?;
-        self.mode.poll_flush_pipeline(cx)
+        self.mode.poll_flush_pipeline(cx).map_err(|e| {
+            self.error_count += 1;
+            e
+        })
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.mode.closed {
-            ready!(self.mode.poll_flush_pipeline(cx))?;
+            ready!(self.mode.poll_flush_pipeline(cx)).map_err(|e| {
+                self.error_count += 1;
+                e
+            })?;
             self.mode.closed = true;
         }
         Poll::Ready(Ok(()))

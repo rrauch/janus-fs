@@ -4,6 +4,10 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
+sia-io = { path = "../sia-io", features = ["indexd", "renterd"] }
+sia-vfs = { path = "../sia-vfs", features = ["indexd", "renterd"] }
+foyer-cache = { path = "../foyer-cache" }
+
 anyhow = { workspace = true, features = ["backtrace"] }
 async-trait = "0.1"
 bimap = "0.6"

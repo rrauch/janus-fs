@@ -1,7 +1,6 @@
 use crate::cache::Cache;
 use crate::object::{Object, ObjectId};
-use crate::{Backend, Client, Metadata, MetadataSource, mock, renterd};
-use chrono::Utc;
+use crate::{Backend, Client, Metadata, MetadataSource};
 use futures_io::AsyncRead;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -285,7 +284,7 @@ impl Backend {
 
                 let id = renterd
                     .object_id(None, name_hint)
-                    .map_err(renterd::client::ClientError::ObjectKeyError)?;
+                    .map_err(crate::renterd::client::ClientError::ObjectKeyError)?;
 
                 renterd
                     .upload(
@@ -309,11 +308,12 @@ impl Backend {
                     _ => return Err(crate::Error::BackendMismatch),
                 }
                 .unwrap_or_default();
-                let id = mock::MockObjectId::try_from(format!("mock:{}", name_hint.as_ref()))?;
+                let id =
+                    crate::mock::MockObjectId::try_from(format!("mock:{}", name_hint.as_ref()))?;
                 let mut buf = vec![];
                 futures_util::AsyncReadExt::read_to_end(&mut content, &mut buf).await?;
-                let now = Utc::now();
-                let object = mock::MockObject {
+                let now = chrono::Utc::now();
+                let object = crate::mock::MockObject {
                     id,
                     created_at: now,
                     updated_at: now,

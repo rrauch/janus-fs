@@ -1,8 +1,12 @@
 use bytesize::ByteSize;
 use clap::Parser;
+use foyer_cache::{FoyerChunkCache, FoyerMetadataCache};
+use sia_io::renterd::client::ApiPassword;
+use sia_io::renterd::BucketName;
 use sia_nfs::SiaNfs;
 use std::num::ParseIntError;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{Instrument, Level};
@@ -14,6 +18,7 @@ use url::Url;
 /// Exports Sia buckets via NFS.
 /// Connects to renterd, allowing direct NFS access to exported buckets.
 struct Arguments {
+    vfs_id: String,
     #[arg(long, short = 'e', env, value_hint = clap::ValueHint::Url)]
     /// URL for renterd's API endpoint (e.g., http://localhost:9880/api/).
     renterd_api_endpoint: Url,
@@ -30,13 +35,17 @@ struct Arguments {
     #[arg(long, short = 'm', env)]
     #[clap(default_value = "2 GiB")]
     max_cache_size: ByteSize,
+    /// Maximum size of metadata cache. Set to `0` to disable.
+    #[arg(long, short = 'n', env)]
+    #[clap(default_value = "256 MiB")]
+    max_metadata_cache_size: ByteSize,
     /// Host and port to listen on.
     #[arg(long, short = 'l', env)]
     #[clap(default_value = "localhost:12000")]
     listen_address: String,
-    /// List of buckets to export.
-    #[arg(required = true, num_args = 1..)]
-    buckets: Vec<String>,
+    /// Bucket to export.
+    #[arg(long, short = 'b', env)]
+    bucket: String,
     /// UID of files and directories
     #[arg(long, env = "INODE_UID")]
     #[clap(default_value = "1000")]
@@ -76,13 +85,68 @@ async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
 
     tokio::fs::create_dir_all(&arguments.data_dir).await?;
-    let db_path = arguments.data_dir.join("sia_nfs_meta.sqlite");
+
+    let api_password = if arguments.renterd_api_password.is_empty() {
+        None
+    } else {
+        Some(ApiPassword::from(arguments.renterd_api_password))
+    };
+    let client = sia_io::renterd::client::Client::builder()
+        .api_endpoint(arguments.renterd_api_endpoint)
+        .maybe_api_password(api_password)
+        .bucket(BucketName::from_str(arguments.bucket.as_str())?)
+        .build()?;
+
+    let cache = if arguments.max_cache_size.as_u64() > 0
+        || arguments.max_metadata_cache_size.as_u64() > 0
+    {
+        let path = arguments
+            .cache_dir
+            .unwrap_or_else(|| arguments.data_dir.clone());
+
+        let maybe_metadata_cache = if arguments.max_metadata_cache_size.as_u64() > 0 {
+            Some(
+                FoyerMetadataCache::builder()
+                    .max_disk_space(arguments.max_metadata_cache_size.as_u64())
+                    .disk_path(path.join("metadata_cache"))
+                    .build()
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let maybe_chunk_cache = if arguments.max_cache_size.as_u64() > 0 {
+            Some(
+                FoyerChunkCache::builder()
+                    .max_disk_space(arguments.max_cache_size.as_u64())
+                    .disk_path(path.join("chunk_cache"))
+                    .build()
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        sia_io::cache::Cache::builder()
+            .maybe_metadata_l2_cache(maybe_metadata_cache)
+            .maybe_chunk_l2_cache(maybe_chunk_cache)
+            .build()
+    } else {
+        sia_io::cache::Cache::default()
+    };
+
+    let sia = sia_io::Client::builder()
+        .backend(client)
+        .cache(cache)
+        .build()
+        .await?;
 
     let sia_nfs = SiaNfs::new(
-        &arguments.renterd_api_endpoint,
-        &arguments.renterd_api_password,
-        &db_path,
-        arguments.buckets,
+        sia,
+        arguments.vfs_id.as_str(),
+        false,
+        &arguments.data_dir,
         &arguments.listen_address,
         arguments.uid,
         arguments.gid,
