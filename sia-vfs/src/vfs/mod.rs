@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod commit;
 pub mod directory;
 pub mod entity;
 pub mod file;
@@ -13,6 +14,7 @@ use crate::db::{
 use crate::object::ObjectId;
 use crate::sync::Syncer;
 use crate::vfs::cache::{Cache, CacheSettings};
+use crate::vfs::commit::Commit;
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
@@ -26,6 +28,7 @@ use sia_io::Client as Sia;
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -131,6 +134,104 @@ impl Display for InodeId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum Head {
+    Branch(BranchName),
+    Tag(TagName),
+}
+
+impl Default for Head {
+    fn default() -> Self {
+        Self::Branch(BranchName::default())
+    }
+}
+
+impl Head {
+    #[inline]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Branch(b) => b,
+            Self::Tag(t) => t,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_tag(&self) -> bool {
+        match self {
+            Self::Branch(_) => false,
+            Self::Tag(_) => true,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn maybe_branch_name(&self) -> Option<BranchName> {
+        match self {
+            Self::Branch(b) => Some(b.clone()),
+            Self::Tag(_) => None,
+        }
+    }
+}
+
+impl Display for Head {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Branch(b) => Display::fmt(b, f),
+            Self::Tag(t) => Display::fmt(t, f),
+        }
+    }
+}
+
+#[derive_where(Debug, Clone, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct Label<T>(Arc<str>, PhantomData<T>);
+
+impl<T> FromStr for Label<T> {
+    type Err = NameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        check_valid_filename(s)?;
+        Ok(Self(Arc::from(s), PhantomData))
+    }
+}
+
+impl<T> Display for Label<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl<T> Deref for Label<T> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct BranchKind;
+pub type BranchName = Label<BranchKind>;
+
+impl Default for BranchName {
+    fn default() -> Self {
+        Self::from_str("main").expect("default branch name to be valid")
+    }
+}
+
+impl From<BranchName> for Head {
+    fn from(value: BranchName) -> Self {
+        Self::Branch(value)
+    }
+}
+
+impl From<TagName> for Head {
+    fn from(value: TagName) -> Self {
+        Self::Tag(value)
+    }
+}
+
+pub struct TagKind;
+pub type TagName = Label<TagKind>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum StorageMode {
     Synced(ObjectId),
@@ -143,7 +244,7 @@ pub struct Timestamp(DateTime<Utc>);
 
 impl Timestamp {
     pub fn now() -> Self {
-        Self(Utc::now())
+        Utc::now().into()
     }
     pub fn from_millis(millis: i64) -> Option<Self> {
         DateTime::<Utc>::from_timestamp_millis(millis).map(Self)
@@ -496,6 +597,7 @@ impl Vfs {
     #[builder(derive(Debug))]
     pub async fn new(
         vfs_id: VfsId,
+        #[builder(default, into)] head: Head,
         #[builder(default = false)] read_only: bool,
         db_file: PathBuf,
         sia_client: Sia,
@@ -516,6 +618,7 @@ impl Vfs {
             db_page_size,
             cache.clone(),
             sia_client.clone(),
+            head.clone(),
         )
         .await?;
 
@@ -524,8 +627,11 @@ impl Vfs {
         let reaper = Reaper::new(db.clone());
         let (syncer, syncer_tx) = Syncer::new(sync_frequency, initial_sync_delay);
 
+        let read_only = if head.is_tag() { true } else { read_only };
+
         let this = Self(Arc::new(Inner {
             vfs_id,
+            head,
             db,
             cache,
             max_chunk_size,
@@ -548,11 +654,15 @@ impl Vfs {
     pub fn is_read_only(&self) -> bool {
         self.0.read_only
     }
+    pub fn head(&self) -> &Head {
+        &self.0.head
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct Inner {
     vfs_id: VfsId,
+    head: Head,
     db: Db,
     cache: Cache,
     max_chunk_size: usize,
@@ -616,6 +726,16 @@ impl Vfs {
     #[inline]
     pub(crate) fn max_sync_concurrency(&self) -> NonZeroUsize {
         self.0.max_sync_concurrency
+    }
+
+    pub async fn current_commit(&self) -> VfsResult<Commit> {
+        //todo: caching
+        let mut tx = self.tx().await?;
+        let commit_id = tx.current_commit_id(self.head().clone()).await?;
+        Ok(tx
+            .commit_by_id(&commit_id)
+            .await?
+            .ok_or_else(|| DbError::DataError(DataError::CommitNotFound(commit_id)))?)
     }
 }
 

@@ -1,3 +1,176 @@
+CREATE TABLE commits
+(
+    id         BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
+                                                LENGTH(id) = 32),
+    ref_count  INTEGER          NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    entity_id  BLOB             NOT NULL,
+    entity_rev BLOB             NOT NULL,
+    mode       TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
+    object_id  INTEGER REFERENCES object (id),
+    data       BLOB,
+
+    FOREIGN KEY (entity_id, entity_rev) REFERENCES entity (id, revision),
+
+    -- Make sure synced entities have an object and no data while local ones have data and no object
+    CHECK (
+        (mode = 'S' AND object_id IS NOT NULL AND data IS NULL) OR
+        (mode = 'L' AND object_id IS NULL AND data IS NOT NULL)
+        )
+);
+
+CREATE TRIGGER commits_update_only_local_to_synced_or_refcount
+    BEFORE UPDATE
+    ON commits
+    FOR EACH ROW
+    WHEN OLD.mode IS NOT NEW.mode
+        OR OLD.object_id IS NOT NEW.object_id
+        OR OLD.data IS NOT NEW.data
+        OR OLD.id IS NOT NEW.id
+        OR OLD.entity_id IS NOT NEW.entity_id
+        OR OLD.entity_rev IS NOT NEW.entity_rev
+BEGIN
+    SELECT RAISE(ABORT, 'commit update: only L->S mode transition allowed') WHERE NOT (
+        OLD.mode = 'L' AND NEW.mode = 'S'
+            AND OLD.object_id IS NULL
+            AND NEW.object_id IS NOT NULL
+            AND OLD.id = NEW.id
+            AND OLD.entity_id = NEW.entity_id
+            AND OLD.entity_rev = NEW.entity_rev
+            AND NEW.data IS NULL
+        );
+END;
+
+CREATE TRIGGER commits_entity_must_be_dir
+    BEFORE INSERT
+    ON commits
+    FOR EACH ROW
+    WHEN (SELECT entity_type
+          FROM entity
+          WHERE id = NEW.entity_id
+            AND revision = NEW.entity_rev) <> 'D'
+BEGIN
+SELECT RAISE(ABORT, 'commit entity must be a directory');
+END;
+
+-- Increment entity ref_count when a commit is inserted
+CREATE TRIGGER commits_insert_entity_refcount
+    AFTER INSERT
+    ON commits
+    FOR EACH ROW
+BEGIN
+    UPDATE entity
+    SET ref_count = ref_count + 1
+    WHERE id = NEW.entity_id
+      AND revision = NEW.entity_rev;
+END;
+
+-- Decrement entity ref_count when a commit is deleted
+CREATE TRIGGER commits_delete_entity_refcount
+    AFTER DELETE
+    ON commits
+    FOR EACH ROW
+BEGIN
+    UPDATE entity
+    SET ref_count = ref_count - 1
+    WHERE id = OLD.entity_id
+      AND revision = OLD.entity_rev;
+END;
+
+-- commits-object ref_count
+CREATE TRIGGER commits_insert_object_refcount
+    AFTER INSERT
+    ON commits
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+END;
+
+CREATE TRIGGER commits_update_object_refcount
+    AFTER UPDATE
+    ON commits
+    FOR EACH ROW
+    WHEN NEW.object_id IS NOT OLD.object_id
+BEGIN
+    UPDATE object SET ref_count = ref_count + 1 WHERE id = NEW.object_id;
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
+END;
+
+CREATE TRIGGER commits_delete_object_refcount
+    AFTER DELETE
+    ON commits
+    FOR EACH ROW
+    WHEN OLD.object_id IS NOT NULL
+BEGIN
+    UPDATE object SET ref_count = ref_count - 1 WHERE id = OLD.object_id;
+END;
+
+-- Automatic GC of local commits
+CREATE TRIGGER commits_gc_on_local_zero_refcount
+    AFTER UPDATE OF ref_count
+    ON commits
+    FOR EACH ROW
+    WHEN NEW.ref_count = 0
+        AND NEW.mode = 'L'
+BEGIN
+    DELETE FROM commits WHERE id = NEW.id;
+END;
+
+CREATE TABLE head
+(
+    name      TEXT PRIMARY KEY NOT NULL COLLATE NOCASE CHECK (LENGTH(name) >= 1 AND
+                                                              LENGTH(name) <= 255),
+    type      TEXT             NOT NULL CHECK (type IN ('B', 'T')),
+    commit_id BLOB             NOT NULL REFERENCES commits (id)
+);
+
+CREATE TRIGGER prevent_head_type_update
+    BEFORE UPDATE OF type
+    ON head
+    FOR EACH ROW
+    WHEN OLD.type <> NEW.type
+BEGIN
+    SELECT RAISE(ABORT, 'cannot update type');
+END;
+
+-- Increment commit ref_count when a head is inserted
+CREATE TRIGGER head_insert_commit_refcount
+    AFTER INSERT
+    ON head
+    FOR EACH ROW
+BEGIN
+    UPDATE commits
+    SET ref_count = ref_count + 1
+    WHERE id = NEW.commit_id;
+END;
+
+-- Decrement commit ref_count when a head is deleted
+CREATE TRIGGER head_delete_commit_refcount
+    AFTER DELETE
+    ON head
+    FOR EACH ROW
+BEGIN
+    UPDATE commits
+    SET ref_count = ref_count - 1
+    WHERE id = OLD.commit_id;
+END;
+
+-- Adjust commit ref_count when a head is re-pointed
+CREATE TRIGGER head_update_commit_refcount
+    AFTER UPDATE OF commit_id
+    ON head
+    FOR EACH ROW
+    WHEN OLD.commit_id IS NOT NEW.commit_id
+BEGIN
+    UPDATE commits
+    SET ref_count = ref_count + 1
+    WHERE id = NEW.commit_id;
+
+    UPDATE commits
+    SET ref_count = ref_count - 1
+    WHERE id = OLD.commit_id;
+END;
+
 CREATE TABLE entity
 (
     id          BLOB    NOT NULL CHECK (TYPEOF(id) = 'blob' AND
@@ -711,15 +884,13 @@ END;
 CREATE TABLE sync_job
 (
     created         TIMESTAMP NOT NULL,
-    root_entity_id  BLOB      NOT NULL,
-    root_entity_rev BLOB      NOT NULL,
+    commit_id       BLOB      NOT NULL REFERENCES commits (id),
     synced_blobs    INTEGER   NOT NULL DEFAULT 0 CHECK (synced_blobs >= 0),
     synced_chunks   INTEGER   NOT NULL DEFAULT 0 CHECK (synced_chunks >= 0),
     synced_entities INTEGER   NOT NULL DEFAULT 0 CHECK (synced_entities >= 0),
+    synced_commits  INTEGER   NOT NULL DEFAULT 0 CHECK (synced_commits >= 0),
     uploaded_data   INTEGER   NOT NULL DEFAULT 0 CHECK (uploaded_data >= 0),
-    num_uploads     INTEGER   NOT NULL DEFAULT 0 CHECK (num_uploads >= 0),
-
-    FOREIGN KEY (root_entity_id, root_entity_rev) REFERENCES entity (id, revision)
+    num_uploads     INTEGER   NOT NULL DEFAULT 0 CHECK (num_uploads >= 0)
 );
 
 CREATE TRIGGER single_sync_job_only
@@ -732,27 +903,14 @@ BEGIN
 SELECT RAISE(ABORT, 'sync_job: only a single row allowed at a time');
 END;
 
-CREATE TRIGGER sync_job_root_entity_type_insert
-    BEFORE INSERT
-    ON sync_job
-    FOR EACH ROW
-    WHEN (SELECT entity_type
-          FROM entity
-          WHERE id = NEW.root_entity_id
-            AND revision = NEW.root_entity_rev) != 'D'
-BEGIN
-SELECT RAISE(ABORT, 'sync_job root must reference an entity of type D');
-END;
-
 CREATE TRIGGER sync_job_immutable
     BEFORE UPDATE
     ON sync_job
     FOR EACH ROW
     WHEN OLD.created <> NEW.created
-        OR OLD.root_entity_id <> NEW.root_entity_id
-        OR OLD.root_entity_rev <> NEW.root_entity_rev
+        OR OLD.commit_id <> NEW.commit_id
 BEGIN
-    SELECT RAISE(ABORT, 'sync_job: created, root_entity_id and root_entity_rev are immutable');
+    SELECT RAISE(ABORT, 'sync_job: created and commit_id are immutable');
 END;
 
 
@@ -768,38 +926,37 @@ DELETE
 FROM sync_job_queue;
 END;
 
--- Increment entity ref_count when sync_job is inserted
+-- Increment commit ref_count when sync_job is inserted
 CREATE TRIGGER sync_job_insert_refcount
     AFTER INSERT
     ON sync_job
     FOR EACH ROW
 BEGIN
-    UPDATE entity
+    UPDATE commits
     SET ref_count = ref_count + 1
-    WHERE id = NEW.root_entity_id
-      AND revision = NEW.root_entity_rev;
+    WHERE id = NEW.commit_id;
 END;
 
--- Decrement entity ref_count when sync_job is deleted
+-- Decrement commit ref_count when sync_job is deleted
 CREATE TRIGGER sync_job_delete_refcount
     AFTER DELETE
     ON sync_job
     FOR EACH ROW
 BEGIN
-    UPDATE entity
+    UPDATE commits
     SET ref_count = ref_count - 1
-    WHERE id = OLD.root_entity_id
-      AND revision = OLD.root_entity_rev;
+    WHERE id = OLD.commit_id;
 END;
 
 CREATE TABLE sync_job_queue
 (
     id             INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E')), -- Blob, Chunk or Entity
+    type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E', 'T')), -- Blob, Chunk, Entity or Commit
     blob_id        BLOB UNIQUE REFERENCES blob (id),
     chunk_id       BLOB UNIQUE REFERENCES chunk (id),
     entity_id      BLOB,
     entity_rev     BLOB,
+    commit_id      BLOB UNIQUE REFERENCES commits (id),
     estimated_size INTEGER NOT NULL CHECK (estimated_size > 0),
     pending        INTEGER NOT NULL DEFAULT 0 CHECK (pending IN (0, 1)),
 
@@ -807,14 +964,19 @@ CREATE TABLE sync_job_queue
     UNIQUE (entity_id, entity_rev),
 
     CHECK (
-        (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL) OR
-        (type = 'C' AND blob_id IS NULL AND chunk_id IS NOT NULL AND entity_id IS NULL AND entity_rev IS NULL) OR
-        (type = 'E' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NOT NULL AND entity_rev IS NOT NULL)
+        (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL AND
+         commit_id IS NULL) OR
+        (type = 'C' AND blob_id IS NULL AND chunk_id IS NOT NULL AND entity_id IS NULL AND entity_rev IS NULL AND
+         commit_id IS NULL) OR
+        (type = 'E' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NOT NULL AND entity_rev IS NOT NULL AND
+         commit_id IS NULL) OR
+        (type = 'T' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL AND
+         commit_id IS NOT NULL)
         )
 );
 
 CREATE TRIGGER sync_job_queue_no_updates
-    BEFORE UPDATE OF id, type, blob_id, chunk_id, entity_id, entity_rev, estimated_size
+    BEFORE UPDATE OF id, type, blob_id, chunk_id, entity_id, entity_rev, commit_id, estimated_size
     ON sync_job_queue
     FOR EACH ROW
 BEGIN
@@ -896,6 +1058,29 @@ BEGIN
       AND revision = OLD.entity_rev;
 END;
 
+-- Increment commit ref_count when sync_job_queue row is inserted
+CREATE TRIGGER sync_job_queue_commit_insert_refcount
+    AFTER INSERT
+    ON sync_job_queue
+    FOR EACH ROW
+    WHEN NEW.commit_id IS NOT NULL
+BEGIN
+    UPDATE commits
+    SET ref_count = ref_count + 1
+    WHERE id = NEW.commit_id;
+END;
+
+-- Decrement commit ref_count when sync_job_queue row is deleted
+CREATE TRIGGER sync_job_queue_commit_delete_refcount
+    AFTER DELETE
+    ON sync_job_queue
+    FOR EACH ROW
+    WHEN OLD.commit_id IS NOT NULL
+BEGIN
+    UPDATE commits
+    SET ref_count = ref_count - 1
+    WHERE id = OLD.commit_id;
+END;
 
 CREATE TABLE object
 (

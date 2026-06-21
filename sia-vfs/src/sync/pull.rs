@@ -4,7 +4,7 @@ use crate::sync::{Error, METADATA_VFS_VERSION};
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::EntityHandler;
 use crate::vfs::file::FileKind;
-use crate::vfs::{Timestamp, Vfs, VfsResult, entity};
+use crate::vfs::{Timestamp, Vfs, VfsResult, commit, entity};
 use crate::{blob, chunk, object};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
 use sia_io::object::Object as SiaObject;
@@ -29,11 +29,12 @@ impl PullTask {
         let mut erroneous_object_ids = self.vfs.known_object_ids().await?;
 
         // The order in which objects are processed is important due to their internal dependency hierarchy:
-        // Entities may depend on Blobs & Blobs depend on Chunks
-        // Hence we have to process in order of: 1. Chunks 2. Blobs 3. Entities
+        // Commits depend on Entities, Entities may depend on Blobs & Blobs depend on Chunks
+        // Hence we have to process in order of: 1. Chunks 2. Blobs 3. Entities 4. Commits
         let mut chunks = vec![];
         let mut blobs = vec![];
         let mut entities = vec![];
+        let mut commits = vec![];
 
         let mut stream = self.vfs.backend_objects().await?;
         while let Some(sia_object) = stream.try_next().await? {
@@ -46,11 +47,12 @@ impl PullTask {
                 Some(chunk::METADATA_OBJECT_TYPE) => chunks.push(sia_object),
                 Some(blob::METADATA_OBJECT_TYPE) => blobs.push(sia_object),
                 Some(entity::METADATA_OBJECT_TYPE) => entities.push(sia_object),
+                Some(commit::METADATA_OBJECT_TYPE) => commits.push(sia_object),
                 _ => {} // ignore
             }
         }
 
-        for group in [chunks, blobs, entities] {
+        for group in [chunks, blobs, entities, commits] {
             let processed = self.process_objects(group).await;
             erroneous_object_ids.retain(|oid| !processed.contains(oid));
         }
@@ -72,6 +74,7 @@ impl PullTask {
                     Ok(id) => Some(id),
                     Err(e) => {
                         // log::warn!("sync failed: {e:?}");
+                        //eprintln!("sync failed: {e:?}");
                         None
                     }
                 }
@@ -151,6 +154,18 @@ impl PullTask {
                             Self::chunk_sync(&mut tx, chunk_id, id).await?;
                         }
                     }
+                    Some(commit::METADATA_OBJECT_TYPE) => {
+                        if let Some(commit_id) = metadata.get(commit::METADATA_COMMIT_ID) {
+                            Self::commit_sync(
+                                &mut tx,
+                                self.vfs.sia_client(),
+                                commit_id,
+                                &sia_object,
+                                id,
+                            )
+                            .await?;
+                        }
+                    }
                     None => {}
                     Some(other) => {}
                 }
@@ -216,11 +231,12 @@ mod tests {
     use crate::blob::{Blob, BlobMut};
     use crate::chunk::Chunk;
     use crate::sync::PullTask;
+    use crate::vfs::commit::{Commit, CommitId, CommitMut};
     use crate::vfs::directory::DirectoryDraft;
-    use crate::vfs::entity::{DraftEntity, EntityHandler};
+    use crate::vfs::entity::{DraftEntity, EntityHandler, EntityKey};
     use crate::vfs::file::FileDraft;
     use crate::vfs::tests::new_vfs_with_opts;
-    use crate::vfs::{OwnedName, StorageMode, Vfs, VfsId};
+    use crate::vfs::{OwnedName, StorageMode, Timestamp, Vfs, VfsId};
     use futures_util::AsyncWriteExt;
     use std::num::NonZeroUsize;
     use std::ops::Deref;
@@ -232,6 +248,53 @@ mod tests {
             |vfs| async move {
                 assert!(vfs.tx().await?.list_objects().await?.is_empty());
                 Ok(())
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_commit() -> anyhow::Result<()> {
+        let dir = DirectoryDraft::new_directory_draft(OwnedName::try_from("dir")?);
+        let entity_key = EntityKey::new(dir.entity_id().clone(), dir.revision().clone());
+
+        let commit = CommitMut {
+            entity_key,
+            preceding_commit_id: CommitId::zeroed(),
+            commit_count: 0,
+            created: Timestamp::now(),
+        }
+        .freeze();
+
+        pull_test(
+            |vfs| {
+                let commit = commit.clone();
+                async move {
+                    upload_entity_object(&vfs, &dir).await?;
+                    upload_commit_object(&vfs, &commit).await?;
+                    Ok(())
+                }
+            },
+            |vfs| {
+                let commit = commit.clone();
+                async move {
+                    let mut tx = vfs.tx().await?;
+                    let objects = tx.list_objects().await?;
+                    assert_eq!(objects.len(), 2);
+                    let object = objects.get(0).unwrap();
+                    assert_eq!(*object.id().deref(), 2);
+                    assert_eq!(
+                        object.remote_location(),
+                        format!("mock:/commits/{}.commit", commit.id())
+                    );
+
+                    let commit = commit.into_synced(object.id());
+                    let stored_commit = tx.commit_by_id(commit.id()).await?.unwrap();
+                    assert_eq!(stored_commit, commit);
+                    Ok(())
+                }
             },
         )
         .await?;
@@ -535,6 +598,13 @@ mod tests {
     async fn upload_chunk_object(vfs: &Vfs, chunk: &Chunk) -> anyhow::Result<()> {
         vfs.sia_client()
             .upload(chunk.to_uploadable_object(vfs.id()))
+            .await?;
+        Ok(())
+    }
+
+    async fn upload_commit_object(vfs: &Vfs, commit: &Commit) -> anyhow::Result<()> {
+        vfs.sia_client()
+            .upload(commit.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }

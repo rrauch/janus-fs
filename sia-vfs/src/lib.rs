@@ -1,5 +1,5 @@
 use crate::gen_flatbuffers::vfs::common::ContentId as FlatContentId;
-use crate::gen_flatbuffers::vfs::entity::Uuid as FlatUuid;
+use crate::gen_flatbuffers::vfs::common::Uuid as FlatUuid;
 use bytemuck::TransparentWrapper;
 pub use bytesize::ByteSize;
 use derive_where::derive_where;

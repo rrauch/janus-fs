@@ -4,6 +4,7 @@ pub(crate) mod push;
 use crate::blob::BlobError;
 use crate::db::Error as DbError;
 use crate::sync::push::PushTask;
+use crate::vfs::commit::CommitError;
 use crate::vfs::entity::EntityError;
 use crate::vfs::{Vfs, VfsError};
 pub use pull::PullTask;
@@ -33,6 +34,10 @@ pub enum Error {
     EntityError(#[from] EntityError),
     #[error("chunk_id invalid")]
     InvalidChunkId,
+    #[error("vfs head not a branch")]
+    NotBranchError,
+    #[error(transparent)]
+    CommitError(#[from] CommitError),
     #[error(transparent)]
     BlobError(#[from] BlobError),
     #[error(transparent)]
@@ -80,8 +85,12 @@ impl Syncer {
 }
 
 pub(crate) async fn push(vfs: Vfs, max_attempts: NonZeroUsize) -> Result<(), Error> {
+    let branch_name = vfs
+        .head()
+        .maybe_branch_name()
+        .ok_or_else(|| Error::NotBranchError)?;
     let _permit = SYNC_SEMAPHORE.acquire().await.expect("semaphore closed");
-    let mut task = PushTask::new(vfs, max_attempts);
+    let mut task = PushTask::new(vfs, branch_name, max_attempts);
     task.run().await
 }
 

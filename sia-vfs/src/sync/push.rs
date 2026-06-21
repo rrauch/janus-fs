@@ -2,14 +2,14 @@ use crate::blob::{Blob, BlobId};
 use crate::chunk::{Chunk, ChunkId};
 use crate::db::{DataError, Error as DbError, Read, Transaction, TxScope, Write};
 use crate::sync::Error;
+use crate::vfs::commit::{Commit, CommitId};
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::{EntityKey, LocalEntity};
 use crate::vfs::file::FileKind;
-use crate::vfs::{ROOT_INODE_ID, Timestamp, Vfs, VfsError, VfsId};
+use crate::vfs::{BranchName, Timestamp, Vfs, VfsError, VfsId};
 use elsa::FrozenVec;
 use sia_io::upload::{MultiUploader, UploadError};
 use std::num::NonZeroUsize;
-use std::ops::Deref;
 use std::time::Duration;
 
 const BACKOFF_INITIAL_DELAY: Duration = Duration::from_secs(2);
@@ -18,6 +18,7 @@ const BACKOFF_MULTIPLIER: f64 = 1.5;
 
 pub struct PushTask {
     vfs: Vfs,
+    branch_name: BranchName,
     max_attempts: usize,
 }
 
@@ -26,6 +27,7 @@ enum Pending {
     Blob(Blob),
     File(LocalEntity<FileKind>),
     Dir(LocalEntity<DirectoryKind>),
+    Commit(Commit),
 }
 
 impl Pending {
@@ -39,14 +41,16 @@ impl Pending {
             Self::Blob(b) => uploader.enqueue(b.to_uploadable_object(vfs_id)).await,
             Self::File(f) => uploader.enqueue(f.to_uploadable_object(vfs_id)).await,
             Self::Dir(d) => uploader.enqueue(d.to_uploadable_object(vfs_id)).await,
+            Self::Commit(c) => uploader.enqueue(c.to_uploadable_object(vfs_id)).await,
         }
     }
 }
 
 impl PushTask {
-    pub(super) fn new(vfs: Vfs, max_attempts: NonZeroUsize) -> Self {
+    pub(super) fn new(vfs: Vfs, branch_name: BranchName, max_attempts: NonZeroUsize) -> Self {
         Self {
             vfs,
+            branch_name,
             max_attempts: max_attempts.get(),
         }
     }
@@ -133,6 +137,7 @@ impl PushTask {
                 .prepare_entity::<DirectoryKind, _>(key, tx)
                 .await?
                 .map(Pending::Dir),
+            Some(JobItem::Commit(id)) => self.prepare_commit(id, tx).await?.map(Pending::Commit),
             None => None,
         })
     }
@@ -192,6 +197,9 @@ impl PushTask {
                     Pending::Dir(dir) => {
                         self.process_entity(dir.clone(), object, &mut tx).await?;
                     }
+                    Pending::Commit(commit) => {
+                        self.process_commit(commit.clone(), object, &mut tx).await?;
+                    }
                 }
             }
             tx.commit().await?;
@@ -207,11 +215,12 @@ impl PushTask {
         Transaction<TX>: Write,
     {
         let mut num_items = 0;
-        tx.create_sync_job().await?;
+        tx.create_sync_job(self.branch_name.clone()).await?;
 
         num_items += self.queue_chunks(tx).await?;
         num_items += self.queue_blobs(tx).await?;
         num_items += self.queue_entities(tx).await?;
+        num_items += self.queue_commits(tx).await?;
 
         Ok(num_items)
     }
@@ -221,6 +230,7 @@ pub(crate) enum JobItem {
     Chunk(ChunkId),
     Blob(BlobId),
     Entity(EntityKey, EntityType),
+    Commit(CommitId),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -259,7 +269,8 @@ where
                         "E" => {
                             let (entity_key, entity_type) = self.entity_item(id).await?;
                             JobItem::Entity(entity_key, entity_type)
-                        }
+                        },
+                        "T" => JobItem::Commit(self.commit_item(id).await?),
                         _ => return Err(DataError::ConversionError("invalid job item".into()))?,
                     })
                 }
@@ -270,11 +281,13 @@ where
     async fn has_push_items(&mut self) -> Result<bool, DbError> {
         Ok(sqlx::query!(
             "SELECT EXISTS (
-    SELECT 1 FROM entity WHERE mode = 'L' AND ref_count > 0
+    SELECT 1 FROM entity  WHERE mode = 'L' AND ref_count > 0
     UNION ALL
-    SELECT 1 FROM blob   WHERE mode = 'L' AND ref_count > 0
+    SELECT 1 FROM blob    WHERE mode = 'L' AND ref_count > 0
     UNION ALL
-    SELECT 1 FROM chunk  WHERE mode = 'L' AND ref_count > 0
+    SELECT 1 FROM chunk   WHERE mode = 'L' AND ref_count > 0
+    UNION ALL
+    SELECT 1 FROM commits WHERE mode = 'L' AND ref_count > 0
     LIMIT 1
           ) AS \"has_items: bool\""
         )
@@ -302,23 +315,15 @@ where
         Ok(())
     }
 
-    async fn create_sync_job(&mut self) -> Result<(), DbError> {
-        let root_id = *ROOT_INODE_ID.deref() as i64;
-
-        let r = sqlx::query!(
-            "SELECT entity_id, entity_rev FROM vfs WHERE inode_id = ?",
-            root_id
-        )
-        .fetch_one(self.conn())
-        .await?;
-        let (root_entity_id, root_entity_rev) = (r.entity_id.as_slice(), r.entity_rev.as_slice());
+    async fn create_sync_job(&mut self, branch_name: BranchName) -> Result<(), DbError> {
+        let commit_id = self.current_commit_id(branch_name).await?;
+        let id = commit_id.as_slice();
         let created = Timestamp::now().to_millis();
 
         sqlx::query!(
-            "INSERT INTO sync_job (created, root_entity_id, root_entity_rev) VALUES (?, ?, ?)",
+            "INSERT INTO sync_job (created, commit_id) VALUES (?, ?)",
             created,
-            root_entity_id,
-            root_entity_rev,
+            id,
         )
         .execute(self.conn())
         .await?;
@@ -331,26 +336,29 @@ where
         item: &JobItem,
         estimated_size: u64,
     ) -> Result<bool, DbError> {
-        let (item_type, blob_id, chunk_id, entity_id, entity_rev) = match item {
-            JobItem::Chunk(chunk_id) => ("C", None, Some(chunk_id.as_slice()), None, None),
-            JobItem::Blob(blob_id) => ("B", Some(blob_id.as_slice()), None, None, None),
+        let (item_type, blob_id, chunk_id, entity_id, entity_rev, commit_id) = match item {
+            JobItem::Chunk(chunk_id) => ("C", None, Some(chunk_id.as_slice()), None, None, None),
+            JobItem::Blob(blob_id) => ("B", Some(blob_id.as_slice()), None, None, None, None),
             JobItem::Entity(key, _) => (
                 "E",
                 None,
                 None,
                 Some(key.id().as_slice()),
                 Some(key.revision().as_slice()),
+                None,
             ),
+            JobItem::Commit(commit_id) => ("T", None, None, None, None, Some(commit_id.as_slice())),
         };
         let estimated_size = estimated_size as i64;
 
         let inserted = sqlx::query!(
-            "INSERT OR IGNORE INTO sync_job_queue (type, blob_id, chunk_id, entity_id, entity_rev, estimated_size) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO sync_job_queue (type, blob_id, chunk_id, entity_id, entity_rev, commit_id, estimated_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
             item_type,
             blob_id,
             chunk_id,
             entity_id,
             entity_rev,
+            commit_id,
             estimated_size
         ).execute(self.conn()).await?.rows_affected() > 0;
 
@@ -369,6 +377,7 @@ mod tests {
     async fn basic_push() -> anyhow::Result<()> {
         let (vfs, _temp_dir) = new_vfs().await?;
         let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
+        let branch_name = vfs.head().maybe_branch_name().unwrap();
 
         let dir = vfs
             .create_dir(&vfs.root().await?, "dir1".try_into()?)
@@ -381,7 +390,9 @@ mod tests {
         fh.write_all(b"This is a test").await?;
         fh.commit().await?;
 
-        let mut task = PushTask::new(vfs.clone(), NonZeroUsize::new(1).unwrap());
+        assert!(!vfs.current_commit().await?.is_synced());
+
+        let mut task = PushTask::new(vfs.clone(), branch_name, NonZeroUsize::new(1).unwrap());
         task.run().await?;
 
         let file = vfs.inode_by_id(file.inode_id()).await?.unwrap();
@@ -389,6 +400,7 @@ mod tests {
 
         let dir = vfs.inode_by_id(dir.inode_id()).await?.unwrap();
         assert!(dir.is_synced());
+        assert!(vfs.current_commit().await?.is_synced());
 
         Ok(())
     }
