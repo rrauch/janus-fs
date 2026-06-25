@@ -1011,7 +1011,7 @@ CREATE TABLE sync_job_queue
 );
 
 CREATE TRIGGER sync_job_queue_no_updates
-    BEFORE UPDATE OF id, type, blob_id, chunk_id, entity_id, entity_rev, commit_id, estimated_size
+    BEFORE UPDATE OF id, type, blob_id, chunk_id, entity_id, entity_rev, commit_id, config, estimated_size
     ON sync_job_queue
     FOR EACH ROW
 BEGIN
