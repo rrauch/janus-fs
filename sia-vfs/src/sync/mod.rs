@@ -4,9 +4,10 @@ pub(crate) mod push;
 use crate::blob::BlobError;
 use crate::db::Error as DbError;
 use crate::sync::push::PushTask;
+use crate::vfs::commit::CommitError;
+use crate::vfs::config::ConfigError;
 use crate::vfs::entity::EntityError;
-use crate::vfs::{ReadOnly, ReadWrite, Vfs, VfsError};
-use async_trait::async_trait;
+use crate::vfs::{Vfs, VfsError};
 pub use pull::PullTask;
 use sia_io::upload::UploadError;
 use std::num::NonZeroUsize;
@@ -34,12 +35,20 @@ pub enum Error {
     EntityError(#[from] EntityError),
     #[error("chunk_id invalid")]
     InvalidChunkId,
+    #[error("vfs head not a branch")]
+    NotBranchError,
+    #[error(transparent)]
+    CommitError(#[from] CommitError),
+    #[error(transparent)]
+    ConfigError(#[from] ConfigError),
     #[error(transparent)]
     BlobError(#[from] BlobError),
     #[error(transparent)]
     DbError(#[from] DbError),
     #[error("too many errors")]
     TooManyErrors,
+    #[error("max depth exceeded")]
+    MaxDepthExceeded,
 }
 
 #[derive(Debug)]
@@ -54,16 +63,13 @@ impl Drop for Syncer {
 }
 
 impl Syncer {
-    pub(crate) fn new<Mode: Send + Sync + 'static>(
+    pub(crate) fn new(
         sync_frequency: Duration,
         initial_sync_delay: Duration,
-    ) -> (Self, oneshot::Sender<Vfs<Mode>>)
-    where
-        Vfs<Mode>: Syncee,
-    {
+    ) -> (Self, oneshot::Sender<Vfs>) {
         let (tx, rx) = oneshot::channel();
         let jh = tokio::task::spawn(async move {
-            let vfs: Vfs<Mode> = match rx.await {
+            let vfs: Vfs = match rx.await {
                 Ok(vfs) => vfs,
                 Err(_) => {
                     // sender gone
@@ -83,45 +89,28 @@ impl Syncer {
     }
 }
 
-#[async_trait]
-pub(crate) trait Syncee {
-    async fn sync(&self) -> Result<(), Error>;
-}
-
-#[async_trait]
-impl Syncee for Vfs<ReadWrite> {
-    async fn sync(&self) -> Result<(), Error> {
-        push(self.clone(), self.max_sync_attempts()).await?;
-        pull(self.clone(), self.max_sync_concurrency()).await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Syncee for Vfs<ReadOnly> {
-    async fn sync(&self) -> Result<(), Error> {
-        pull(self.clone(), self.max_sync_concurrency()).await?;
-        Ok(())
-    }
-}
-
-pub(crate) async fn push(vfs: Vfs<ReadWrite>, max_attempts: NonZeroUsize) -> Result<(), Error> {
+pub(crate) async fn push(vfs: Vfs, max_attempts: NonZeroUsize) -> Result<(), Error> {
+    let branch_name = vfs
+        .head()
+        .maybe_branch_name()
+        .ok_or_else(|| Error::NotBranchError)?;
     let _permit = SYNC_SEMAPHORE.acquire().await.expect("semaphore closed");
-    let mut task = PushTask::new(vfs, max_attempts);
+    let mut task = PushTask::new(vfs, branch_name, max_attempts);
     task.run().await
 }
 
-pub(crate) async fn pull<Mode>(vfs: Vfs<Mode>, max_concurrency: NonZeroUsize) -> Result<(), Error> {
+pub(crate) async fn pull(vfs: Vfs, max_concurrency: NonZeroUsize) -> Result<(), Error> {
     let _permit = SYNC_SEMAPHORE.acquire().await.expect("semaphore closed");
     let mut task = PullTask::new(vfs, max_concurrency);
     task.run().await
 }
 
-impl<Mode> Vfs<Mode>
-where
-    Self: Syncee,
-{
+impl Vfs {
     pub async fn sync(&self) -> Result<(), Error> {
-        <Self as Syncee>::sync(self).await
+        if !self.is_read_only() {
+            push(self.clone(), self.max_sync_attempts()).await?;
+        }
+        pull(self.clone(), self.max_sync_concurrency()).await?;
+        Ok(())
     }
 }

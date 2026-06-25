@@ -3,19 +3,18 @@ use crate::io_scheduler::resource_manager::{
     Action, Context, QueueCtrl, Resource, ResourceManager,
 };
 use crate::io_scheduler::Scheduler;
-use crate::vfs::file_writer::FileWriter;
-use crate::vfs::Vfs;
 use anyhow::{anyhow, bail};
 use futures_util::future::BoxFuture;
-use std::sync::Arc;
+use sia_vfs::vfs::file::{FileHandle, ReadWrite};
+use sia_vfs::vfs::{InodeId, OwnedName, Vfs};
 use std::time::Duration;
 
 pub(crate) struct Upload {
-    vfs: Arc<Vfs>,
+    vfs: Vfs,
 }
 
 impl Upload {
-    pub(crate) fn new(vfs: Arc<Vfs>, max_idle: Duration) -> Scheduler<Self> {
+    pub(crate) fn new(vfs: Vfs, max_idle: Duration) -> Scheduler<Self> {
         Scheduler::new(
             Upload { vfs },
             false,
@@ -27,9 +26,9 @@ impl Upload {
 }
 
 impl ResourceManager for Upload {
-    type Resource = FileWriter;
-    type PreparationKey = (u64, String);
-    type AccessKey = u64;
+    type Resource = FileHandle<ReadWrite>;
+    type PreparationKey = (InodeId, OwnedName);
+    type AccessKey = InodeId;
     type ResourceData = ();
     type ResourceFuture = BoxFuture<'static, anyhow::Result<Self::Resource>>; // nonexistent, actually
 
@@ -45,19 +44,19 @@ impl ResourceManager for Upload {
             .ok_or(anyhow!("parent not found"))?;
 
         let parent = parent
-            .as_parent()
+            .as_directory()
             .ok_or(anyhow!("inode cannot have children"))?;
 
-        let fw = self.vfs.write_file(parent, name.to_string()).await?;
-        let file = fw.to_file();
+        let file = self.vfs.create_file(parent, name).await?;
+        let fh = self.vfs.open_rw(&file).await?;
 
         tracing::debug!(
-            file_id = %file.id(),
-            file_name = file.name(),
+            file_id = %file.inode_id(),
+            file_name = file.name().as_ref(),
             "upload prepared"
         );
 
-        Ok((file.id().value(), (), vec![fw]))
+        Ok((file.inode_id(), (), vec![fh]))
     }
 
     fn process(
@@ -83,9 +82,9 @@ impl ResourceManager for Upload {
     }
 }
 
-impl Resource for FileWriter {
+impl Resource for FileHandle<ReadWrite> {
     fn offset(&self) -> u64 {
-        self.bytes_written()
+        self.offset()
     }
 
     fn can_reuse(&self) -> bool {
@@ -93,7 +92,7 @@ impl Resource for FileWriter {
     }
 
     async fn finalize(self) -> anyhow::Result<()> {
-        let _ = self.finalize().await?;
+        let _ = self.commit().await?;
         Ok(())
     }
 }

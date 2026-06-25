@@ -6,9 +6,7 @@ use crate::gen_flatbuffers::vfs::entity::{
 use crate::vfs::entity::{
     DraftEntity, EntityError, EntityHandler, EntityKey, EntityMut, EntityRef, RawEntityInner,
 };
-use crate::vfs::{
-    Inode, InodeId, InodeMut, Name, OwnedName, Read, TypedInode, Vfs, VfsError, VfsResult, Write,
-};
+use crate::vfs::{Inode, InodeId, InodeMut, Name, OwnedName, TypedInode, Vfs, VfsError, VfsResult};
 use blake3::{Hash, Hasher};
 use flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset};
 use futures_util::{StreamExt, TryStream};
@@ -16,6 +14,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use yoke::Yokeable;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryKind;
 
 #[derive(Yokeable, Clone)]
@@ -40,6 +39,10 @@ impl DirectoryBody<'_> {
         DirectoryBody {
             entries: Cow::Owned(self.entries.into_owned()),
         }
+    }
+
+    pub(crate) fn entries(&self) -> &[EntityKey] {
+        &self.entries
     }
 }
 
@@ -127,6 +130,17 @@ fn hash_entries(entries: &[EntityKey], hasher: &mut Hasher) {
 
 pub type Directory = TypedInode<DirectoryKind>;
 
+impl TryFrom<Inode> for Directory {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> Result<Self, Self::Error> {
+        match value {
+            Inode::Directory(dir) => Ok(dir),
+            Inode::File(file) => Err(Inode::File(file)),
+        }
+    }
+}
+
 impl Directory {
     pub fn is_root(&self) -> bool {
         self.parent.is_none()
@@ -141,12 +155,12 @@ pub(crate) type DirectoryMut = InodeMut<DirectoryKind>;
 pub(crate) type DirectoryDraft = DraftEntity<DirectoryKind>;
 
 impl DirectoryDraft {
-    pub fn new_directory_draft(name: OwnedName) -> Self {
-        EntityMut::new(name, DirectoryBody::new(vec![])).freeze()
+    pub fn new_directory_draft(name: OwnedName, entries: Vec<EntityKey>) -> Self {
+        EntityMut::new(name, DirectoryBody::new(entries)).freeze()
     }
 }
 
-impl<Mode: Read> Vfs<Mode> {
+impl Vfs {
     pub async fn list(
         &self,
         dir: &Directory,
@@ -178,8 +192,12 @@ impl<Mode: Read> Vfs<Mode> {
     }
 }
 
-impl<Mode: Read + Write> Vfs<Mode> {
+impl Vfs {
     pub async fn create_dir(&self, parent: &Directory, name: &Name) -> VfsResult<Directory> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
+
         let mut tx = self.tx_rw().await?;
         let inode_id = tx.create_dir(name, parent.inode_id()).await?;
         let dir = match tx.inode_by_id(inode_id).await? {
@@ -205,7 +223,7 @@ where
         name: &Name,
         parent_inode_id: InodeId,
     ) -> Result<InodeId, DbError> {
-        let entity = DirectoryDraft::new_directory_draft(name.to_owned());
+        let entity = DirectoryDraft::new_directory_draft(name.to_owned(), vec![]);
         let entity_id = self.register_entity(entity).await?;
         Ok(self
             .create_inode::<DirectoryKind>(&name, parent_inode_id, entity_id)

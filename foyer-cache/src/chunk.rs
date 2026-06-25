@@ -21,17 +21,17 @@ impl FoyerChunkCache {
         disk_path: impl AsRef<Path>,
         #[builder(default = DEFAULT_MEM_BUF_SIZE)] mem_buf: usize,
     ) -> Result<Self, Error> {
-        Ok(Self(
-            DiskCache::new(
-                "sia_chunk_cache",
-                disk_path,
-                max_disk_space,
-                mem_buf,
-                COMPAT_FILE_CONTENT_TYPE.to_string(),
-                COMPAT_FILE_COMP_VERSION,
-            )
-            .await?,
-        ))
+        let mut cache = DiskCache::new(
+            "sia_chunk_cache",
+            disk_path,
+            max_disk_space,
+            mem_buf,
+            COMPAT_FILE_CONTENT_TYPE.to_string(),
+            COMPAT_FILE_COMP_VERSION,
+        )
+        .await?;
+        cache.init().await?;
+        Ok(Self(cache))
     }
 }
 

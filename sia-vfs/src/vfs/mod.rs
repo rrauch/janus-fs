@@ -1,4 +1,6 @@
 pub mod cache;
+pub mod commit;
+pub mod config;
 pub mod directory;
 pub mod entity;
 pub mod file;
@@ -11,8 +13,10 @@ use crate::db::{
     ReadWrite as DbReadWrite, Transaction, TxScope, Write as DbWrite,
 };
 use crate::object::ObjectId;
-use crate::sync::{Syncee, Syncer};
+use crate::sync::Syncer;
 use crate::vfs::cache::{Cache, CacheSettings};
+use crate::vfs::commit::Commit;
+use crate::vfs::config::Config;
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
@@ -60,6 +64,8 @@ pub enum VfsError {
     CachedError(#[from] Arc<VfsError>),
     #[error(transparent)]
     FileLockError(#[from] file::LockError),
+    #[error("read-only file system")]
+    ReadOnlyFileSystem,
 }
 
 #[derive(Error, Debug)]
@@ -110,6 +116,12 @@ impl InodeId {
     }
 }
 
+impl From<u64> for InodeId {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
 impl Deref for InodeId {
     type Target = u64;
 
@@ -125,6 +137,104 @@ impl Display for InodeId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Head {
+    Branch(BranchName),
+    Tag(TagName),
+}
+
+impl Default for Head {
+    fn default() -> Self {
+        Self::Branch(BranchName::default())
+    }
+}
+
+impl Head {
+    #[inline]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Branch(b) => b,
+            Self::Tag(t) => t,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_tag(&self) -> bool {
+        match self {
+            Self::Branch(_) => false,
+            Self::Tag(_) => true,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn maybe_branch_name(&self) -> Option<BranchName> {
+        match self {
+            Self::Branch(b) => Some(b.clone()),
+            Self::Tag(_) => None,
+        }
+    }
+}
+
+impl Display for Head {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Branch(b) => Display::fmt(b, f),
+            Self::Tag(t) => Display::fmt(t, f),
+        }
+    }
+}
+
+#[derive_where(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Label<T>(Arc<str>, PhantomData<T>);
+
+impl<T> FromStr for Label<T> {
+    type Err = NameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        check_valid_filename(s)?;
+        Ok(Self(Arc::from(s), PhantomData))
+    }
+}
+
+impl<T> Display for Label<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl<T> Deref for Label<T> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct BranchKind;
+pub type BranchName = Label<BranchKind>;
+
+impl Default for BranchName {
+    fn default() -> Self {
+        Self::from_str("main").expect("default branch name to be valid")
+    }
+}
+
+impl From<BranchName> for Head {
+    fn from(value: BranchName) -> Self {
+        Self::Branch(value)
+    }
+}
+
+impl From<TagName> for Head {
+    fn from(value: TagName) -> Self {
+        Self::Tag(value)
+    }
+}
+
+pub struct TagKind;
+pub type TagName = Label<TagKind>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum StorageMode {
     Synced(ObjectId),
     Local(Arc<[u8]>),
@@ -136,7 +246,7 @@ pub struct Timestamp(DateTime<Utc>);
 
 impl Timestamp {
     pub fn now() -> Self {
-        Self(Utc::now())
+        Utc::now().into()
     }
     pub fn from_millis(millis: i64) -> Option<Self> {
         DateTime::<Utc>::from_timestamp_millis(millis).map(Self)
@@ -173,7 +283,7 @@ impl Deref for Timestamp {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 #[repr(transparent)]
 pub struct OwnedName(Cow<'static, str>);
 
@@ -480,18 +590,17 @@ impl<T: EntityHandler> DerefMut for InodeMut<T> {
     }
 }
 
-#[derive_where(Debug, Clone)]
+#[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct Vfs<Mode>(Arc<Inner>, PhantomData<Mode>);
+pub struct Vfs(Arc<Inner>);
 
 #[bon::bon]
-impl<Mode: Send + Sync + 'static> Vfs<Mode>
-where
-    Vfs<Mode>: Syncee,
-{
+impl Vfs {
     #[builder(derive(Debug))]
     pub async fn new(
         vfs_id: VfsId,
+        #[builder(default, into)] head: Head,
+        #[builder(default = false)] read_only: bool,
         db_file: PathBuf,
         sia_client: Sia,
         #[builder(default)] db_page_size: PageSize,
@@ -511,6 +620,8 @@ where
             db_page_size,
             cache.clone(),
             sia_client.clone(),
+            head.clone(),
+            &vfs_id,
         )
         .await?;
 
@@ -519,21 +630,22 @@ where
         let reaper = Reaper::new(db.clone());
         let (syncer, syncer_tx) = Syncer::new(sync_frequency, initial_sync_delay);
 
-        let this = Self(
-            Arc::new(Inner {
-                vfs_id,
-                db,
-                cache,
-                max_chunk_size,
-                dead_fh_reaper: reaper,
-                file_write_locks: FileWriteLocks::new(),
-                sia_client,
-                syncer,
-                max_sync_attempts,
-                max_sync_concurrency,
-            }),
-            PhantomData,
-        );
+        let read_only = if head.is_tag() { true } else { read_only };
+
+        let this = Self(Arc::new(Inner {
+            vfs_id,
+            head,
+            db,
+            cache,
+            max_chunk_size,
+            dead_fh_reaper: reaper,
+            file_write_locks: FileWriteLocks::new(),
+            sia_client,
+            _syncer: syncer,
+            max_sync_attempts,
+            max_sync_concurrency,
+            read_only,
+        }));
 
         syncer_tx.send(this.clone()).expect("syncer to be alive");
 
@@ -541,18 +653,29 @@ where
     }
 }
 
+impl Vfs {
+    pub fn is_read_only(&self) -> bool {
+        self.0.read_only
+    }
+    pub fn head(&self) -> &Head {
+        &self.0.head
+    }
+}
+
 #[derive(Debug)]
-struct Inner {
+pub(crate) struct Inner {
     vfs_id: VfsId,
+    head: Head,
     db: Db,
     cache: Cache,
     max_chunk_size: usize,
     dead_fh_reaper: Reaper,
     file_write_locks: FileWriteLocks,
     sia_client: Arc<Sia>,
-    syncer: Syncer,
+    _syncer: Syncer,
     max_sync_attempts: NonZeroUsize,
     max_sync_concurrency: NonZeroUsize,
+    read_only: bool,
 }
 
 pub trait Read: Send + Sync + 'static {}
@@ -567,41 +690,65 @@ pub struct ReadWrite;
 impl Read for ReadWrite {}
 impl Write for ReadWrite {}
 
-impl<Mode> Vfs<Mode> {
+impl Vfs {
+    #[inline]
     pub fn id(&self) -> &VfsId {
         &self.0.vfs_id
     }
 
+    #[inline]
     pub(crate) async fn tx(&self) -> VfsResult<Transaction<DbReadOnly>> {
         Ok(self.0.db.read().await?)
     }
 
+    #[inline]
     pub(crate) async fn tx_rw(&self) -> VfsResult<Transaction<DbReadWrite>> {
         Ok(self.0.db.write().await?)
     }
 
+    #[inline]
     pub(crate) fn sia_client(&self) -> &Sia {
         &self.0.sia_client
     }
 
+    #[inline]
     pub(crate) fn cache(&self) -> &Cache {
         &self.0.cache
     }
 
+    #[inline]
     pub(crate) fn max_chunk_size(&self) -> usize {
         self.0.max_chunk_size
     }
 
+    #[inline]
     pub(crate) fn max_sync_attempts(&self) -> NonZeroUsize {
         self.0.max_sync_attempts
     }
 
+    #[inline]
     pub(crate) fn max_sync_concurrency(&self) -> NonZeroUsize {
         self.0.max_sync_concurrency
     }
+
+    pub async fn current_commit(&self) -> VfsResult<Commit> {
+        //todo: caching
+        let mut tx = self.tx().await?;
+        let commit_id = tx.current_commit_id(self.head().clone()).await?;
+        Ok(tx
+            .commit_by_id(&commit_id)
+            .await?
+            .ok_or_else(|| DbError::DataError(DataError::CommitNotFound(commit_id)))?)
+    }
+
+    pub async fn current_config(&self) -> VfsResult<Config> {
+        //todo: caching
+        let mut tx = self.tx().await?;
+        Ok(tx.current_config().await?)
+    }
 }
 
-impl<Mode: Read> Vfs<Mode> {
+impl Vfs {
     #[inline]
     pub async fn root(&self) -> VfsResult<Directory> {
         match self.inode_by_id(ROOT_INODE_ID).await? {
@@ -623,8 +770,11 @@ impl<Mode: Read> Vfs<Mode> {
     }
 }
 
-impl<Mode: Read + Write> Vfs<Mode> {
+impl Vfs {
     pub async fn update<T: EntityHandler>(&self, modified_inode: InodeMut<T>) -> VfsResult<Inode> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
         let inode_id = modified_inode.inode_id;
         let name = modified_inode.name().to_owned();
         let draft_entity = modified_inode.freeze();
@@ -635,6 +785,9 @@ impl<Mode: Read + Write> Vfs<Mode> {
     }
 
     pub async fn delete(&self, inode_id: InodeId) -> VfsResult<()> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
         if inode_id == ROOT_INODE_ID {
             return Err(VfsError::DeleteRootError);
         }
@@ -645,6 +798,9 @@ impl<Mode: Read + Write> Vfs<Mode> {
     }
 
     pub async fn mv(&self, inode_id: InodeId, parent: &Directory) -> VfsResult<()> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
         if inode_id == ROOT_INODE_ID {
             return Err(VfsError::MoveRootError);
         }
@@ -655,6 +811,9 @@ impl<Mode: Read + Write> Vfs<Mode> {
     }
 
     pub async fn copy(&self, inode_id: InodeId, _new_parent: &Directory) -> VfsResult<()> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
         if inode_id == ROOT_INODE_ID {
             return Err(VfsError::CopyRootError);
         }
@@ -853,7 +1012,7 @@ where
 pub(crate) mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{Inode, InodeId, Name, OwnedName, Read, ReadWrite, Vfs, VfsError, VfsId};
+    use crate::vfs::{Inode, InodeId, Name, OwnedName, Vfs, VfsError, VfsId};
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
     use sia_io::Client as Sia;
@@ -863,14 +1022,14 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
 
-    pub(crate) async fn new_vfs() -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
+    pub(crate) async fn new_vfs() -> anyhow::Result<(Vfs, TempDir)> {
         new_vfs_with_opts(None, None).await
     }
 
     pub(crate) async fn new_vfs_with_opts(
         vfs_id: Option<VfsId>,
         sia_client: Option<Sia>,
-    ) -> anyhow::Result<(Vfs<ReadWrite>, TempDir)> {
+    ) -> anyhow::Result<(Vfs, TempDir)> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
         let sia_client = match sia_client {
@@ -910,7 +1069,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    async fn create_dirs(vfs: &Vfs<ReadWrite>, parent: &Directory) -> anyhow::Result<()> {
+    async fn create_dirs(vfs: &Vfs, parent: &Directory) -> anyhow::Result<()> {
         let dir_name: &Name = "dir_1".try_into()?;
         let dir = vfs.create_dir(&parent, dir_name).await?;
         assert_eq!(dir.name(), dir_name);
@@ -1057,8 +1216,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    async fn count_fh(vfs: &Vfs<ReadWrite>) -> anyhow::Result<u64> {
-        let mut tx = vfs.0.db.read().await?;
+    async fn count_fh(vfs: &Vfs) -> anyhow::Result<u64> {
+        let mut tx = vfs.tx().await?;
         Ok(
             sqlx::query!("SELECT COUNT(*) AS fh_count FROM temp_file_handle")
                 .fetch_one(tx.as_mut())
@@ -1067,8 +1226,8 @@ pub(crate) mod tests {
         )
     }
 
-    async fn count_temp_chunks(vfs: &Vfs<ReadWrite>) -> anyhow::Result<u64> {
-        let mut tx = vfs.0.db.read().await?;
+    async fn count_temp_chunks(vfs: &Vfs) -> anyhow::Result<u64> {
+        let mut tx = vfs.tx().await?;
         Ok(
             sqlx::query!("SELECT COUNT(*) AS chunk_count FROM temp_file_chunks")
                 .fetch_one(tx.as_mut())
@@ -1114,7 +1273,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    async fn count_path_entries<Mode: Read>(vfs: &Vfs<Mode>, path: &str) -> anyhow::Result<usize> {
+    async fn count_path_entries(vfs: &Vfs, path: &str) -> anyhow::Result<usize> {
         Ok(vfs
             .list(
                 vfs.inode_by_path(&VfsPath::from_str(path)?)

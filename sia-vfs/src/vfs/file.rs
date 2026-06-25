@@ -11,8 +11,7 @@ use crate::vfs::entity::{
     DraftEntity, EntityError, EntityHandler, EntityMut, EntityRef, RawEntityInner,
 };
 use crate::vfs::{
-    Inode, InodeId, InodeMut, Name, OwnedName, Read, Timestamp, TypedInode, Vfs, VfsError,
-    VfsResult, Write,
+    Inode, InodeId, InodeMut, Name, OwnedName, Timestamp, TypedInode, Vfs, VfsError, VfsResult,
 };
 use async_trait::async_trait;
 use blake3::Hash;
@@ -34,6 +33,7 @@ use twox_hash::XxHash3_64;
 use uuid::Uuid;
 use yoke::Yokeable;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileKind;
 
 #[derive(Yokeable, Debug, Clone)]
@@ -117,6 +117,17 @@ pub type File = TypedInode<FileKind>;
 pub type FileMut = InodeMut<FileKind>;
 pub(crate) type FileDraft = DraftEntity<FileKind>;
 
+impl TryFrom<Inode> for File {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> Result<Self, Self::Error> {
+        match value {
+            Inode::File(file) => Ok(file),
+            Inode::Directory(dir) => Err(Inode::Directory(dir)),
+        }
+    }
+}
+
 impl FileDraft {
     pub fn new_file_draft(name: OwnedName, blob: Blob) -> Self {
         EntityMut::new(name, blob.into()).freeze()
@@ -143,11 +154,11 @@ impl FileMut {
     }
 }
 
-impl<Mode: Read> Vfs<Mode>
+impl Vfs
 where
     Self: ChunkSource + 'static,
 {
-    pub async fn open(&self, file: &File) -> VfsResult<FileHandle<ReadOnly<Mode>>> {
+    pub async fn open(&self, file: &File) -> VfsResult<FileHandle<ReadOnly>> {
         let blob = self
             .blob_by_id(file.blob_id())
             .await?
@@ -222,11 +233,15 @@ impl FileWriteLocks {
     }
 }
 
-impl<Mode: Read + Write> Vfs<Mode>
+impl Vfs
 where
     Self: ChunkSource + ChunkSink + 'static,
 {
-    pub async fn open_rw(&self, file: &File) -> VfsResult<FileHandle<ReadWrite<Mode>>> {
+    pub async fn open_rw(&self, file: &File) -> VfsResult<FileHandle<ReadWrite>> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFileSystem);
+        }
+
         let blob = self
             .blob_by_id(file.blob_id())
             .await?
@@ -296,12 +311,12 @@ where
 
 pub trait FileMode {}
 
-pub struct ReadOnly<Mode> {
-    reader: BlobReader<Vfs<Mode>>,
+pub struct ReadOnly {
+    reader: BlobReader<Vfs>,
     file: File,
 }
 
-impl<Mode> FileMode for ReadOnly<Mode> where Vfs<Mode>: ChunkSource + 'static {}
+impl FileMode for ReadOnly {}
 
 pub struct FileHandle<M: FileMode> {
     id: u64,
@@ -314,10 +329,7 @@ impl<M: FileMode> FileHandle<M> {
     }
 }
 
-impl<Mode> FileHandle<ReadOnly<Mode>>
-where
-    Vfs<Mode>: ChunkSource + 'static,
-{
+impl FileHandle<ReadOnly> {
     pub fn file(&self) -> &File {
         &self.inner.file
     }
@@ -331,10 +343,7 @@ where
     }
 }
 
-impl<Mode> AsyncRead for FileHandle<ReadOnly<Mode>>
-where
-    Vfs<Mode>: ChunkSource + 'static,
-{
+impl AsyncRead for FileHandle<ReadOnly> {
     #[inline]
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -346,10 +355,7 @@ where
     }
 }
 
-impl<Mode> AsyncSeek for FileHandle<ReadOnly<Mode>>
-where
-    Vfs<Mode>: ChunkSource + 'static,
-{
+impl AsyncSeek for FileHandle<ReadOnly> {
     #[inline]
     fn poll_seek(
         mut self: Pin<&mut Self>,
@@ -361,34 +367,28 @@ where
     }
 }
 
-pub struct ReadWrite<Mode> {
-    writer: BlobWriter<TempChunkTracker<Mode>>,
+pub struct ReadWrite {
+    writer: BlobWriter<TempChunkTracker>,
     lock: FileWriteLock,
     file: FileMut,
-    vfs: Vfs<Mode>,
+    vfs: Vfs,
     reaper_notifier: ReaperNotifier,
 }
 
-struct TempChunkTracker<Mode> {
-    vfs: Vfs<Mode>,
+struct TempChunkTracker {
+    vfs: Vfs,
     fh_id: u64,
 }
 
 #[async_trait]
-impl<Mode> ChunkSource for TempChunkTracker<Mode>
-where
-    Vfs<Mode>: ChunkSource,
-{
+impl ChunkSource for TempChunkTracker {
     async fn get_chunk(&self, chunk_id: &ChunkId) -> Result<Option<Chunk>, Error> {
         self.vfs.get_chunk(chunk_id).await
     }
 }
 
 #[async_trait]
-impl<Mode: Read + Write> ChunkSink for TempChunkTracker<Mode>
-where
-    Vfs<Mode>: ChunkSink,
-{
+impl ChunkSink for TempChunkTracker {
     async fn insert_chunk(&self, chunk: Chunk) -> Result<(), Error> {
         let chunk_id = chunk.id().clone();
         self.vfs.insert_chunk(chunk).await?;
@@ -421,12 +421,9 @@ impl Drop for ReaperNotifier {
     }
 }
 
-impl<Mode> FileMode for ReadWrite<Mode> where Vfs<Mode>: ChunkSource + ChunkSink + 'static {}
+impl FileMode for ReadWrite {}
 
-impl<Mode: Read + Write> FileHandle<ReadWrite<Mode>>
-where
-    Vfs<Mode>: ChunkSource + ChunkSink + 'static,
-{
+impl FileHandle<ReadWrite> {
     pub fn file_id(&self) -> InodeId {
         self.inner.lock.inode_id()
     }
@@ -443,14 +440,26 @@ where
         self.inner.writer.is_empty()
     }
 
-    pub async fn fsync(&mut self) -> VfsResult<()> {
+    pub fn is_closed(&self) -> bool {
+        self.inner.writer.mode.closed
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.inner.writer.error_count
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.inner.writer.pos
+    }
+
+    pub async fn fsync(&mut self) -> VfsResult<File> {
         self.flush().await?;
         let blob = self.inner.writer.fsync().await?;
         let mut tx = self.inner.vfs.tx_rw().await?;
         let file = tx.fsync(self.inner.file.clone(), blob).await?;
         tx.commit().await?;
-        self.inner.file = file.into_mut();
-        Ok(())
+        self.inner.file = file.clone().into_mut();
+        Ok(file)
     }
 
     pub async fn commit(mut self) -> VfsResult<File> {
@@ -464,10 +473,7 @@ where
     }
 }
 
-impl<Mode: Read + Write> AsyncRead for FileHandle<ReadWrite<Mode>>
-where
-    Vfs<Mode>: ChunkSource + ChunkSink + 'static,
-{
+impl AsyncRead for FileHandle<ReadWrite> {
     #[inline]
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -478,10 +484,7 @@ where
     }
 }
 
-impl<Mode: Read + Write> AsyncWrite for FileHandle<ReadWrite<Mode>>
-where
-    Vfs<Mode>: ChunkSource + ChunkSink + 'static,
-{
+impl AsyncWrite for FileHandle<ReadWrite> {
     #[inline]
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -502,10 +505,7 @@ where
     }
 }
 
-impl<Mode: Read + Write> AsyncSeek for FileHandle<ReadWrite<Mode>>
-where
-    Vfs<Mode>: ChunkSource + ChunkSink + 'static,
-{
+impl AsyncSeek for FileHandle<ReadWrite> {
     #[inline]
     fn poll_seek(
         mut self: Pin<&mut Self>,

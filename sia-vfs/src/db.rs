@@ -2,9 +2,11 @@ use crate::blob::BlobId;
 use crate::chunk::ChunkId;
 use crate::object::ObjectId;
 use crate::vfs::cache::Cache;
+use crate::vfs::commit::{CommitId, CommitMut};
+use crate::vfs::config::{ConfigMut, OwnedEntry};
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
-use crate::vfs::{Inode, InodeId, OwnedName};
+use crate::vfs::{BranchName, Head, Inode, InodeId, OwnedName, Timestamp, VfsId};
 use sia_io::Client as Sia;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
@@ -45,13 +47,17 @@ pub enum DbStateError {
 pub enum DataError {
     #[error("conversion failed: {0}")]
     ConversionError(Cow<'static, str>),
-    #[error("entity not found: {0:?}")]
+    #[error("entity not found: [{0:?}]")]
     EntityNotFound(EntityKey),
+    #[error("invalid entity id")]
+    InvalidEntityId,
+    #[error("invalid revision")]
+    InvalidRevision,
     #[error("entity id and/or revision mismatch")]
     EntityMismatch,
-    #[error("inode {0} not found")]
+    #[error("inode [{0}] not found")]
     InodeNotFound(InodeId),
-    #[error("blob {0} not found")]
+    #[error("blob [{0}] not found")]
     BlobNotFound(BlobId),
     #[error("wrong number of rows affected: {actual} != {expected}")]
     UnexpectedAffectedRows { expected: u64, actual: u64 },
@@ -63,14 +69,23 @@ pub enum DataError {
     BlobIdMismatch { expected: BlobId, actual: BlobId },
     #[error("chunk id mismatch: [{expected}] != [{actual}]")]
     ChunkIdMismatch { expected: ChunkId, actual: ChunkId },
-    #[error("chunk {0} not found")]
+    #[error("commit id mismatch: [{expected}] != [{actual}]")]
+    CommitIdMismatch {
+        expected: CommitId,
+        actual: CommitId,
+    },
+    #[error("chunk [{0}] not found")]
     ChunkNotFound(ChunkId),
-    #[error("object {0} not found")]
+    #[error("commit [{0}] not found")]
+    CommitNotFound(CommitId),
+    #[error("object [{0}] not found")]
     ObjectNotFound(ObjectId),
-    #[error("invalid remote_location: {0}")]
+    #[error("invalid remote_location: [{0}]")]
     InvalidRemoteLocation(String),
     #[error("storage mode unsupported")]
     UnsupportedStorageMode,
+    #[error("head entry [{0}] not found")]
+    HeadEntryNotFound(Head),
 }
 
 pub struct ReadOnly(PoolConnection<Sqlite>, Arc<Sia>);
@@ -81,7 +96,12 @@ impl AsMut<SqliteConnection> for ReadOnly {
     }
 }
 
-pub struct ReadWrite(SqlxTransaction<'static, Sqlite>, Cache, Arc<Sia>);
+pub struct ReadWrite(
+    SqlxTransaction<'static, Sqlite>,
+    Cache,
+    Arc<Sia>,
+    Option<BranchName>,
+);
 
 impl AsMut<SqliteConnection> for ReadWrite {
     #[inline]
@@ -122,6 +142,12 @@ impl Transaction<ReadWrite> {
     #[inline]
     pub async fn commit(mut self) -> Result<(), Error> {
         self.process_dirty_inodes().await?;
+
+        if let Some(branch_name) = self.0.3.clone() {
+            if self.update_commit(branch_name).await?.is_some() {
+                self.maybe_update_config().await?;
+            }
+        }
 
         let changelog = self.get_changelog().await?;
         self.clear_changelog().await?;
@@ -283,7 +309,7 @@ impl Transaction<ReadWrite> {
         })
     }
 
-    async fn bootstrap(&mut self) -> Result<(), Error> {
+    async fn bootstrap(&mut self, vfs_id: &VfsId) -> Result<(), Error> {
         if sqlx::query!("SELECT COUNT(*) AS vfs_rows FROM vfs")
             .fetch_one(self.conn())
             .await?
@@ -291,7 +317,8 @@ impl Transaction<ReadWrite> {
             == 0
         {
             // empty vfs, create new root
-            let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap());
+            let root =
+                DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap(), vec![]);
             let name = root.name().to_owned();
             let entity_key = self.register_entity(root).await?;
 
@@ -307,6 +334,49 @@ impl Transaction<ReadWrite> {
             )
                 .execute(self.conn())
                 .await?;
+
+            if let Some(branch_name) = self.0.3.clone() {
+                // create empty commit & initial head
+                let commit = CommitMut {
+                    entity_key: entity_key.clone(),
+                    preceding_commit_id: CommitId::zeroed(),
+                    commit_count: 0,
+                    created: Timestamp::now(),
+                }
+                .freeze();
+                self.register_commit(&commit).await?;
+                let name = branch_name.deref();
+                let id = commit.id().as_slice();
+                sqlx::query!(
+                    "INSERT INTO head (name, type, commit_id) VALUES (?, 'B', ?)",
+                    name,
+                    id,
+                )
+                .execute(self.conn())
+                .await?;
+
+                let mut config = ConfigMut::new(vfs_id.clone());
+                config.last_modified = Timestamp::from_millis(0).expect("timestamp 0 to be valid");
+                config.heads.insert(
+                    Head::from(branch_name.clone()),
+                    OwnedEntry {
+                        description: None,
+                        commit_id: commit.id().clone(),
+                    },
+                );
+                let config = config.freeze();
+
+                let vfs_id = vfs_id.as_slice();
+                let last_modified = config.last_modified().to_millis();
+                let data = config.as_flatbuffer();
+                sqlx::query!(
+                    "INSERT INTO config (vfs_id, head, last_modified, mode, data) VALUES (?, ?, ?, 'L', ?)",
+                    vfs_id,
+                    name,
+                    last_modified,
+                    data
+                ).execute(self.conn()).await?;
+            }
         }
         Ok(())
     }
@@ -346,11 +416,13 @@ impl SqlitePool {
         &self,
         cache: Cache,
         sia_client: Arc<Sia>,
+        branch_name: Option<BranchName>,
     ) -> Result<Transaction<ReadWrite>, SqlxError> {
         Ok(Transaction(ReadWrite(
             self.writer.begin().await?,
             cache,
             sia_client,
+            branch_name,
         )))
     }
 }
@@ -361,6 +433,7 @@ struct DbInner {
     db_file: PathBuf,
     cache: Cache,
     sia_client: Arc<Sia>,
+    head: Head,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,11 +492,15 @@ impl Db {
         page_size: PageSize,
         cache: Cache,
         sia_client: Arc<Sia>,
+        head: Head,
+        vfs_id: &VfsId,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
-        let mut tx = pool.write(cache.clone(), sia_client.clone()).await?;
-        tx.bootstrap().await?;
+        let mut tx = pool
+            .write(cache.clone(), sia_client.clone(), head.maybe_branch_name())
+            .await?;
+        tx.bootstrap(vfs_id).await?;
         tx.housekeeping().await?;
         tx.commit().await?;
 
@@ -432,6 +509,7 @@ impl Db {
             db_file,
             cache,
             sia_client,
+            head,
         })))
     }
 
@@ -443,7 +521,11 @@ impl Db {
         let mut tx = self
             .0
             .pool
-            .write(self.0.cache.clone(), self.0.sia_client.clone())
+            .write(
+                self.0.cache.clone(),
+                self.0.sia_client.clone(),
+                self.0.head.maybe_branch_name(),
+            )
             .await?;
         tx.clear_changelog().await?;
         Ok(tx)

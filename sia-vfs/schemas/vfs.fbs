@@ -2,21 +2,13 @@ include "content_id.fbs";
 
 namespace entity;
 
-struct ContentId {
-  bytes: [ubyte:32];
-}
-
-struct Uuid {
-  bytes: [ubyte:16];
-}
-
 table File {
   len: uint64;
   blob_id: common.ContentId (required);
 }
 
 struct DirectoryEntry {
-  id: Uuid;
+  id: common.Uuid;
   revision: common.ContentId;
 }
 
@@ -27,7 +19,7 @@ table Directory {
 union EntityBody { File, Directory }
 
 table Entity {
-  id: Uuid (required);
+  id: common.Uuid (required);
   name: string (required);
   created: int64;
   last_modified: int64;
@@ -46,4 +38,32 @@ struct Chunk {
 table Blob {
     len: uint64;
     chunks: [Chunk];
+}
+
+namespace commit;
+
+table Commit {
+    entity_id: common.Uuid (required);
+    entity_rev: common.ContentId (required);
+    created: int64;
+    count: uint64;
+    prev_id: common.ContentId (required);
+}
+
+namespace config;
+
+enum HeadKind : byte { Branch, Tag }
+
+table Head {
+    name: string (key);
+    kind: HeadKind;
+    description: string;
+    commit_id: common.ContentId (required);
+}
+
+table Config {
+    vfs_id: common.Uuid (required);
+    description: string;
+    last_modified: int64;
+    heads:[Head];
 }

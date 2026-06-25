@@ -3,3 +3,7 @@ namespace common;
 struct ContentId {
   bytes: [ubyte:32];
 }
+
+struct Uuid {
+  bytes: [ubyte:16];
+}
