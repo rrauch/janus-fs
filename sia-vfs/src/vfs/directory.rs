@@ -14,6 +14,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use yoke::Yokeable;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryKind;
 
 #[derive(Yokeable, Clone)]
@@ -38,6 +39,10 @@ impl DirectoryBody<'_> {
         DirectoryBody {
             entries: Cow::Owned(self.entries.into_owned()),
         }
+    }
+
+    pub(crate) fn entries(&self) -> &[EntityKey] {
+        &self.entries
     }
 }
 
@@ -150,8 +155,8 @@ pub(crate) type DirectoryMut = InodeMut<DirectoryKind>;
 pub(crate) type DirectoryDraft = DraftEntity<DirectoryKind>;
 
 impl DirectoryDraft {
-    pub fn new_directory_draft(name: OwnedName) -> Self {
-        EntityMut::new(name, DirectoryBody::new(vec![])).freeze()
+    pub fn new_directory_draft(name: OwnedName, entries: Vec<EntityKey>) -> Self {
+        EntityMut::new(name, DirectoryBody::new(entries)).freeze()
     }
 }
 
@@ -218,7 +223,7 @@ where
         name: &Name,
         parent_inode_id: InodeId,
     ) -> Result<InodeId, DbError> {
-        let entity = DirectoryDraft::new_directory_draft(name.to_owned());
+        let entity = DirectoryDraft::new_directory_draft(name.to_owned(), vec![]);
         let entity_id = self.register_entity(entity).await?;
         Ok(self
             .create_inode::<DirectoryKind>(&name, parent_inode_id, entity_id)

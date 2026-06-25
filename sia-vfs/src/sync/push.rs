@@ -3,6 +3,7 @@ use crate::chunk::{Chunk, ChunkId};
 use crate::db::{DataError, Error as DbError, Read, Transaction, TxScope, Write};
 use crate::sync::Error;
 use crate::vfs::commit::{Commit, CommitId};
+use crate::vfs::config::Config;
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::{EntityKey, LocalEntity};
 use crate::vfs::file::FileKind;
@@ -28,6 +29,7 @@ enum Pending {
     File(LocalEntity<FileKind>),
     Dir(LocalEntity<DirectoryKind>),
     Commit(Commit),
+    Config(Config),
 }
 
 impl Pending {
@@ -42,6 +44,7 @@ impl Pending {
             Self::File(f) => uploader.enqueue(f.to_uploadable_object(vfs_id)).await,
             Self::Dir(d) => uploader.enqueue(d.to_uploadable_object(vfs_id)).await,
             Self::Commit(c) => uploader.enqueue(c.to_uploadable_object(vfs_id)).await,
+            Self::Config(c) => uploader.enqueue(c.to_uploadable_object(vfs_id)).await,
         }
     }
 }
@@ -138,6 +141,9 @@ impl PushTask {
                 .await?
                 .map(Pending::Dir),
             Some(JobItem::Commit(id)) => self.prepare_commit(id, tx).await?.map(Pending::Commit),
+            Some(JobItem::Config(data)) => {
+                self.prepare_config(data, tx).await?.map(Pending::Config)
+            }
             None => None,
         })
     }
@@ -200,6 +206,9 @@ impl PushTask {
                     Pending::Commit(commit) => {
                         self.process_commit(commit.clone(), object, &mut tx).await?;
                     }
+                    Pending::Config(config) => {
+                        self.process_config(config, object, &mut tx).await?;
+                    }
                 }
             }
             tx.commit().await?;
@@ -221,6 +230,7 @@ impl PushTask {
         num_items += self.queue_blobs(tx).await?;
         num_items += self.queue_entities(tx).await?;
         num_items += self.queue_commits(tx).await?;
+        num_items += self.queue_config(tx).await?;
 
         Ok(num_items)
     }
@@ -231,6 +241,7 @@ pub(crate) enum JobItem {
     Blob(BlobId),
     Entity(EntityKey, EntityType),
     Commit(CommitId),
+    Config(Vec<u8>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -271,6 +282,7 @@ where
                             JobItem::Entity(entity_key, entity_type)
                         },
                         "T" => JobItem::Commit(self.commit_item(id).await?),
+                        "F" => JobItem::Config(self.config_item(id).await?),
                         _ => return Err(DataError::ConversionError("invalid job item".into()))?,
                     })
                 }
@@ -288,6 +300,8 @@ where
     SELECT 1 FROM chunk   WHERE mode = 'L' AND ref_count > 0
     UNION ALL
     SELECT 1 FROM commits WHERE mode = 'L' AND ref_count > 0
+    UNION ALL
+    SELECT 1 FROM config WHERE mode = 'L'
     LIMIT 1
           ) AS \"has_items: bool\""
         )
@@ -336,29 +350,53 @@ where
         item: &JobItem,
         estimated_size: u64,
     ) -> Result<bool, DbError> {
-        let (item_type, blob_id, chunk_id, entity_id, entity_rev, commit_id) = match item {
-            JobItem::Chunk(chunk_id) => ("C", None, Some(chunk_id.as_slice()), None, None, None),
-            JobItem::Blob(blob_id) => ("B", Some(blob_id.as_slice()), None, None, None, None),
-            JobItem::Entity(key, _) => (
-                "E",
-                None,
-                None,
-                Some(key.id().as_slice()),
-                Some(key.revision().as_slice()),
-                None,
-            ),
-            JobItem::Commit(commit_id) => ("T", None, None, None, None, Some(commit_id.as_slice())),
-        };
+        let (item_type, blob_id, chunk_id, entity_id, entity_rev, commit_id, config_data) =
+            match item {
+                JobItem::Chunk(chunk_id) => {
+                    ("C", None, Some(chunk_id.as_slice()), None, None, None, None)
+                }
+                JobItem::Blob(blob_id) => {
+                    ("B", Some(blob_id.as_slice()), None, None, None, None, None)
+                }
+                JobItem::Entity(key, _) => (
+                    "E",
+                    None,
+                    None,
+                    Some(key.id().as_slice()),
+                    Some(key.revision().as_slice()),
+                    None,
+                    None,
+                ),
+                JobItem::Commit(commit_id) => (
+                    "T",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(commit_id.as_slice()),
+                    None,
+                ),
+                JobItem::Config(config_data) => (
+                    "F",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(config_data.as_slice()),
+                ),
+            };
         let estimated_size = estimated_size as i64;
 
         let inserted = sqlx::query!(
-            "INSERT OR IGNORE INTO sync_job_queue (type, blob_id, chunk_id, entity_id, entity_rev, commit_id, estimated_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO sync_job_queue (type, blob_id, chunk_id, entity_id, entity_rev, commit_id, config, estimated_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             item_type,
             blob_id,
             chunk_id,
             entity_id,
             entity_rev,
             commit_id,
+            config_data,
             estimated_size
         ).execute(self.conn()).await?.rows_affected() > 0;
 
@@ -391,6 +429,7 @@ mod tests {
         fh.commit().await?;
 
         assert!(!vfs.current_commit().await?.is_synced());
+        assert!(!vfs.current_config().await?.is_synced());
 
         let mut task = PushTask::new(vfs.clone(), branch_name, NonZeroUsize::new(1).unwrap());
         task.run().await?;
@@ -400,7 +439,9 @@ mod tests {
 
         let dir = vfs.inode_by_id(dir.inode_id()).await?.unwrap();
         assert!(dir.is_synced());
+
         assert!(vfs.current_commit().await?.is_synced());
+        assert!(vfs.current_config().await?.is_synced());
 
         Ok(())
     }

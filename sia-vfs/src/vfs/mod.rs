@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod commit;
+pub mod config;
 pub mod directory;
 pub mod entity;
 pub mod file;
@@ -15,6 +16,7 @@ use crate::object::ObjectId;
 use crate::sync::Syncer;
 use crate::vfs::cache::{Cache, CacheSettings};
 use crate::vfs::commit::Commit;
+use crate::vfs::config::Config;
 use crate::vfs::directory::Directory;
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
@@ -134,7 +136,7 @@ impl Display for InodeId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Head {
     Branch(BranchName),
     Tag(TagName),
@@ -181,7 +183,7 @@ impl Display for Head {
     }
 }
 
-#[derive_where(Debug, Clone, PartialEq, Hash)]
+#[derive_where(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Label<T>(Arc<str>, PhantomData<T>);
 
@@ -619,6 +621,7 @@ impl Vfs {
             cache.clone(),
             sia_client.clone(),
             head.clone(),
+            &vfs_id,
         )
         .await?;
 
@@ -736,6 +739,12 @@ impl Vfs {
             .commit_by_id(&commit_id)
             .await?
             .ok_or_else(|| DbError::DataError(DataError::CommitNotFound(commit_id)))?)
+    }
+
+    pub async fn current_config(&self) -> VfsResult<Config> {
+        //todo: caching
+        let mut tx = self.tx().await?;
+        Ok(tx.current_config().await?)
     }
 }
 

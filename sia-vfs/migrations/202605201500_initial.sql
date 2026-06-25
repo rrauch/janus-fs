@@ -1,3 +1,45 @@
+CREATE TABLE config
+(
+    vfs_id        BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(vfs_id) = 'blob' AND
+                                                   LENGTH(vfs_id) = 16),
+    head          TEXT             NOT NULL REFERENCES head (name),
+    last_modified TIMESTAMP        NOT NULL,
+    mode          TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
+    object_id     INTEGER REFERENCES object (id),
+    data          BLOB,
+
+    CHECK (
+        (mode = 'S' AND object_id IS NOT NULL AND data IS NULL) OR
+        (mode = 'L' AND object_id IS NULL AND data IS NOT NULL)
+        )
+);
+
+CREATE TRIGGER prevent_multiple_configs
+    BEFORE INSERT
+    ON config
+    WHEN (SELECT COUNT(*)
+          FROM config) >= 1
+BEGIN
+SELECT RAISE(ABORT, 'Only one config entry allowed');
+END;
+
+CREATE TRIGGER config_prevent_immutable_update
+    BEFORE UPDATE OF vfs_id, head
+    ON config
+    FOR EACH ROW
+    WHEN OLD.vfs_id != NEW.vfs_id OR OLD.head != NEW.head
+BEGIN
+SELECT RAISE(ABORT, 'cannot modify vfs_id or head');
+END;
+
+
+CREATE TRIGGER prevent_config_deletes
+    BEFORE DELETE
+    ON config
+BEGIN
+    SELECT RAISE(ABORT, 'Config cannot be deleted');
+END;
+
 CREATE TABLE commits
 (
     id         BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(id) = 'blob' AND
@@ -596,16 +638,6 @@ BEGIN
 SELECT RAISE(ABORT, 'vfs: root inode_type must be D');
 END;
 
--- Ensure root cannot be deleted
-CREATE TRIGGER vfs_root_undeletable
-    BEFORE DELETE
-    ON vfs
-    FOR EACH ROW
-    WHEN OLD.inode_id = 1
-BEGIN
-    SELECT RAISE(ABORT, 'vfs: root cannot be deleted');
-END;
-
 -- Ensure only directories can be parents, and that only root has no parent (on insert)
 CREATE TRIGGER vfs_parent_insert
     BEFORE INSERT
@@ -951,12 +983,13 @@ END;
 CREATE TABLE sync_job_queue
 (
     id             INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E', 'T')), -- Blob, Chunk, Entity or Commit
+    type           TEXT    NOT NULL CHECK (type IN ('B', 'C', 'E', 'T', 'F')), -- Blob, Chunk, Entity, Commit, or Config
     blob_id        BLOB UNIQUE REFERENCES blob (id),
     chunk_id       BLOB UNIQUE REFERENCES chunk (id),
     entity_id      BLOB,
     entity_rev     BLOB,
     commit_id      BLOB UNIQUE REFERENCES commits (id),
+    config         BLOB,
     estimated_size INTEGER NOT NULL CHECK (estimated_size > 0),
     pending        INTEGER NOT NULL DEFAULT 0 CHECK (pending IN (0, 1)),
 
@@ -965,13 +998,15 @@ CREATE TABLE sync_job_queue
 
     CHECK (
         (type = 'B' AND blob_id IS NOT NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL AND
-         commit_id IS NULL) OR
+         commit_id IS NULL AND config IS NULL) OR
         (type = 'C' AND blob_id IS NULL AND chunk_id IS NOT NULL AND entity_id IS NULL AND entity_rev IS NULL AND
-         commit_id IS NULL) OR
+         commit_id IS NULL AND config IS NULL) OR
         (type = 'E' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NOT NULL AND entity_rev IS NOT NULL AND
-         commit_id IS NULL) OR
+         commit_id IS NULL AND config IS NULL) OR
         (type = 'T' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL AND
-         commit_id IS NOT NULL)
+         commit_id IS NOT NULL AND config IS NULL) OR
+        (type = 'F' AND blob_id IS NULL AND chunk_id IS NULL AND entity_id IS NULL AND entity_rev IS NULL AND
+         commit_id IS NULL AND config IS NOT NULL)
         )
 );
 

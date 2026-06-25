@@ -33,6 +33,7 @@ use twox_hash::XxHash3_64;
 use uuid::Uuid;
 use yoke::Yokeable;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FileKind;
 
 #[derive(Yokeable, Debug, Clone)]

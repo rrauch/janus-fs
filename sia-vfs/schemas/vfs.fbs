@@ -49,3 +49,21 @@ table Commit {
     count: uint64;
     prev_id: common.ContentId (required);
 }
+
+namespace config;
+
+enum HeadKind : byte { Branch, Tag }
+
+table Head {
+    name: string (key);
+    kind: HeadKind;
+    description: string;
+    commit_id: common.ContentId (required);
+}
+
+table Config {
+    vfs_id: common.Uuid (required);
+    description: string;
+    last_modified: int64;
+    heads:[Head];
+}

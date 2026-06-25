@@ -25,6 +25,8 @@ use sia_io::object::Object as SiaObject;
 use sia_io::object::ObjectId as SiaObjectId;
 use sia_io::upload::UploadableObject;
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
@@ -621,6 +623,27 @@ where
             Ok(None)
         }
     }
+
+    pub(crate) async fn entity_type(
+        &mut self,
+        key: &EntityKey,
+    ) -> Result<Option<EntityType>, DbError> {
+        let id = key.id().as_slice();
+        let rev = key.revision().as_slice();
+        Ok(sqlx::query!(
+            "SELECT entity_type FROM entity WHERE id = ? AND revision = ?",
+            id,
+            rev
+        )
+        .fetch_optional(self.conn())
+        .await?
+        .map(|r| match r.entity_type.as_str() {
+            <FileKind as EntityHandler>::DB_TYPE => Some(EntityType::File),
+            <DirectoryKind as EntityHandler>::DB_TYPE => Some(EntityType::Dir),
+            _ => None,
+        })
+        .flatten())
+    }
 }
 
 pub(crate) struct EntityRow {
@@ -717,6 +740,87 @@ impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
 }
 
 impl PullTask {
+    pub(crate) async fn sort_entities(
+        objects: &mut Vec<SiaObject>,
+        sia_client: &Sia,
+    ) -> Result<(), SyncError> {
+        const MAX_DEPTH: usize = 1024;
+
+        struct DirInfo {
+            children: Vec<EntityKey>,
+            depth: Cell<Option<usize>>,
+        }
+
+        let mut dirs: HashMap<EntityKey, DirInfo> = HashMap::new();
+        let mut key_of: HashMap<SiaObjectId, EntityKey> = HashMap::new();
+
+        for sia_object in objects.iter() {
+            let metadata: object::metadata::Metadata = sia_object
+                .metadata()
+                .try_into()
+                .expect("metadata conversion to never fail");
+
+            if metadata.get(METADATA_ENTITY_TYPE)
+                != Some(<DirectoryKind as EntityHandler>::METADATA_TYPE)
+            {
+                continue;
+            }
+
+            let dir = SyncedEntity::<DirectoryKind>::load_from_backend(
+                0u64.into(),
+                sia_object.id(),
+                sia_client,
+            )
+            .await?;
+
+            let key = EntityKey::new(dir.entity_id().clone(), dir.revision().clone());
+            key_of.insert(sia_object.id().clone(), key);
+            dirs.insert(
+                key,
+                DirInfo {
+                    children: dir.body().entries().to_vec(),
+                    depth: Cell::new(None),
+                },
+            );
+        }
+
+        // Depth = max(child depth) + 1; non-dir children contribute 0.
+        fn depth(
+            key: &EntityKey,
+            dirs: &HashMap<EntityKey, DirInfo>,
+            budget: usize,
+        ) -> Result<usize, SyncError> {
+            let info = &dirs[key];
+            if let Some(d) = info.depth.get() {
+                return Ok(d);
+            }
+            let Some(budget) = budget.checked_sub(1) else {
+                return Err(SyncError::MaxDepthExceeded);
+            };
+
+            let mut d = 0;
+            for c in info.children.iter().filter(|c| dirs.contains_key(*c)) {
+                d = d.max(depth(c, dirs, budget)? + 1);
+            }
+            info.depth.set(Some(d));
+            Ok(d)
+        }
+
+        // Precompute depths so we can surface errors (sort_by_key can't fail).
+        for key in dirs.keys() {
+            depth(key, &dirs, MAX_DEPTH)?;
+        }
+
+        // Sort: non-dirs (rank 0) first, then dirs by ascending depth.
+        objects.sort_by_key(|o| {
+            key_of
+                .get(o.id())
+                .map_or(0, |k| dirs[k].depth.get().expect("precomputed") + 1)
+        });
+
+        Ok(())
+    }
+
     pub(crate) async fn entity_sync<T: EntityHandler, TX: TxScope>(
         tx: &mut Transaction<TX>,
         sia_client: &Sia,

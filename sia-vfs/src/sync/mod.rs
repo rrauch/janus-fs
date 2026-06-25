@@ -5,6 +5,7 @@ use crate::blob::BlobError;
 use crate::db::Error as DbError;
 use crate::sync::push::PushTask;
 use crate::vfs::commit::CommitError;
+use crate::vfs::config::ConfigError;
 use crate::vfs::entity::EntityError;
 use crate::vfs::{Vfs, VfsError};
 pub use pull::PullTask;
@@ -39,11 +40,15 @@ pub enum Error {
     #[error(transparent)]
     CommitError(#[from] CommitError),
     #[error(transparent)]
+    ConfigError(#[from] ConfigError),
+    #[error(transparent)]
     BlobError(#[from] BlobError),
     #[error(transparent)]
     DbError(#[from] DbError),
     #[error("too many errors")]
     TooManyErrors,
+    #[error("max depth exceeded")]
+    MaxDepthExceeded,
 }
 
 #[derive(Debug)]

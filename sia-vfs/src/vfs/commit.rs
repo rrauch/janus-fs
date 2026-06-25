@@ -141,6 +141,10 @@ impl Commit {
         &self.id
     }
 
+    pub fn entity(&self) -> &EntityKey {
+        &self.entity_key
+    }
+
     pub fn preceding_commit_id(&self) -> &CommitId {
         &self.preceding_commit_id
     }

@@ -3,9 +3,10 @@ use crate::chunk::ChunkId;
 use crate::object::ObjectId;
 use crate::vfs::cache::Cache;
 use crate::vfs::commit::{CommitId, CommitMut};
+use crate::vfs::config::{ConfigMut, OwnedEntry};
 use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
-use crate::vfs::{BranchName, Head, Inode, InodeId, OwnedName, Timestamp};
+use crate::vfs::{BranchName, Head, Inode, InodeId, OwnedName, Timestamp, VfsId};
 use sia_io::Client as Sia;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
@@ -48,6 +49,10 @@ pub enum DataError {
     ConversionError(Cow<'static, str>),
     #[error("entity not found: [{0:?}]")]
     EntityNotFound(EntityKey),
+    #[error("invalid entity id")]
+    InvalidEntityId,
+    #[error("invalid revision")]
+    InvalidRevision,
     #[error("entity id and/or revision mismatch")]
     EntityMismatch,
     #[error("inode [{0}] not found")]
@@ -139,7 +144,9 @@ impl Transaction<ReadWrite> {
         self.process_dirty_inodes().await?;
 
         if let Some(branch_name) = self.0.3.clone() {
-            self.update_commit(branch_name).await?;
+            if self.update_commit(branch_name).await?.is_some() {
+                self.maybe_update_config().await?;
+            }
         }
 
         let changelog = self.get_changelog().await?;
@@ -302,7 +309,7 @@ impl Transaction<ReadWrite> {
         })
     }
 
-    async fn bootstrap(&mut self) -> Result<(), Error> {
+    async fn bootstrap(&mut self, vfs_id: &VfsId) -> Result<(), Error> {
         if sqlx::query!("SELECT COUNT(*) AS vfs_rows FROM vfs")
             .fetch_one(self.conn())
             .await?
@@ -310,7 +317,8 @@ impl Transaction<ReadWrite> {
             == 0
         {
             // empty vfs, create new root
-            let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap());
+            let root =
+                DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap(), vec![]);
             let name = root.name().to_owned();
             let entity_key = self.register_entity(root).await?;
 
@@ -346,6 +354,28 @@ impl Transaction<ReadWrite> {
                 )
                 .execute(self.conn())
                 .await?;
+
+                let mut config = ConfigMut::new(vfs_id.clone());
+                config.last_modified = Timestamp::from_millis(0).expect("timestamp 0 to be valid");
+                config.heads.insert(
+                    Head::from(branch_name.clone()),
+                    OwnedEntry {
+                        description: None,
+                        commit_id: commit.id().clone(),
+                    },
+                );
+                let config = config.freeze();
+
+                let vfs_id = vfs_id.as_slice();
+                let last_modified = config.last_modified().to_millis();
+                let data = config.as_flatbuffer();
+                sqlx::query!(
+                    "INSERT INTO config (vfs_id, head, last_modified, mode, data) VALUES (?, ?, ?, 'L', ?)",
+                    vfs_id,
+                    name,
+                    last_modified,
+                    data
+                ).execute(self.conn()).await?;
             }
         }
         Ok(())
@@ -463,13 +493,14 @@ impl Db {
         cache: Cache,
         sia_client: Arc<Sia>,
         head: Head,
+        vfs_id: &VfsId,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
         let mut tx = pool
             .write(cache.clone(), sia_client.clone(), head.maybe_branch_name())
             .await?;
-        tx.bootstrap().await?;
+        tx.bootstrap(vfs_id).await?;
         tx.housekeeping().await?;
         tx.commit().await?;
 
