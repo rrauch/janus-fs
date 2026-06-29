@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile:
 # The `builder` stage compiles the binary and gathers all dependencies in the `/export/` directory.
-FROM debian:12 AS builder
+FROM debian:13 AS builder
 RUN apt-get update && apt-get -y upgrade \
- && apt-get -y install wget curl build-essential gcc make libssl-dev pkg-config fuse git
+ && apt-get -y install wget curl build-essential gcc make libssl-dev pkg-config cmake git
 
 # Install the latest Rust build environment.
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
@@ -17,8 +17,10 @@ RUN cd /usr/local/src/ \
  && cp target/release/depres /usr/local/bin/
 
 COPY Cargo.* /usr/local/src/sia_nfs/
-COPY cachalot /usr/local/src/sia_nfs/cachalot/
+COPY foyer-cache /usr/local/src/sia_nfs/foyer-cache/
 COPY main /usr/local/src/sia_nfs/main/
+COPY sia-io /usr/local/src/sia_nfs/sia-io/
+COPY sia-vfs /usr/local/src/sia_nfs/sia-vfs/
 
 # Build the `sia_nfs` binary.
 RUN cd /usr/local/src/sia_nfs/ \
