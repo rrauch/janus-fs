@@ -222,12 +222,12 @@ pub enum ConfigError {
     InvalidMaxConcurrentDownloads,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     backend: Backend,
     cache: Cache,
     known_object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
-    object_event_loop_handle: Option<JoinHandle<()>>,
+    object_event_loop_handle: Option<Arc<JoinHandle<()>>>,
     chunk_size: usize,
     chunk_downloader: Arc<Scheduler<ChunkDownloader>>,
 }
@@ -235,7 +235,9 @@ pub struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(handle) = self.object_event_loop_handle.take() {
-            handle.abort();
+            if let Ok(handle) = Arc::try_unwrap(handle) {
+                handle.abort();
+            }
         }
     }
 }
@@ -311,7 +313,7 @@ impl Client {
             backend,
             cache,
             known_object_ids: object_ids,
-            object_event_loop_handle: Some(object_event_loop_handle),
+            object_event_loop_handle: Some(Arc::new(object_event_loop_handle)),
             chunk_downloader,
         })
     }
