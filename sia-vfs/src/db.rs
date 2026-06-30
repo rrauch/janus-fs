@@ -41,6 +41,8 @@ pub enum Error {
 pub enum DbStateError {
     #[error("invalid page size: '{0}'")]
     InvalidPageSize(String),
+    #[error("connection pool already closed")]
+    PoolIsClosed,
 }
 
 #[derive(Error, Debug)]
@@ -398,7 +400,7 @@ struct Changelog {
 #[repr(transparent)]
 pub(crate) struct Db(Arc<DbInner>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SqlitePool {
     writer: Pool<Sqlite>,
     reader: Pool<Sqlite>,
@@ -429,11 +431,22 @@ impl SqlitePool {
 
 #[derive(Debug)]
 struct DbInner {
-    pool: SqlitePool,
+    pool: Option<SqlitePool>,
     db_file: PathBuf,
     cache: Cache,
     sia_client: Arc<Sia>,
     head: Head,
+}
+
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            tokio::spawn(async move {
+                pool.reader.close().await;
+                pool.writer.close().await;
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,7 +518,7 @@ impl Db {
         tx.commit().await?;
 
         Ok(Self(Arc::new(DbInner {
-            pool,
+            pool: Some(pool),
             db_file,
             cache,
             sia_client,
@@ -514,13 +527,21 @@ impl Db {
     }
 
     pub async fn read(&self) -> Result<Transaction<ReadOnly>, Error> {
-        Ok(self.0.pool.read(self.0.sia_client.clone()).await?)
+        Ok(self
+            .0
+            .pool
+            .as_ref()
+            .ok_or_else(|| DbStateError::PoolIsClosed)?
+            .read(self.0.sia_client.clone())
+            .await?)
     }
 
     pub async fn write(&self) -> Result<Transaction<ReadWrite>, Error> {
         let mut tx = self
             .0
             .pool
+            .as_ref()
+            .ok_or_else(|| DbStateError::PoolIsClosed)?
             .write(
                 self.0.cache.clone(),
                 self.0.sia_client.clone(),
@@ -573,6 +594,32 @@ async fn db_init(
     Ok(SqlitePool { writer, reader })
 }
 
+async fn connect_with_retry<const MAX_ATTEMPTS: usize>(
+    opts: &SqliteConnectOptions,
+) -> Result<SqliteConnection, Error> {
+    fn is_locked(e: &sqlx::Error) -> bool {
+        matches!(
+            e,
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("5") // database is locked
+        )
+    }
+
+    let mut attempts = 0;
+    loop {
+        match SqliteConnection::connect_with(opts).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                if is_locked(&e) && attempts < MAX_ATTEMPTS {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+}
+
 async fn prepare_db(db_file: &Path, page_size: PageSize) -> Result<(), Error> {
     let opts = SqliteConnectOptions::new()
         .create_if_missing(true)
@@ -584,7 +631,7 @@ async fn prepare_db(db_file: &Path, page_size: PageSize) -> Result<(), Error> {
         .busy_timeout(Duration::from_millis(1000))
         .shared_cache(false);
 
-    let mut conn = SqliteConnection::connect_with(&opts).await?;
+    let mut conn = connect_with_retry::<10>(&opts).await?;
 
     async { sqlx::migrate!("./migrations").run_direct(&mut conn).await }.await?;
 
