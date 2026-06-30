@@ -35,7 +35,7 @@ use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use thiserror::Error;
 use twox_hash::XxHash3_64;
@@ -594,6 +594,23 @@ impl<T: EntityHandler> DerefMut for InodeMut<T> {
 #[repr(transparent)]
 pub struct Vfs(Arc<Inner>);
 
+#[derive(Debug, Clone)]
+pub(crate) struct WeakVfs(Weak<Inner>);
+
+impl From<Vfs> for WeakVfs {
+    fn from(value: Vfs) -> Self {
+        WeakVfs(Arc::downgrade(&value.0))
+    }
+}
+
+impl TryFrom<WeakVfs> for Vfs {
+    type Error = WeakVfs;
+
+    fn try_from(value: WeakVfs) -> Result<Self, Self::Error> {
+        value.0.upgrade().map(Vfs).ok_or_else(|| value)
+    }
+}
+
 #[bon::bon]
 impl Vfs {
     #[builder(derive(Debug))]
@@ -647,7 +664,9 @@ impl Vfs {
             read_only,
         }));
 
-        syncer_tx.send(this.clone()).expect("syncer to be alive");
+        syncer_tx
+            .send(this.clone().into())
+            .expect("syncer to be alive");
 
         Ok(this)
     }
