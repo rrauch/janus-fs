@@ -3,12 +3,14 @@ use crate::indexd::AppDetails;
 use bon::bon;
 use derive_where::derive_where;
 use sia_storage::{
-    AppKey, ApprovedState, Builder, BuilderError, Error as SiaError, IntoUrl,
-    RequestingApprovalState, SDK, SealedObjectError, Url,
+    ApprovedState, Builder, BuilderError, Error as SiaError, IntoUrl, RequestingApprovalState, SDK,
+    SealedObjectError, Url,
 };
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
+
+pub use sia_storage::AppKey;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
