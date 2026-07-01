@@ -145,7 +145,7 @@ impl Config {
     ) -> UploadableObject<Metadata<'_>, Cursor<Vec<u8>>> {
         let metadata = MetadataMut::with_vfs_template(vfs_id, METADATA_OBJECT_TYPE);
         UploadableObject::new(
-            format!("/configs/{}.config", vfs_id),
+            format!("/configs/{}.config", self.last_modified().to_millis()),
             Cursor::new(self.inner.backing_cart().as_ref().to_vec()),
             Some(metadata.freeze()),
         )
@@ -335,6 +335,8 @@ impl ConfigMut {
 impl PullTask {
     pub(crate) async fn config_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
+        head: &Head,
+        vfs_id: &VfsId,
         sia_client: &Sia,
         sia_object: &SiaObject,
         object_id: ObjectId,
@@ -343,7 +345,7 @@ impl PullTask {
         Transaction<TX>: crate::db::Read + crate::db::Write,
     {
         let config = Config::load_from_backend(object_id, sia_object.id(), sia_client).await?;
-        tx.maybe_set_config(&config).await?;
+        tx.maybe_set_config(&config, head, vfs_id).await?;
         Ok(())
     }
 }
@@ -465,18 +467,6 @@ where
                 .config
                 .ok_or_else(|| DataError::ConversionError("config is missing".into()))?,
         )
-    }
-
-    async fn current_head(&mut self) -> Result<Head, crate::db::Error> {
-        let name = sqlx::query!("SELECT head FROM config")
-            .map(|r| r.head)
-            .fetch_one(self.conn())
-            .await?;
-        self.current_heads()
-            .await?
-            .into_iter()
-            .find(|head| head.name() == name)
-            .ok_or_else(|| std::io::Error::other("head not found").into())
     }
 
     async fn current_heads(&mut self) -> Result<Vec<Head>, crate::db::Error> {
@@ -620,55 +610,34 @@ where
         Ok(())
     }
 
-    async fn maybe_set_config(&mut self, config: &Config) -> Result<(), crate::db::Error> {
-        let current = self.current_config().await?;
-        if config.last_modified() <= current.last_modified() || !config.is_synced() {
-            // nothing to do
-            return Ok(());
+    async fn maybe_set_config(
+        &mut self,
+        config: &Config,
+        head: &Head,
+        vfs_id: &VfsId,
+    ) -> Result<(), crate::db::Error> {
+        if !self.is_empty().await? {
+            let current = self.current_config().await?;
+            if config.last_modified() <= current.last_modified() || !config.is_synced() {
+                // nothing to do
+                return Ok(());
+            }
         }
 
-        self.set_config(config).await
+        self.set_config(config, head, vfs_id).await
     }
 
-    async fn set_config(&mut self, config: &Config) -> Result<(), crate::db::Error> {
-        let head = self.current_head().await?;
+    async fn set_config(
+        &mut self,
+        config: &Config,
+        head: &Head,
+        vfs_id: &VfsId,
+    ) -> Result<(), crate::db::Error> {
         if !config.heads().contains_key(&head) {
             return Err(DataError::HeadEntryNotFound(head.clone()))?;
         }
+
         let prev_commit_id = self.current_commit_id(head.clone()).await?;
-
-        let last_modified = config.last_modified().to_millis();
-        let (mode, object_id, data) = match &config.mode {
-            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64), None),
-            StorageMode::Local(data) => ("L", None, Some(data.as_ref())),
-        };
-
-        sqlx::query!(
-            "UPDATE config SET last_modified = ?, mode = ?, object_id = ?, data = ?",
-            last_modified,
-            mode,
-            object_id,
-            data,
-        )
-        .execute(self.conn())
-        .await?;
-
-        let mut obsolete_heads = self.current_heads().await?;
-        obsolete_heads.retain(|h| !config.heads().contains_key(h));
-        for head in obsolete_heads {
-            let name = head.name();
-            let head_type = match &head {
-                Head::Branch(_) => "B",
-                Head::Tag(_) => "T",
-            };
-            sqlx::query!(
-                "DELETE FROM head WHERE name = ? AND type = ?",
-                name,
-                head_type,
-            )
-            .execute(self.conn())
-            .await?;
-        }
 
         for (head, entry) in config.heads().iter() {
             let name = head.name();
@@ -692,9 +661,68 @@ where
             .await?;
         }
 
-        let current_commit_id = self.current_commit_id(head).await?;
+        let last_modified = config.last_modified().to_millis();
+        let (mode, object_id, data) = match &config.mode {
+            StorageMode::Synced(oid) => ("S", Some(*oid.deref() as i64), None),
+            StorageMode::Local(data) => ("L", None, Some(data.as_ref())),
+        };
 
-        if current_commit_id != prev_commit_id {
+        let head_name = head.name();
+        let vfs_id = vfs_id.as_slice();
+
+        if self.is_empty().await? {
+            // initial config
+            sqlx::query!(
+                "INSERT INTO config (vfs_id, head, last_modified, mode, object_id, data) VALUES (?, ?, ?, ?, ?, ?)",
+                vfs_id,
+                head_name,
+                last_modified,
+                mode,
+                object_id,
+                data,
+            ).execute(self.conn()).await?;
+        } else {
+            // update
+            let rows_affected = sqlx::query!(
+                "UPDATE config SET head = ?, last_modified = ?, mode = ?, object_id = ?, data = ? WHERE vfs_id = ?",
+                head_name,
+                last_modified,
+                mode,
+                object_id,
+                data,
+                vfs_id
+            ).execute(self.conn()).await?.rows_affected();
+            if rows_affected != 1 {
+                return Err(DataError::UnexpectedAffectedRows {
+                    expected: 1,
+                    actual: rows_affected,
+                })?;
+            }
+        }
+
+        let mut obsolete_heads = self.current_heads().await?;
+        obsolete_heads.retain(|h| !config.heads().contains_key(h));
+        for head in obsolete_heads {
+            let name = head.name();
+            let head_type = match &head {
+                Head::Branch(_) => "B",
+                Head::Tag(_) => "T",
+            };
+            sqlx::query!(
+                "DELETE FROM head WHERE name = ? AND type = ?",
+                name,
+                head_type,
+            )
+            .execute(self.conn())
+            .await?;
+        }
+
+        let current_commit_id = self
+            .current_commit_id(head.clone())
+            .await?
+            .ok_or_else(|| DataError::HeadEntryNotFound(head.clone()))?;
+
+        if Some(current_commit_id) != prev_commit_id {
             // commit changed, full vfs update needed
             let commit = self
                 .commit_by_id(&current_commit_id)

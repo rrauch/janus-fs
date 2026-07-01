@@ -140,13 +140,28 @@ impl<T: AsMut<SqliteConnection> + Send + Sync + Unpin + 'static> TxScope for T {
 #[repr(transparent)]
 pub(crate) struct Transaction<Scope: TxScope>(Scope);
 
+impl<C: TxScope> Transaction<C>
+where
+    Self: Read,
+{
+    pub async fn is_empty(&mut self) -> Result<bool, Error> {
+        Ok(
+            sqlx::query!("SELECT COUNT(*) AS \"num_rows:i64\" FROM config")
+                .fetch_one(self.conn())
+                .await?
+                .num_rows
+                == 0,
+        )
+    }
+}
+
 impl Transaction<ReadWrite> {
     #[inline]
     pub async fn commit(mut self) -> Result<(), Error> {
         self.process_dirty_inodes().await?;
 
         if let Some(branch_name) = self.0.3.clone() {
-            if self.update_commit(branch_name).await?.is_some() {
+            if !self.is_empty().await? && self.update_commit(branch_name).await?.is_some() {
                 self.maybe_update_config().await?;
             }
         }
@@ -310,78 +325,6 @@ impl Transaction<ReadWrite> {
             affected_chunk_ids,
         })
     }
-
-    async fn bootstrap(&mut self, vfs_id: &VfsId) -> Result<(), Error> {
-        if sqlx::query!("SELECT COUNT(*) AS vfs_rows FROM vfs")
-            .fetch_one(self.conn())
-            .await?
-            .vfs_rows
-            == 0
-        {
-            // empty vfs, create new root
-            let root =
-                DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap(), vec![]);
-            let name = root.name().to_owned();
-            let entity_key = self.register_entity(root).await?;
-
-            let entity_id = entity_key.id().as_slice();
-            let entity_rev = entity_key.revision().as_slice();
-            let name = name.as_ref();
-
-            sqlx::query!(
-                "INSERT INTO vfs (inode_id, inode_type, entity_id, entity_rev, name) VALUES (1, 'D', ?, ?, ?)",
-                entity_id,
-                entity_rev,
-                name
-            )
-                .execute(self.conn())
-                .await?;
-
-            if let Some(branch_name) = self.0.3.clone() {
-                // create empty commit & initial head
-                let commit = CommitMut {
-                    entity_key: entity_key.clone(),
-                    preceding_commit_id: CommitId::zeroed(),
-                    commit_count: 0,
-                    created: Timestamp::now(),
-                }
-                .freeze();
-                self.register_commit(&commit).await?;
-                let name = branch_name.deref();
-                let id = commit.id().as_slice();
-                sqlx::query!(
-                    "INSERT INTO head (name, type, commit_id) VALUES (?, 'B', ?)",
-                    name,
-                    id,
-                )
-                .execute(self.conn())
-                .await?;
-
-                let mut config = ConfigMut::new(vfs_id.clone());
-                config.last_modified = Timestamp::from_millis(0).expect("timestamp 0 to be valid");
-                config.heads.insert(
-                    Head::from(branch_name.clone()),
-                    OwnedEntry {
-                        description: None,
-                        commit_id: commit.id().clone(),
-                    },
-                );
-                let config = config.freeze();
-
-                let vfs_id = vfs_id.as_slice();
-                let last_modified = config.last_modified().to_millis();
-                let data = config.as_flatbuffer();
-                sqlx::query!(
-                    "INSERT INTO config (vfs_id, head, last_modified, mode, data) VALUES (?, ?, ?, 'L', ?)",
-                    vfs_id,
-                    name,
-                    last_modified,
-                    data
-                ).execute(self.conn()).await?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl<Scope: TxScope> AsMut<SqliteConnection> for Transaction<Scope> {
@@ -513,7 +456,6 @@ impl Db {
         let mut tx = pool
             .write(cache.clone(), sia_client.clone(), head.maybe_branch_name())
             .await?;
-        tx.bootstrap(vfs_id).await?;
         tx.housekeeping().await?;
         tx.commit().await?;
 

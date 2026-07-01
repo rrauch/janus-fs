@@ -64,10 +64,12 @@ impl PullTask {
         }
 
         // mark all objects we didn't see or that failed in this run as erroneous
-        let mut tx = self.vfs.tx_rw().await?;
-        tx.mark_object_error(erroneous_object_ids.into_iter())
-            .await?;
-        tx.commit().await?;
+        if !erroneous_object_ids.is_empty() {
+            let mut tx = self.vfs.tx_rw().await?;
+            tx.mark_object_error(erroneous_object_ids.into_iter())
+                .await?;
+            tx.commit().await?;
+        }
         Ok(())
     }
 
@@ -173,7 +175,15 @@ impl PullTask {
                         }
                     }
                     Some(config::METADATA_OBJECT_TYPE) => {
-                        Self::config_sync(&mut tx, self.vfs.sia_client(), &sia_object, id).await?;
+                        Self::config_sync(
+                            &mut tx,
+                            self.vfs.head(),
+                            self.vfs.id(),
+                            self.vfs.sia_client(),
+                            &sia_object,
+                            id,
+                        )
+                        .await?;
                     }
                     None => {}
                     Some(other) => {}
@@ -239,6 +249,7 @@ mod tests {
     use crate::blob::io::tests::MockBackend;
     use crate::blob::{Blob, BlobMut};
     use crate::chunk::Chunk;
+    use crate::object::Object;
     use crate::sync::PullTask;
     use crate::vfs::commit::{Commit, CommitId, CommitMut};
     use crate::vfs::config::{Config, ConfigMut, OwnedEntry};
@@ -247,16 +258,18 @@ mod tests {
     use crate::vfs::file::FileDraft;
     use crate::vfs::tests::new_vfs_with_opts;
     use crate::vfs::{BranchName, OwnedName, StorageMode, Timestamp, Vfs, VfsId};
+    use chrono::Utc;
     use futures_util::{AsyncWriteExt, TryStreamExt};
     use std::num::NonZeroUsize;
     use std::ops::Deref;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn pull_empty() -> anyhow::Result<()> {
         pull_test(
             |_| async move { Ok(()) },
             |vfs| async move {
-                assert!(vfs.tx().await?.list_objects().await?.is_empty());
+                assert_eq!(vfs.tx().await?.list_objects().await?.len(), 3);
                 Ok(())
             },
         )
@@ -292,9 +305,9 @@ mod tests {
                 async move {
                     let mut tx = vfs.tx().await?;
                     let objects = tx.list_objects().await?;
-                    assert_eq!(objects.len(), 2);
-                    let object = objects.get(0).unwrap();
-                    assert_eq!(*object.id().deref(), 2);
+                    assert_eq!(objects.len(), 5);
+                    let object = by_id(&objects, 5);
+
                     assert_eq!(
                         object.remote_location(),
                         format!("mock:/commits/{}.commit", commit.id())
@@ -340,11 +353,14 @@ mod tests {
                 commit_id: commit.id().clone(),
             },
         );
+        config.last_modified = (Utc::now() + Duration::from_secs(2)).into();
+        config.description = Some("foo".to_string());
         let config = config.freeze();
 
         pull_test(
             |vfs| {
                 let config = config.clone();
+                let commit = commit.clone();
                 async move {
                     upload_blob_object(&vfs, &blob).await?;
                     upload_entity_object(&vfs, &file).await?;
@@ -357,16 +373,22 @@ mod tests {
             },
             |vfs| {
                 let config = config.clone();
+                let commit = commit.clone();
                 async move {
                     let mut tx = vfs.tx().await?;
                     let objects = tx.list_objects().await?;
-                    assert_eq!(objects.len(), 6);
-                    let object = objects.get(2).unwrap();
-                    assert_eq!(*object.id().deref(), 6);
+                    assert_eq!(objects.len(), 9);
+                    let object = by_id(&objects, 9);
+
                     assert_eq!(
                         object.remote_location(),
-                        format!("mock:/configs/{}.config", vfs.id())
+                        format!(
+                            "mock:/configs/{}.config",
+                            config.last_modified().to_millis()
+                        )
                     );
+
+                    assert_eq!(vfs.current_commit().await?.id(), commit.id());
 
                     let root = vfs.root().await?;
                     assert!(root.is_synced());
@@ -407,9 +429,8 @@ mod tests {
                 async move {
                     let mut tx = vfs.tx().await?;
                     let objects = tx.list_objects().await?;
-                    assert_eq!(objects.len(), 1);
-                    let object = objects.get(0).unwrap();
-                    assert_eq!(*object.id().deref(), 1);
+                    assert_eq!(objects.len(), 4);
+                    let object = by_id(&objects, 4);
                     assert_eq!(
                         object.remote_location(),
                         format!("mock:/chunks/{}.chunk", chunk.id())
@@ -443,9 +464,8 @@ mod tests {
                 async move {
                     let mut tx = vfs.tx().await?;
                     let objects = tx.list_objects().await?;
-                    assert_eq!(objects.len(), 1);
-                    let object = objects.get(0).unwrap();
-                    assert_eq!(*object.id().deref(), 1);
+                    assert_eq!(objects.len(), 4);
+                    let object = by_id(&objects, 4);
                     assert_eq!(
                         object.remote_location(),
                         format!("mock:/blobs/{}.blob", blob.id())
@@ -504,7 +524,7 @@ mod tests {
                 async move {
                     let mut tx = vfs.tx().await?;
                     let objects = tx.list_objects().await?;
-                    assert_eq!(objects.len(), num_chunks + 1);
+                    assert_eq!(objects.len(), num_chunks + 4);
                     Ok(())
                 }
             },
@@ -531,7 +551,7 @@ mod tests {
                 let blob = blob.clone();
                 async move {
                     let mut tx = vfs.tx().await?;
-                    assert!(tx.list_objects().await?.is_empty());
+                    assert_eq!(tx.list_objects().await?.len(), 3);
                     assert!(tx.blob_by_id(blob.id()).await?.is_none());
                     Ok(())
                 }
@@ -565,7 +585,7 @@ mod tests {
                 async move {
                     let mut tx = vfs.tx().await?;
                     let objects = tx.list_objects().await?;
-                    assert_eq!(objects.len(), num_chunks + 2);
+                    assert_eq!(objects.len(), num_chunks + 5);
                     Ok(())
                 }
             },
@@ -589,7 +609,7 @@ mod tests {
             |vfs| async move {
                 let mut tx = vfs.tx().await?;
                 let objects = tx.list_objects().await?;
-                assert_eq!(objects.len(), 1);
+                assert_eq!(objects.len(), 4);
                 Ok(())
             },
         )
@@ -602,7 +622,7 @@ mod tests {
     async fn pull_idempotent() -> anyhow::Result<()> {
         let (blob, chunks) = write_blob(b"idempotent test", 1024).await?;
         let file = FileDraft::new_file_draft(OwnedName::try_from("file.txt")?, blob.clone());
-        let expected_count = chunks.len() + 2;
+        let expected_count = chunks.len() + 5;
 
         pull_test_n(
             2,
@@ -631,6 +651,10 @@ mod tests {
         Ok(())
     }
 
+    fn by_id(objects: &Vec<Object>, id: u64) -> &Object {
+        objects.iter().find(|o| o.id().deref() == &id).unwrap()
+    }
+
     async fn pull_test<F1, Fut1, F2, Fut2>(setup: F1, assert: F2) -> anyhow::Result<()>
     where
         F1: FnOnce(Vfs) -> Fut1,
@@ -652,8 +676,7 @@ mod tests {
         F2: FnOnce(Vfs) -> Fut2,
         Fut2: Future<Output = anyhow::Result<()>>,
     {
-        let vfs_id = VfsId::generate();
-        let (vfs, _temp_dir) = new_vfs_with_opts(Some(vfs_id), None).await?;
+        let (vfs, _temp_dir) = new_vfs_with_opts(None).await?;
         let _temp_dir = _temp_dir.path().to_str().unwrap().to_string();
 
         setup(vfs.clone()).await?;
@@ -699,6 +722,7 @@ mod tests {
     }
 
     async fn upload_config_object(vfs: &Vfs, config: &Config) -> anyhow::Result<()> {
+        let ts = config.last_modified().to_millis();
         vfs.sia_client()
             .upload(config.to_uploadable_object(vfs.id()))
             .await?;

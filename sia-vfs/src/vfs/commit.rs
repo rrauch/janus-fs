@@ -241,7 +241,7 @@ impl Commit {
     }
 
     pub(crate) fn into_synced(self, object_id: ObjectId) -> Self {
-        let mut commit_mut = CommitMut::from(self);
+        let commit_mut = CommitMut::from(self);
         commit_mut.finalize(StorageMode::Synced(object_id))
     }
 }
@@ -348,7 +348,7 @@ where
     pub(crate) async fn current_commit_id(
         &mut self,
         head: impl Into<Head>,
-    ) -> Result<CommitId, crate::db::Error> {
+    ) -> Result<Option<CommitId>, crate::db::Error> {
         let head = head.into();
         let name = head.name();
         let head_type = match &head {
@@ -356,7 +356,7 @@ where
             Head::Tag(_) => "T",
         };
 
-        sqlx::query!(
+        Ok(sqlx::query!(
             "SELECT commit_id FROM head where name = ? and type = ?",
             name,
             head_type,
@@ -364,8 +364,7 @@ where
         .map(|r| CommitId::try_from_bytes(r.commit_id))
         .fetch_optional(self.conn())
         .await?
-        .flatten()
-        .ok_or_else(|| DataError::HeadEntryNotFound(head).into())
+        .flatten())
     }
 
     pub(crate) async fn commit_by_id(
@@ -469,30 +468,6 @@ where
     ) -> Result<(), crate::db::Error> {
         let id = commit.id().as_slice();
 
-        if let StorageMode::Synced(object_id) = &commit.mode {
-            // upgrade commit to synced if necessary
-            let object_id = *object_id.deref() as i64;
-            sqlx::query!(
-                "UPDATE commits SET mode = 'S', data = NULL, object_id = ? WHERE id = ?",
-                object_id,
-                id
-            )
-            .execute(self.conn())
-            .await?;
-        }
-
-        if sqlx::query!(
-            "SELECT EXISTS(SELECT 1 FROM commits WHERE id = ?) as \"commit_exists: bool\"",
-            id,
-        )
-        .fetch_one(self.conn())
-        .await?
-        .commit_exists
-        {
-            // commit already exists
-            return Ok(());
-        }
-
         let (mode, data, object_id) = match &commit.mode {
             StorageMode::Local(bytes) => ("L", Some(bytes.as_ref()), None),
             StorageMode::Synced(oid) => ("S", None, Some(*oid.deref() as i64)),
@@ -502,14 +477,20 @@ where
         let entity_rev = commit.entity_key.revision().as_slice();
 
         sqlx::query!(
-            "INSERT INTO commits (id, entity_id, entity_rev, mode, object_id, data) VALUES (?, ?, ?, ?, ?, ?)",
-            id,
-            entity_id,
-            entity_rev,
-            mode,
-            object_id,
-            data,
-        )
+        "INSERT INTO commits (id, entity_id, entity_rev, mode, object_id, data) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             entity_id = excluded.entity_id,
+             entity_rev = excluded.entity_rev,
+             mode = excluded.mode,
+             object_id = excluded.object_id,
+             data = excluded.data",
+        id,
+        entity_id,
+        entity_rev,
+        mode,
+        object_id,
+        data,
+    )
             .execute(self.conn())
             .await?;
 
@@ -538,7 +519,10 @@ where
         .await?
         .map_err(std::io::Error::other)?;
 
-        let prev_commit_id = self.current_commit_id(branch_name.clone()).await?;
+        let prev_commit_id = self
+            .current_commit_id(branch_name.clone())
+            .await?
+            .ok_or_else(|| DataError::HeadEntryNotFound(branch_name.clone().into()))?;
         let prev_commit = self
             .commit_by_id(&prev_commit_id)
             .await?

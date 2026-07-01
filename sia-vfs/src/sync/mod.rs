@@ -113,7 +113,7 @@ pub(crate) async fn pull(vfs: Vfs, max_concurrency: NonZeroUsize) -> Result<(), 
 
 impl Vfs {
     pub async fn sync(&self) -> Result<(), Error> {
-        if !self.is_read_only() {
+        if !self.is_read_only() && !self.is_empty().await? {
             push(self.clone(), self.max_sync_attempts()).await?;
         }
         pull(self.clone(), self.max_sync_concurrency()).await?;

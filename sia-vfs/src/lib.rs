@@ -197,12 +197,9 @@ mod gen_flatbuffers {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::vfs::commit::{CommitId, CommitMut};
-    use crate::vfs::config::{ConfigMut, OwnedEntry};
-    use crate::vfs::directory::DirectoryDraft;
-    use crate::vfs::entity::EntityKey;
+    use crate::vfs::file::File;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{BranchName, Inode, OwnedName, Timestamp, Vfs, VfsId};
+    use crate::vfs::{Inode, Vfs};
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     use sia_io::Client as Sia;
     use std::io::SeekFrom;
@@ -215,65 +212,22 @@ pub(crate) mod tests {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
         let sia_client = Sia::mock().await;
-        let vfs_id = VfsId::generate();
 
-        let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT")?, vec![]);
-        let entity_key = EntityKey::new(root.entity_id().clone(), root.revision().clone());
+        // create a new vfs & upload to network
+        let vfs_id = Vfs::create_new(None, &sia_client).await?;
 
-        let commit = CommitMut {
-            entity_key,
-            preceding_commit_id: CommitId::zeroed(),
-            commit_count: 0,
-            created: Timestamp::now(),
-        }
-        .freeze();
-
-        let mut config = ConfigMut::new(vfs_id.clone());
-        config.heads.insert(
-            BranchName::default().into(),
-            OwnedEntry {
-                description: None,
-                commit_id: commit.id().clone(),
-            },
-        );
-        let config = config.freeze();
-
-        sia_client
-            .upload(root.to_uploadable_object(&vfs_id))
-            .await?;
-        sia_client
-            .upload(commit.to_uploadable_object(&vfs_id))
-            .await?;
-        sia_client
-            .upload(config.to_uploadable_object(&vfs_id))
-            .await?;
-
+        // instantiate vfs + initial sync from network
         let vfs = Vfs::builder()
             .vfs_id(vfs_id.clone())
             .sia_client(sia_client.clone())
             .db_file(path.clone())
             .max_sync_concurrency(NonZero::new(1).unwrap())
-            .initial_sync_delay(Duration::from_secs(8640000))
-            .read_only(true)
             .build()
             .await?;
 
-        vfs.sync().await?;
+        assert!(vfs.current_commit().await?.is_synced());
 
-        assert_eq!(vfs.current_config().await?.heads(), config.heads());
-        assert_eq!(vfs.current_commit().await?.id(), commit.id());
-
-        drop(vfs);
-
-        let vfs = Vfs::builder()
-            .vfs_id(vfs_id.clone())
-            .sia_client(sia_client.clone())
-            .db_file(path.clone())
-            .max_sync_concurrency(NonZero::new(1).unwrap())
-            .initial_sync_delay(Duration::from_secs(8640000))
-            .build()
-            .await?;
-
+        // make multiple local changes
         let dir1 = vfs
             .create_dir(&vfs.root().await?, "dir1".try_into()?)
             .await?;
@@ -295,15 +249,16 @@ pub(crate) mod tests {
         let commit = vfs.current_commit().await?;
         assert!(!commit.is_synced());
 
-        read_file(&vfs, false).await?;
+        read_file(&vfs, b"some bytesmore", false).await?;
 
+        // sync changes back to network
         vfs.sync().await?;
 
         let current_commit = vfs.current_commit().await?;
         assert!(current_commit.is_synced());
         assert_eq!(current_commit.id(), commit.id());
 
-        read_file(&vfs, true).await?;
+        read_file(&vfs, b"some bytesmore", true).await?;
 
         drop(vfs);
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -316,38 +271,59 @@ pub(crate) mod tests {
             .sia_client(sia_client)
             .db_file(path)
             .max_sync_concurrency(NonZero::new(1).unwrap())
-            .initial_sync_delay(Duration::from_secs(8640000))
-            .read_only(true)
             .build()
             .await?;
-
-        vfs.sync().await?;
 
         let current_commit = vfs.current_commit().await?;
         assert!(current_commit.is_synced());
         assert_eq!(current_commit.id(), commit.id());
 
-        read_file(&vfs, true).await?;
+        read_file(&vfs, b"some bytesmore", true).await?;
+
+        // make additional changes
+
+        let file = get_file(&vfs).await?;
+        let mut fh = vfs.open_rw(&file).await?;
+        fh.seek(SeekFrom::End(0)).await?;
+        fh.write_all(b"even more").await?;
+        fh.commit().await?;
+
+        read_file(&vfs, b"some bytesmoreeven more", false).await?;
+
+        // sync changes back to network
+        vfs.sync().await?;
+
+        read_file(&vfs, b"some bytesmoreeven more", true).await?;
 
         Ok(())
     }
 
-    async fn read_file(vfs: &Vfs, expect_synced: bool) -> anyhow::Result<()> {
-        let file1 = match vfs
-            .inode_by_path(&VfsPath::try_from("/dir1/file1")?)
-            .await?
-            .unwrap()
-        {
-            Inode::File(file) => file,
-            _ => unreachable!("should be a file"),
-        };
-        assert_eq!(file1.len(), 14);
+    async fn read_file(
+        vfs: &Vfs,
+        expected_content: &[u8],
+        expect_synced: bool,
+    ) -> anyhow::Result<()> {
+        let file1 = get_file(vfs).await?;
+        assert_eq!(file1.len(), expected_content.len() as u64);
         assert_eq!(file1.is_synced(), expect_synced);
         let mut fh = vfs.open(&file1).await?;
         let mut buffer = Vec::with_capacity(fh.len() as usize);
         fh.read_to_end(&mut buffer).await?;
-        assert_eq!(buffer.as_slice(), b"some bytesmore");
+        assert_eq!(buffer.as_slice(), expected_content);
 
         Ok(())
+    }
+
+    async fn get_file(vfs: &Vfs) -> anyhow::Result<File> {
+        Ok(
+            match vfs
+                .inode_by_path(&VfsPath::try_from("/dir1/file1")?)
+                .await?
+                .unwrap()
+            {
+                Inode::File(file) => file,
+                _ => unreachable!("should be a file"),
+            },
+        )
     }
 }
