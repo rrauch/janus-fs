@@ -7,6 +7,7 @@ edition = "2024"
 default = ["indexd", "lz4", "renterd", "zstd"]
 indexd = ["sia-io/indexd"]
 lz4 = ["dep:lz4_flex"]
+mock = ["sia-io/mock"]
 renterd = ["sia-io/renterd"]
 zstd = ["dep:zstd"]
 
@@ -39,13 +40,11 @@ yoke = "0.8"
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
-sia-io = { path = "../sia-io", default-features = false, features = ["mock"] }
+sia-vfs = { path = ".", features = ["mock"] }
 
 anyhow = { workspace = true }
-dotenv = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
-tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

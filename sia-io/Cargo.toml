@@ -23,7 +23,6 @@ futures-io = { workspace = true }
 futures-util = { workspace = true, features = ["io"] }
 indexmap = "2"
 itertools = { workspace = true }
-maybe-owned = "0.3"
 mime = "0.3"
 moka = { workspace = true, features = ["future"] }
 ouroboros = "0.18"
