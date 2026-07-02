@@ -430,12 +430,6 @@ dependencies = [
 
 [[package]]
 name = "bytesize"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e93abca9e28e0a1b9877922aacb20576e05d4679ffa78c3d6dc22a26a216659"
-
-[[package]]
-name = "bytesize"
 version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bd91ee7b2422bcb158d90ef4d14f75ef67f340943fc4149891dcce8f8b972a3"
@@ -1283,7 +1277,7 @@ dependencies = [
  "foyer-tokio",
  "futures-util",
  "hashbrown 0.16.1",
- "itertools 0.14.0",
+ "itertools",
  "mea",
  "mixtrics",
  "parking_lot 0.12.5",
@@ -1313,7 +1307,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.16.1",
  "io-uring",
- "itertools 0.14.0",
+ "itertools",
  "libc",
  "lz4",
  "mea",
@@ -1998,15 +1992,6 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -2288,7 +2273,7 @@ version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb252c728b9d77c6ef9103f0c81524fa0a3d3b161d0a936295d7fbeff6e04c11"
 dependencies = [
- "itertools 0.14.0",
+ "itertools",
  "parking_lot 0.12.5",
 ]
 
@@ -3509,7 +3494,7 @@ dependencies = [
  "bimap",
  "bon",
  "bytes",
- "bytesize 2.3.1",
+ "bytesize",
  "chrono",
  "ct-codecs",
  "derive-where",
@@ -3517,7 +3502,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "indexmap 2.14.0",
- "itertools 0.14.0",
+ "itertools",
  "maybe-owned",
  "mime",
  "moka",
@@ -3548,7 +3533,7 @@ dependencies = [
  "bon",
  "bytemuck",
  "bytes",
- "bytesize 2.3.1",
+ "bytesize",
  "chrono",
  "derive-where",
  "dotenv",
@@ -3639,7 +3624,7 @@ dependencies = [
  "async-trait",
  "bimap",
  "bytes",
- "bytesize 1.3.3",
+ "bytesize",
  "chrono",
  "clap",
  "ct-codecs",
@@ -3647,7 +3632,7 @@ dependencies = [
  "futures",
  "futures-util",
  "humantime",
- "itertools 0.13.0",
+ "itertools",
  "moka",
  "nfsserve",
  "parking_lot 0.12.5",

@@ -1,7 +1,7 @@
 [package]
 name = "sia_nfs"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 sia-io = { path = "../sia-io", features = ["indexd", "renterd"] }
@@ -9,20 +9,20 @@ sia-vfs = { path = "../sia-vfs", features = ["indexd", "renterd"] }
 foyer-cache = { path = "../foyer-cache" }
 
 anyhow = { workspace = true, features = ["backtrace"] }
-async-trait = "0.1"
-bimap = "0.6"
+async-trait = { workspace = true }
+bimap = { workspace = true }
 bytes = { workspace = true }
-bytesize = "1.3"
+bytesize = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"] }
-ct-codecs = "1.1"
+ct-codecs = { workspace = true }
 futures = "0.3"
 futures-util = { workspace = true }
 humantime = "2.1"
-itertools = "0.13"
+itertools = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 nfsserve = "0.10"
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "11e947e7861e690c9d36ccf2702e0012c9f97eca" }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 synonym = "0.1"
@@ -32,7 +32,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zeroize = "1.8"
+zeroize = { workspace = true }
 
 [build-dependencies]
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }

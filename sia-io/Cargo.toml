@@ -10,39 +10,39 @@ renterd = ["dep:chrono", "dep:reqwest", "dep:serde_json"]
 mock = []
 
 [dependencies]
-anyhow = "1"
-async-trait = "0.1"
-bimap = "0.6"
-bon = "3.9"
-bytes = { version = "1", features = ["serde"] }
-bytesize = "2.3"
-chrono = { version = "0.4", features = ["serde"], optional = true }
-ct-codecs = "1.1"
-derive-where = { version = "1.6", features = ["zeroize", "serde"] }
-futures-io = "0.3"
-futures-util = { version = "0.3", features = ["io"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bimap = { workspace = true }
+bon = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+bytesize = { workspace = true }
+chrono = { workspace = true, features = ["serde"], optional = true }
+ct-codecs = { workspace = true }
+derive-where = { workspace = true, features = ["zeroize", "serde"] }
+futures-io = { workspace = true }
+futures-util = { workspace = true, features = ["io"] }
 indexmap = "2"
-itertools = "0.14"
+itertools = { workspace = true }
 maybe-owned = "0.3"
 mime = "0.3"
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true, features = ["future"] }
 ouroboros = "0.18"
 papaya = "0.2"
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 reqwest = { version = "0.13", features = ["stream", "json", "query"], optional = true }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 sia_storage = { version = "0.6", optional = true }
-thiserror = "2.0"
-tokio = { version = "1.51", features = ["default"], optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["default"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
-tracing = "0.1"
-twox-hash = { version = "2.1", features = ["xxhash3_64"] }
-typed-path = "0.12"
-zeroize = { version = "1.8", features = ["serde", "derive"] }
+tracing = { workspace = true }
+twox-hash = { workspace = true, features = ["xxhash3_64"] }
+typed-path = { workspace = true }
+zeroize = { workspace = true, features = ["serde", "derive"] }
 
 [dev-dependencies]
-anyhow = "1.0"
-dotenv = "0.15"
-tokio = { version = "1.51", features = ["full"] }
-tracing-subscriber = "0.3"
+anyhow = { workspace = true }
+dotenv = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
