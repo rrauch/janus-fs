@@ -94,6 +94,7 @@ impl ChunkMap {
         }
     }
 
+    #[allow(dead_code)]
     pub fn remove(&mut self, offset: u64, len: u64) {
         if len == 0 {
             return;

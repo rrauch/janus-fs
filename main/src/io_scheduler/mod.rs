@@ -1,13 +1,13 @@
 use crate::io_scheduler::queue::{ActiveHandle, Queue};
 use crate::io_scheduler::resource_manager::ResourceManager;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use bimap::BiHashMap;
 use futures_util::FutureExt;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
@@ -218,6 +218,7 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
         Ok(resp?)
     }
 
+    #[allow(dead_code)]
     #[instrument(skip(self))]
     pub async fn close(&self, access_key: &RM::AccessKey) {
         loop {
@@ -228,7 +229,7 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
                         Some(Status::Ready(queue)) => {
                             tracing::debug!("closing queue");
                             Some(queue.close())
-                        },
+                        }
                         Some(Status::Closing(close_notify)) => Some(close_notify.clone()),
                         Some(Status::Preparing(prep_notify)) => Some(prep_notify.clone()),
                         None => None,

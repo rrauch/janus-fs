@@ -557,14 +557,6 @@ pub struct InodeMut<T: EntityHandler> {
 }
 
 impl<T: EntityHandler> InodeMut<T> {
-    pub(super) fn new(parent: Option<InodeId>, inode_id: InodeId, entity: EntityMut<T>) -> Self {
-        Self {
-            parent,
-            inode_id,
-            entity,
-        }
-    }
-
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
@@ -640,7 +632,6 @@ impl Vfs {
             cache.clone(),
             sia_client.clone(),
             head.clone(),
-            &vfs_id,
         )
         .await?;
 
@@ -1112,7 +1103,7 @@ where
 pub(crate) mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{Inode, InodeId, Name, OwnedName, Vfs, VfsError, VfsId};
+    use crate::vfs::{Inode, InodeId, Name, OwnedName, Vfs, VfsError};
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
     use sia_io::Client as Sia;

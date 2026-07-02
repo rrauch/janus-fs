@@ -271,10 +271,6 @@ impl ConfigMut {
         }
     }
 
-    pub fn vfs_id(&self) -> &VfsId {
-        &self.vfs_id
-    }
-
     pub fn freeze(self) -> Config {
         Config::try_from_flatbuffer(Arc::from(self.to_flatbuffer()), None)
             .expect("deserialization to never fail")

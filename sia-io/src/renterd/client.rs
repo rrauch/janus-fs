@@ -40,7 +40,7 @@ pub type ApiPassword = Password<ApiPasswordKind>;
 
 #[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct Client(pub(crate) Arc<Inner>);
+pub struct Client(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
@@ -85,7 +85,6 @@ impl Client {
             RequestType::Post => self.0.reqwest_client.post(url),
             RequestType::Put => self.0.reqwest_client.put(url),
             RequestType::Delete => self.0.reqwest_client.delete(url),
-            RequestType::Head => self.0.reqwest_client.head(url),
         };
 
         if let Some(params) = &request.params {
@@ -239,10 +238,6 @@ impl<'a> ApiRequestBuilder<'a> {
         Self::new(path, RequestType::Delete)
     }
 
-    pub(crate) fn head<T: Into<Cow<'a, str>>>(path: T) -> Self {
-        Self::new(path, RequestType::Head)
-    }
-
     pub(crate) fn params<K: Into<Cow<'a, str>>, V: Into<Cow<'a, str>>>(
         mut self,
         params: Option<Vec<(K, V)>>,
@@ -277,7 +272,6 @@ pub(crate) enum RequestType {
     Post,
     Put,
     Delete,
-    Head,
 }
 
 pub(crate) enum RequestContent<'a> {

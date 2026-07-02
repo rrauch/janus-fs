@@ -80,7 +80,7 @@ impl PullTask {
             .filter_map(|res| async move {
                 match res {
                     Ok(id) => Some(id),
-                    Err(e) => {
+                    Err(_e) => {
                         // log::warn!("sync failed: {e:?}");
                         //eprintln!("sync failed: {e:?}");
                         None
@@ -186,7 +186,7 @@ impl PullTask {
                         .await?;
                     }
                     None => {}
-                    Some(other) => {}
+                    Some(_other) => {}
                 }
 
                 id
@@ -722,7 +722,6 @@ mod tests {
     }
 
     async fn upload_config_object(vfs: &Vfs, config: &Config) -> anyhow::Result<()> {
-        let ts = config.last_modified().to_millis();
         vfs.sia_client()
             .upload(config.to_uploadable_object(vfs.id()))
             .await?;

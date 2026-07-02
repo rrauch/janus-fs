@@ -1,27 +1,19 @@
 pub(crate) mod metadata;
 
 use crate::db::{Error as DbError, Read, Transaction, TxScope, Write};
-use crate::object::metadata::MetadataError;
 use crate::vfs::Timestamp;
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::str::FromStr;
-use thiserror::Error;
 
 const METADATA_MAGIC_NUMBER: [u8; 4] = [0xA8, 0x19, 0xCD, 0x28];
 
 pub(crate) const METADATA_VFS_OBJECT_TYPE: &'static str = "VFS-OBJECT-TYPE";
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error(transparent)]
-    MetadataError(#[from] MetadataError),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub(crate) struct ObjectId(u64);
+pub struct ObjectId(u64);
 impl From<i64> for ObjectId {
     fn from(value: i64) -> Self {
         Self(value as u64)
@@ -182,6 +174,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn delete_gone_objects(
         &mut self,
         error_threshold: NonZeroUsize,

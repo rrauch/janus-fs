@@ -221,6 +221,7 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
         Ok(resp?)
     }
 
+    #[allow(dead_code)]
     #[instrument(skip(self))]
     pub async fn close(&self, access_key: &RM::AccessKey) {
         loop {

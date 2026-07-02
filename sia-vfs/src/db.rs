@@ -2,11 +2,10 @@ use crate::blob::BlobId;
 use crate::chunk::ChunkId;
 use crate::object::ObjectId;
 use crate::vfs::cache::Cache;
-use crate::vfs::commit::{CommitId, CommitMut};
-use crate::vfs::config::{ConfigMut, OwnedEntry};
-use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
+use crate::vfs::commit::CommitId;
+use crate::vfs::directory::{DirectoryBody, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
-use crate::vfs::{BranchName, Head, Inode, InodeId, OwnedName, Timestamp, VfsId};
+use crate::vfs::{BranchName, Head, Inode, InodeId};
 use sia_io::Client as Sia;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
@@ -265,6 +264,7 @@ impl Transaction<ReadWrite> {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub async fn rollback(self) -> Result<(), Error> {
         Ok(self.0.0.rollback().await?)
     }
@@ -375,7 +375,6 @@ impl SqlitePool {
 #[derive(Debug)]
 struct DbInner {
     pool: Option<SqlitePool>,
-    db_file: PathBuf,
     cache: Cache,
     sia_client: Arc<Sia>,
     head: Head,
@@ -449,7 +448,6 @@ impl Db {
         cache: Cache,
         sia_client: Arc<Sia>,
         head: Head,
-        vfs_id: &VfsId,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
@@ -461,7 +459,6 @@ impl Db {
 
         Ok(Self(Arc::new(DbInner {
             pool: Some(pool),
-            db_file,
             cache,
             sia_client,
             head,

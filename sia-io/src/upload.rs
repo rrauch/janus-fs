@@ -266,7 +266,7 @@ impl Backend {
     async fn upload(
         &self,
         name_hint: impl AsRef<str>,
-        mut content: impl AsyncRead + Send + Unpin + 'static,
+        #[allow(unused_mut)] mut content: impl AsyncRead + Send + Unpin + 'static,
         metadata: Option<Metadata<'_>>,
     ) -> Result<Object, crate::Error> {
         match (&self, metadata) {

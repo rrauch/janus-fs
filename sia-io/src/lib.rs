@@ -140,7 +140,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum Backend {
+pub enum Backend {
     #[cfg(feature = "indexd")]
     Indexd(indexd::client::Client),
     #[cfg(feature = "renterd")]

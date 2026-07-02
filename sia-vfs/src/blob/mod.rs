@@ -195,7 +195,7 @@ impl BlobMut {
         }
     }
 
-    pub fn from_chunk_map(chunk_map: ChunkMap, mode: StorageMode) -> Self {
+    pub(crate) fn from_chunk_map(chunk_map: ChunkMap, mode: StorageMode) -> Self {
         Self { chunk_map, mode }
     }
 

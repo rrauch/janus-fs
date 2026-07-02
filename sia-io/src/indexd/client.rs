@@ -37,7 +37,6 @@ impl Client {
         indexd_endpoint: impl IntoUrl,
         app_details: AppDetails,
         app_key: &AppKey,
-        #[builder(default = 65536)] download_buffer_size: usize,
         download_max_buffered_chunks: Option<usize>,
         upload_max_buffered_slabs: Option<usize>,
     ) -> Result<Self, ClientError> {
@@ -49,7 +48,6 @@ impl Client {
 
         Ok(Self(Arc::new(Inner {
             sdk,
-            download_buffer_size,
             download_max_buffered_chunks,
             upload_max_buffered_slabs,
         })))
@@ -117,11 +115,6 @@ impl Client {
     }
 
     #[inline]
-    pub(crate) fn download_buffer_size(&self) -> usize {
-        self.0.download_buffer_size
-    }
-
-    #[inline]
     pub(crate) fn download_max_buffered_chunks(&self) -> Option<usize> {
         self.0.download_max_buffered_chunks
     }
@@ -136,7 +129,6 @@ impl Client {
 pub(crate) struct Inner {
     #[derive_where(skip)]
     sdk: Sdk,
-    download_buffer_size: usize,
     download_max_buffered_chunks: Option<usize>,
     upload_max_buffered_slabs: Option<usize>,
 }

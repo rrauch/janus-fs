@@ -92,7 +92,7 @@ impl EntityHandler for FileKind {
         (FlatEntityBody::File, file.as_union_value())
     }
 
-    fn normalize(value: &mut Self::Body) {
+    fn normalize(_: &mut Self::Body) {
         // nothing do to
     }
 
@@ -270,7 +270,6 @@ where
 
         let fh_id = tx.create_fh(file.inode_id).await?;
         tx.commit().await?;
-        let file_id = file.inode_id;
         let file = current_file.into_mut();
         let reaper_tx = self.0.dead_fh_reaper.tx();
         Ok(FileHandle::new(

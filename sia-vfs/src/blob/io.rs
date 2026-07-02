@@ -257,7 +257,7 @@ pub struct BlobIo<M> {
     pub(crate) error_count: usize,
 }
 
-pub(crate) struct ReadOnly<S> {
+pub struct ReadOnly<S> {
     blob: Blob,
     fetch: ChunkFetch,
     backend: Arc<S>,
@@ -341,7 +341,7 @@ impl<S: ChunkSource + 'static> AsyncSeek for BlobReader<S> {
     }
 }
 
-pub(crate) struct ReadWrite<B> {
+pub struct ReadWrite<B> {
     blob: BlobMut,
     fetch: ChunkFetch,
     pipeline: WritePipeline,

@@ -54,7 +54,6 @@ impl<T: Resource> Resource for Box<T> {
 }
 
 pub(crate) struct Context {
-    pub started: SystemTime,
     pub last_activity: SystemTime,
     pub previous_call: Option<SystemTime>,
     pub iteration: usize,
@@ -77,14 +76,6 @@ impl Entry {
             Entry::Waiting(w) => w.offset,
             Entry::Idle(i) => i.offset,
             Entry::Active(a) => a.offset,
-        }
-    }
-
-    pub fn since(&self) -> SystemTime {
-        match self {
-            Entry::Waiting(w) => w.since,
-            Entry::Idle(i) => i.since,
-            Entry::Active(a) => a.since,
         }
     }
 

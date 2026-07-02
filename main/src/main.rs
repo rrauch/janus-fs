@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
                 .indexd_appkey
                 .take()
                 .ok_or_else(|| anyhow!("Indexd Appkey is not set"))?;
-            let mut app_key = parse_appkey(app_key_arg.as_str())?;
+            let app_key = parse_appkey(app_key_arg.as_str())?;
             app_key_arg.zeroize();
 
             let app_details = AppDetails::builder()
@@ -241,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
         sia_io::cache::Cache::default()
     };
 
-    let mut sia_builder = sia_io::Client::builder().cache(cache);
+    let sia_builder = sia_io::Client::builder().cache(cache);
     let sia = match backend {
         ConfiguredBackend::Indexd(indexd) => sia_builder.backend(indexd).build().await?,
         ConfiguredBackend::Renterd(renterd) => sia_builder.backend(renterd).build().await?,
