@@ -2,11 +2,10 @@ use crate::blob::BlobId;
 use crate::chunk::ChunkId;
 use crate::object::ObjectId;
 use crate::vfs::cache::Cache;
-use crate::vfs::commit::{CommitId, CommitMut};
-use crate::vfs::config::{ConfigMut, OwnedEntry};
-use crate::vfs::directory::{DirectoryBody, DirectoryDraft, DirectoryMut};
+use crate::vfs::commit::CommitId;
+use crate::vfs::directory::{DirectoryBody, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
-use crate::vfs::{BranchName, Head, Inode, InodeId, OwnedName, Timestamp, VfsId};
+use crate::vfs::{BranchName, Head, Inode, InodeId};
 use sia_io::Client as Sia;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
@@ -41,6 +40,8 @@ pub enum Error {
 pub enum DbStateError {
     #[error("invalid page size: '{0}'")]
     InvalidPageSize(String),
+    #[error("connection pool already closed")]
+    PoolIsClosed,
 }
 
 #[derive(Error, Debug)]
@@ -138,13 +139,28 @@ impl<T: AsMut<SqliteConnection> + Send + Sync + Unpin + 'static> TxScope for T {
 #[repr(transparent)]
 pub(crate) struct Transaction<Scope: TxScope>(Scope);
 
+impl<C: TxScope> Transaction<C>
+where
+    Self: Read,
+{
+    pub async fn is_empty(&mut self) -> Result<bool, Error> {
+        Ok(
+            sqlx::query!("SELECT COUNT(*) AS \"num_rows:i64\" FROM config")
+                .fetch_one(self.conn())
+                .await?
+                .num_rows
+                == 0,
+        )
+    }
+}
+
 impl Transaction<ReadWrite> {
     #[inline]
     pub async fn commit(mut self) -> Result<(), Error> {
         self.process_dirty_inodes().await?;
 
         if let Some(branch_name) = self.0.3.clone() {
-            if self.update_commit(branch_name).await?.is_some() {
+            if !self.is_empty().await? && self.update_commit(branch_name).await?.is_some() {
                 self.maybe_update_config().await?;
             }
         }
@@ -248,6 +264,7 @@ impl Transaction<ReadWrite> {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub async fn rollback(self) -> Result<(), Error> {
         Ok(self.0.0.rollback().await?)
     }
@@ -308,78 +325,6 @@ impl Transaction<ReadWrite> {
             affected_chunk_ids,
         })
     }
-
-    async fn bootstrap(&mut self, vfs_id: &VfsId) -> Result<(), Error> {
-        if sqlx::query!("SELECT COUNT(*) AS vfs_rows FROM vfs")
-            .fetch_one(self.conn())
-            .await?
-            .vfs_rows
-            == 0
-        {
-            // empty vfs, create new root
-            let root =
-                DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT").unwrap(), vec![]);
-            let name = root.name().to_owned();
-            let entity_key = self.register_entity(root).await?;
-
-            let entity_id = entity_key.id().as_slice();
-            let entity_rev = entity_key.revision().as_slice();
-            let name = name.as_ref();
-
-            sqlx::query!(
-                "INSERT INTO vfs (inode_id, inode_type, entity_id, entity_rev, name) VALUES (1, 'D', ?, ?, ?)",
-                entity_id,
-                entity_rev,
-                name
-            )
-                .execute(self.conn())
-                .await?;
-
-            if let Some(branch_name) = self.0.3.clone() {
-                // create empty commit & initial head
-                let commit = CommitMut {
-                    entity_key: entity_key.clone(),
-                    preceding_commit_id: CommitId::zeroed(),
-                    commit_count: 0,
-                    created: Timestamp::now(),
-                }
-                .freeze();
-                self.register_commit(&commit).await?;
-                let name = branch_name.deref();
-                let id = commit.id().as_slice();
-                sqlx::query!(
-                    "INSERT INTO head (name, type, commit_id) VALUES (?, 'B', ?)",
-                    name,
-                    id,
-                )
-                .execute(self.conn())
-                .await?;
-
-                let mut config = ConfigMut::new(vfs_id.clone());
-                config.last_modified = Timestamp::from_millis(0).expect("timestamp 0 to be valid");
-                config.heads.insert(
-                    Head::from(branch_name.clone()),
-                    OwnedEntry {
-                        description: None,
-                        commit_id: commit.id().clone(),
-                    },
-                );
-                let config = config.freeze();
-
-                let vfs_id = vfs_id.as_slice();
-                let last_modified = config.last_modified().to_millis();
-                let data = config.as_flatbuffer();
-                sqlx::query!(
-                    "INSERT INTO config (vfs_id, head, last_modified, mode, data) VALUES (?, ?, ?, 'L', ?)",
-                    vfs_id,
-                    name,
-                    last_modified,
-                    data
-                ).execute(self.conn()).await?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl<Scope: TxScope> AsMut<SqliteConnection> for Transaction<Scope> {
@@ -398,7 +343,7 @@ struct Changelog {
 #[repr(transparent)]
 pub(crate) struct Db(Arc<DbInner>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SqlitePool {
     writer: Pool<Sqlite>,
     reader: Pool<Sqlite>,
@@ -429,11 +374,21 @@ impl SqlitePool {
 
 #[derive(Debug)]
 struct DbInner {
-    pool: SqlitePool,
-    db_file: PathBuf,
+    pool: Option<SqlitePool>,
     cache: Cache,
     sia_client: Arc<Sia>,
     head: Head,
+}
+
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            tokio::spawn(async move {
+                pool.reader.close().await;
+                pool.writer.close().await;
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,20 +448,17 @@ impl Db {
         cache: Cache,
         sia_client: Arc<Sia>,
         head: Head,
-        vfs_id: &VfsId,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
         let mut tx = pool
             .write(cache.clone(), sia_client.clone(), head.maybe_branch_name())
             .await?;
-        tx.bootstrap(vfs_id).await?;
         tx.housekeeping().await?;
         tx.commit().await?;
 
         Ok(Self(Arc::new(DbInner {
-            pool,
-            db_file,
+            pool: Some(pool),
             cache,
             sia_client,
             head,
@@ -514,13 +466,21 @@ impl Db {
     }
 
     pub async fn read(&self) -> Result<Transaction<ReadOnly>, Error> {
-        Ok(self.0.pool.read(self.0.sia_client.clone()).await?)
+        Ok(self
+            .0
+            .pool
+            .as_ref()
+            .ok_or_else(|| DbStateError::PoolIsClosed)?
+            .read(self.0.sia_client.clone())
+            .await?)
     }
 
     pub async fn write(&self) -> Result<Transaction<ReadWrite>, Error> {
         let mut tx = self
             .0
             .pool
+            .as_ref()
+            .ok_or_else(|| DbStateError::PoolIsClosed)?
             .write(
                 self.0.cache.clone(),
                 self.0.sia_client.clone(),
@@ -573,6 +533,32 @@ async fn db_init(
     Ok(SqlitePool { writer, reader })
 }
 
+async fn connect_with_retry<const MAX_ATTEMPTS: usize>(
+    opts: &SqliteConnectOptions,
+) -> Result<SqliteConnection, Error> {
+    fn is_locked(e: &sqlx::Error) -> bool {
+        matches!(
+            e,
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("5") // database is locked
+        )
+    }
+
+    let mut attempts = 0;
+    loop {
+        match SqliteConnection::connect_with(opts).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                if is_locked(&e) && attempts < MAX_ATTEMPTS {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+}
+
 async fn prepare_db(db_file: &Path, page_size: PageSize) -> Result<(), Error> {
     let opts = SqliteConnectOptions::new()
         .create_if_missing(true)
@@ -584,9 +570,9 @@ async fn prepare_db(db_file: &Path, page_size: PageSize) -> Result<(), Error> {
         .busy_timeout(Duration::from_millis(1000))
         .shared_cache(false);
 
-    let mut conn = SqliteConnection::connect_with(&opts).await?;
+    let mut conn = connect_with_retry::<10>(&opts).await?;
 
-    async { sqlx::migrate!("./migrations").run_direct(&mut conn).await }.await?;
+    async { sqlx::migrate!("./migrations").run(&mut conn).await }.await?;
 
     async fn get_page_size(conn: &mut SqliteConnection) -> Result<PageSize, Error> {
         Ok(sqlx::query!("PRAGMA page_size")

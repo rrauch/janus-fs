@@ -19,7 +19,6 @@ impl Display for Compressor {
             Self::Lz4 => "lz4",
             #[cfg(feature = "zstd")]
             Self::Zstd => "zstd",
-            _ => "unknown",
         };
         write!(f, "{}", name)
     }
@@ -60,7 +59,6 @@ impl CompressedChunk {
                 self.compressed_data.as_ref(),
                 self.uncompressed_len,
             ),
-            other => Err(CompressionError::UnsupportedCompressor(other)),
         }
     }
 
@@ -73,11 +71,11 @@ impl CompressedChunk {
             Compressor::Lz4 => Ok(lz4::compress(chunk)),
             #[cfg(feature = "zstd")]
             Compressor::Zstd => Ok(zstd::compress(chunk)),
-            other => Err(CompressionError::UnsupportedCompressor(other)),
         }
     }
 }
 
+#[allow(dead_code)]
 pub trait ChunkCompressionExt {
     fn compress(&self, compressor: Compressor) -> Result<CompressedChunk, CompressionError>;
 }

@@ -154,7 +154,7 @@ impl PushTask {
         tx.commit().await?;
 
         let mut pending = FrozenVec::new();
-        let mut uploader = self.vfs.sia_client().prepare_multi_upload();
+        let mut uploader = self.vfs.sia_client().prepare_multi_upload()?;
         let vfs_id = self.vfs.id().clone();
 
         loop {
@@ -212,7 +212,7 @@ impl PushTask {
                 }
             }
             tx.commit().await?;
-            uploader = self.vfs.sia_client().prepare_multi_upload();
+            uploader = self.vfs.sia_client().prepare_multi_upload()?;
         }
     }
 
@@ -330,7 +330,10 @@ where
     }
 
     async fn create_sync_job(&mut self, branch_name: BranchName) -> Result<(), DbError> {
-        let commit_id = self.current_commit_id(branch_name).await?;
+        let commit_id = self
+            .current_commit_id(branch_name.clone())
+            .await?
+            .ok_or_else(|| DataError::HeadEntryNotFound(branch_name.into()))?;
         let id = commit_id.as_slice();
         let created = Timestamp::now().to_millis();
 
@@ -410,6 +413,7 @@ mod tests {
     use crate::vfs::tests::new_vfs;
     use futures_util::AsyncWriteExt;
     use std::num::NonZeroUsize;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn basic_push() -> anyhow::Result<()> {
@@ -433,13 +437,13 @@ mod tests {
 
         let mut task = PushTask::new(vfs.clone(), branch_name, NonZeroUsize::new(1).unwrap());
         task.run().await?;
-
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         let file = vfs.inode_by_id(file.inode_id()).await?.unwrap();
         assert!(file.is_synced());
 
         let dir = vfs.inode_by_id(dir.inode_id()).await?.unwrap();
         assert!(dir.is_synced());
-
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(vfs.current_commit().await?.is_synced());
         assert!(vfs.current_config().await?.is_synced());
 

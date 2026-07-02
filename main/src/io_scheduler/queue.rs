@@ -1,7 +1,7 @@
 use super::ResourceManager;
 use crate::io_scheduler::queue::ctrl::QueueCtrl;
 use crate::io_scheduler::resource_manager::{Action, Context, Resource};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use futures_util::future::BoxFuture;
 use itertools::Itertools;
 use std::cmp::{max, min};
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -105,6 +105,7 @@ enum Op<R: Resource + 'static> {
     Waiting(Response<R>),
     Idle(R),
     Active,
+    #[allow(dead_code)]
     Reserved(Response<R>, SystemTime),
     Invalid,
 }
@@ -209,7 +210,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         let mut finalize_resources: JoinSet<()> = JoinSet::new();
 
         let mut ctx = Context {
-            started: queue.started,
             last_activity: SystemTime::now(),
             previous_call: None,
             iteration: 0,
@@ -373,7 +373,6 @@ struct QueueInner<RM: ResourceManager + Send + Sync + 'static>
 where
     <RM as ResourceManager>::Resource: 'static,
 {
-    started: SystemTime,
     ct: CancellationToken,
     return_tx: mpsc::Sender<(usize, RM::Resource)>,
     max_idle: Duration,
@@ -383,6 +382,7 @@ where
     prep_errors_left: usize,
 }
 
+#[allow(dead_code)]
 impl<RM: ResourceManager + Send + Sync + 'static> QueueInner<RM> {
     fn new(
         initial_resources: Vec<RM::Resource>,
@@ -408,7 +408,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> QueueInner<RM> {
         }
 
         Self {
-            started: SystemTime::now(),
             ct,
             return_tx,
             max_idle,
@@ -690,10 +689,10 @@ impl<R: Resource + 'static> Drop for ActiveHandle<R> {
 }
 
 pub(super) mod ctrl {
+    use crate::io_scheduler::ResourceManager;
     use crate::io_scheduler::queue::{Op, QueueInner};
     use crate::io_scheduler::resource_manager::Entry;
-    use crate::io_scheduler::ResourceManager;
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use std::time::SystemTime;
 
     pub(crate) struct QueueCtrl<'a, RM: ResourceManager + Send + Sync + 'static> {
@@ -702,6 +701,7 @@ pub(super) mod ctrl {
         pub(super) finalize_resources: Vec<RM::Resource>,
     }
 
+    #[allow(dead_code)]
     impl<'a, RM: ResourceManager + Send + Sync + 'static> QueueCtrl<'a, RM> {
         pub(super) fn new(inner: &'a mut QueueInner<RM>) -> Self {
             Self {

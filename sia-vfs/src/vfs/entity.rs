@@ -252,7 +252,7 @@ pub trait EntityHandler: Sized {
 }
 
 #[derive_where(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RawEntityInner<T: EntityHandler> {
+pub struct RawEntityInner<T: EntityHandler> {
     revision: Revision,
     created: Timestamp,
     last_modified: Timestamp,
@@ -484,10 +484,6 @@ impl<T: EntityHandler> EntityMut<T> {
         &self.body
     }
 
-    pub(crate) fn body_mut(&mut self) -> &mut <T as EntityHandler>::Body {
-        &mut self.body
-    }
-
     pub(crate) fn set_body(&mut self, new: <T as EntityHandler>::Body) {
         self.body = new;
     }
@@ -654,7 +650,7 @@ pub(crate) struct EntityRow {
     pub entity_type: Cow<'static, str>,
 }
 
-pub(crate) enum EntityRef<'a> {
+pub enum EntityRef<'a> {
     Blob(Cow<'a, BlobId>),
     Entity(Cow<'a, EntityKey>),
 }

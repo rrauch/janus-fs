@@ -33,12 +33,12 @@ pub(crate) trait Resource: Send {
 }
 
 pub(crate) struct Context {
-    pub started: SystemTime,
     pub last_activity: SystemTime,
     pub previous_call: Option<SystemTime>,
     pub iteration: usize,
 }
 pub(crate) enum Action {
+    #[allow(dead_code)]
     Again,
     Sleep(Duration),
 }
@@ -50,6 +50,7 @@ pub enum Entry {
     Active(Active),
 }
 
+#[allow(dead_code)]
 impl Entry {
     pub fn offset(&self) -> u64 {
         match self {

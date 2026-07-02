@@ -1,6 +1,10 @@
+use anyhow::anyhow;
 use bytesize::ByteSize;
-use clap::Parser;
+use clap::{Args, Parser, ValueEnum};
+use ct_codecs::{Decoder, Hex};
 use foyer_cache::{FoyerChunkCache, FoyerMetadataCache};
+use sia_io::indexd::client::AppKey;
+use sia_io::indexd::{AppDetails, AppId};
 use sia_io::renterd::client::ApiPassword;
 use sia_io::renterd::BucketName;
 use sia_nfs::SiaNfs;
@@ -12,19 +16,58 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{Instrument, Level};
 use tracing_subscriber::EnvFilter;
 use url::Url;
+use zeroize::Zeroize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    Indexd,
+    Renterd,
+}
+
+#[derive(Debug, Args)]
+struct IndexdArgs {
+    /// URL for indexd's API endpoint.
+    #[arg(long, short = 'i', env, value_hint = clap::ValueHint::Url, default_value = "https://sia.storage"
+    )]
+    indexd_endpoint: Url,
+
+    /// Appkey for the indexd API.
+    #[arg(long, short = 'k', env)]
+    indexd_appkey: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RenterdArgs {
+    /// URL for renterd's API endpoint.
+    #[arg(long, short = 'e', env, value_hint = clap::ValueHint::Url)]
+    renterd_api_endpoint: Option<Url>,
+
+    /// Password for the renterd API.
+    #[arg(long, short = 's', env)]
+    renterd_api_password: Option<String>,
+
+    /// renterd Bucket to export.
+    #[arg(long, short = 'b', env)]
+    bucket: Option<String>,
+}
 
 #[derive(Debug, Parser)]
 #[command(version)]
-/// Exports Sia buckets via NFS.
-/// Connects to renterd, allowing direct NFS access to exported buckets.
+/// Exports Sia stored data via NFS.
+/// Connects to backend, allowing direct NFS access.
 struct Arguments {
     vfs_id: String,
-    #[arg(long, short = 'e', env, value_hint = clap::ValueHint::Url)]
-    /// URL for renterd's API endpoint (e.g., http://localhost:9880/api/).
-    renterd_api_endpoint: Url,
-    /// Password for the renterd API. It's recommended to use an environment variable for this.
-    #[arg(long, short = 's', env)]
-    renterd_api_password: String,
+
+    /// Backend to use.
+    #[arg(long, env, value_enum, default_value_t = Backend::Indexd)]
+    backend: Backend,
+
+    #[command(flatten)]
+    indexd: IndexdArgs,
+
+    #[command(flatten)]
+    renterd: RenterdArgs,
+
     /// Directory to store persistent data in. Will be created if it doesn't exist.
     #[arg(long, short = 'd', env, value_hint = clap::ValueHint::DirPath)]
     data_dir: PathBuf,
@@ -43,9 +86,6 @@ struct Arguments {
     #[arg(long, short = 'l', env)]
     #[clap(default_value = "localhost:12000")]
     listen_address: String,
-    /// Bucket to export.
-    #[arg(long, short = 'b', env)]
-    bucket: String,
     /// UID of files and directories
     #[arg(long, env = "INODE_UID")]
     #[clap(default_value = "1000")]
@@ -71,6 +111,11 @@ struct Arguments {
     write_autocommit_after: Duration,
 }
 
+enum ConfiguredBackend {
+    Indexd(sia_io::indexd::client::Client),
+    Renterd(sia_io::renterd::client::Client),
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -82,20 +127,80 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let arguments = Arguments::parse();
+    let mut arguments = Arguments::parse();
 
     tokio::fs::create_dir_all(&arguments.data_dir).await?;
 
-    let api_password = if arguments.renterd_api_password.is_empty() {
-        None
-    } else {
-        Some(ApiPassword::from(arguments.renterd_api_password))
+    let backend = match arguments.backend {
+        Backend::Indexd => {
+            let mut app_key_arg = arguments
+                .indexd
+                .indexd_appkey
+                .take()
+                .ok_or_else(|| anyhow!("Indexd Appkey is not set"))?;
+            let app_key = parse_appkey(app_key_arg.as_str())?;
+            app_key_arg.zeroize();
+
+            let app_details = AppDetails::builder()
+                .id(AppId::from_str(
+                    "b9f0bda1b97b7d44ae6369ac830851a115311bb59aa2d848beda6ae95d10adff",
+                )?)
+                .name("sia_nfs test app")
+                .description("for sia_nfs unit & integration tests only")
+                .service_url(Url::parse("https://github.com/rrauch/sia_nfs/")?)
+                .build();
+
+            let indexd = sia_io::indexd::client::Client::builder()
+                .indexd_endpoint(arguments.indexd.indexd_endpoint)
+                .app_key(&app_key)
+                .app_details(app_details)
+                .build()
+                .await?;
+
+            ConfiguredBackend::Indexd(indexd)
+        }
+        Backend::Renterd => {
+            let api_password = if arguments
+                .renterd
+                .renterd_api_password
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
+                None
+            } else {
+                Some(ApiPassword::from(
+                    arguments
+                        .renterd
+                        .renterd_api_password
+                        .take()
+                        .expect("password to be set"),
+                ))
+            };
+
+            let renterd = sia_io::renterd::client::Client::builder()
+                .api_endpoint(
+                    arguments
+                        .renterd
+                        .renterd_api_endpoint
+                        .ok_or_else(|| anyhow!("renterd api endpoint not set"))?,
+                )
+                .maybe_api_password(api_password)
+                .bucket(
+                    arguments
+                        .renterd
+                        .bucket
+                        .as_ref()
+                        .map(|b| -> Result<_, anyhow::Error> {
+                            Ok(BucketName::from_str(b.as_str())?)
+                        })
+                        .unwrap_or_else(|| Ok(BucketName::default()))?,
+                )
+                .build()?;
+            ConfiguredBackend::Renterd(renterd)
+        }
     };
-    let client = sia_io::renterd::client::Client::builder()
-        .api_endpoint(arguments.renterd_api_endpoint)
-        .maybe_api_password(api_password)
-        .bucket(BucketName::from_str(arguments.bucket.as_str())?)
-        .build()?;
 
     let cache = if arguments.max_cache_size.as_u64() > 0
         || arguments.max_metadata_cache_size.as_u64() > 0
@@ -136,11 +241,11 @@ async fn main() -> anyhow::Result<()> {
         sia_io::cache::Cache::default()
     };
 
-    let sia = sia_io::Client::builder()
-        .backend(client)
-        .cache(cache)
-        .build()
-        .await?;
+    let sia_builder = sia_io::Client::builder().cache(cache);
+    let sia = match backend {
+        ConfiguredBackend::Indexd(indexd) => sia_builder.backend(indexd).build().await?,
+        ConfiguredBackend::Renterd(renterd) => sia_builder.backend(renterd).build().await?,
+    };
 
     let sia_nfs = SiaNfs::new(
         sia,
@@ -184,6 +289,13 @@ async fn main() -> anyhow::Result<()> {
     }
     .instrument(span)
     .await
+}
+
+fn parse_appkey(hex: &str) -> Result<AppKey, anyhow::Error> {
+    let bytes = Hex::decode_to_vec(hex, None)?;
+    Ok(AppKey::import(
+        bytes.try_into().map_err(|_| anyhow!("invalid AppKey"))?,
+    ))
 }
 
 fn parse_octal(src: &str) -> Result<u32, ParseIntError> {

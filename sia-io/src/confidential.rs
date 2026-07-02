@@ -5,8 +5,8 @@ use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use zeroize::{Zeroize, ZeroizeOnDrop};
 use zeroize::__internal::AssertZeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod sealed {
     pub trait Permission {}
@@ -77,19 +77,20 @@ impl<T: Sized> Security for SensitiveSecurity<T> {
     type MaybeZeroize = ();
 }
 
-pub type Confidential<T: Zeroize + Sized> = Veil<T, ConfidentialSecurity<T>>;
+pub type Confidential<T> = Veil<T, ConfidentialSecurity<T>>;
 
 impl<T: Zeroize + Sized> ZeroizeOnDrop for Confidential<T> {}
 
-pub type Protected<T: Zeroize + Sized> = Veil<T, ProtectedSecurity<T>>;
+pub type Protected<T> = Veil<T, ProtectedSecurity<T>>;
 
 impl<T: Zeroize + Sized> ZeroizeOnDrop for Protected<T> {}
 
-pub type Sensitive<T: Sized> = Veil<T, SensitiveSecurity<T>>;
+pub type Sensitive<T> = Veil<T, SensitiveSecurity<T>>;
 
 impl<T: ZeroizeOnDrop + Sized> ZeroizeOnDrop for Sensitive<T> {}
 
 #[repr(transparent)]
+#[allow(private_bounds)]
 pub struct Veil<T, S>
 where
     S: Security<SupportedType = T>,
@@ -98,6 +99,7 @@ where
     _phantom_data: PhantomData<S>,
 }
 
+#[allow(private_bounds)]
 impl<T, S> Veil<T, S>
 where
     S: Security<SupportedType = T>,
@@ -110,6 +112,7 @@ where
     }
 }
 
+#[allow(private_bounds)]
 impl<T, S> Veil<T, S>
 where
     S: Security<ExtractPermission = Allow, SupportedType = T>,

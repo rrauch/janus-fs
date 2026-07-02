@@ -108,7 +108,7 @@ impl<'a> TryFrom<IoMetadata<'a>> for Metadata<'a> {
             IoMetadata::Indexd(bytes) => Self::try_from(bytes),
             #[cfg(feature = "renterd")]
             IoMetadata::Renterd(map) => Ok(Self::from(map)),
-            #[cfg(test)]
+            #[cfg(feature = "mock")]
             IoMetadata::Mock(map) => Ok(Self::from(map)),
         }
     }

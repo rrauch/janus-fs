@@ -713,7 +713,6 @@ impl ObjectEvent {
 pub struct DownloadableObject {
     chunk_size: usize,
     object: Object,
-    backend: Backend,
     cache: Cache,
     downloader: Arc<Scheduler<ChunkDownloader>>,
 }
@@ -798,7 +797,6 @@ impl Client {
         Ok(self.object(id).await?.map(|object| DownloadableObject {
             chunk_size: self.chunk_size,
             object,
-            backend: self.backend.clone(),
             cache: self.cache.clone(),
             downloader: self.chunk_downloader.clone(),
         }))

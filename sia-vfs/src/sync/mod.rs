@@ -7,7 +7,7 @@ use crate::sync::push::PushTask;
 use crate::vfs::commit::CommitError;
 use crate::vfs::config::ConfigError;
 use crate::vfs::entity::EntityError;
-use crate::vfs::{Vfs, VfsError};
+use crate::vfs::{Vfs, VfsError, WeakVfs};
 pub use pull::PullTask;
 use sia_io::upload::UploadError;
 use std::num::NonZeroUsize;
@@ -66,10 +66,10 @@ impl Syncer {
     pub(crate) fn new(
         sync_frequency: Duration,
         initial_sync_delay: Duration,
-    ) -> (Self, oneshot::Sender<Vfs>) {
+    ) -> (Self, oneshot::Sender<WeakVfs>) {
         let (tx, rx) = oneshot::channel();
         let jh = tokio::task::spawn(async move {
-            let vfs: Vfs = match rx.await {
+            let weak: WeakVfs = match rx.await {
                 Ok(vfs) => vfs,
                 Err(_) => {
                     // sender gone
@@ -78,10 +78,16 @@ impl Syncer {
             };
             tokio::time::sleep(initial_sync_delay).await;
             loop {
-                if let Err(err) = vfs.sync().await {
-                    //todo: logging
-                    eprintln!("{}", err);
+                if let Ok(vfs) = Vfs::try_from(weak.clone()) {
+                    if let Err(err) = vfs.sync().await {
+                        //todo: logging
+                        eprintln!("{}", err);
+                    }
+                } else {
+                    // vfs shut down
+                    return;
                 }
+
                 tokio::time::sleep(sync_frequency).await;
             }
         });
@@ -107,7 +113,7 @@ pub(crate) async fn pull(vfs: Vfs, max_concurrency: NonZeroUsize) -> Result<(), 
 
 impl Vfs {
     pub async fn sync(&self) -> Result<(), Error> {
-        if !self.is_read_only() {
+        if !self.is_read_only() && !self.is_empty().await? {
             push(self.clone(), self.max_sync_attempts()).await?;
         }
         pull(self.clone(), self.max_sync_concurrency()).await?;

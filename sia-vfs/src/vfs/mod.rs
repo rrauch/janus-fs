@@ -15,9 +15,9 @@ use crate::db::{
 use crate::object::ObjectId;
 use crate::sync::Syncer;
 use crate::vfs::cache::{Cache, CacheSettings};
-use crate::vfs::commit::Commit;
-use crate::vfs::config::Config;
-use crate::vfs::directory::Directory;
+use crate::vfs::commit::{Commit, CommitId, CommitMut};
+use crate::vfs::config::{Config, ConfigMut, OwnedEntry};
+use crate::vfs::directory::{Directory, DirectoryDraft};
 use crate::vfs::entity::{
     DraftEntity, Entity, EntityHandler, EntityId, EntityKey, EntityMut, Revision,
 };
@@ -35,7 +35,7 @@ use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use thiserror::Error;
 use twox_hash::XxHash3_64;
@@ -66,6 +66,8 @@ pub enum VfsError {
     FileLockError(#[from] file::LockError),
     #[error("read-only file system")]
     ReadOnlyFileSystem,
+    #[error("initial sync failure")]
+    InitialSyncError,
 }
 
 #[derive(Error, Debug)]
@@ -555,14 +557,6 @@ pub struct InodeMut<T: EntityHandler> {
 }
 
 impl<T: EntityHandler> InodeMut<T> {
-    pub(super) fn new(parent: Option<InodeId>, inode_id: InodeId, entity: EntityMut<T>) -> Self {
-        Self {
-            parent,
-            inode_id,
-            entity,
-        }
-    }
-
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
@@ -594,6 +588,23 @@ impl<T: EntityHandler> DerefMut for InodeMut<T> {
 #[repr(transparent)]
 pub struct Vfs(Arc<Inner>);
 
+#[derive(Debug, Clone)]
+pub(crate) struct WeakVfs(Weak<Inner>);
+
+impl From<Vfs> for WeakVfs {
+    fn from(value: Vfs) -> Self {
+        WeakVfs(Arc::downgrade(&value.0))
+    }
+}
+
+impl TryFrom<WeakVfs> for Vfs {
+    type Error = WeakVfs;
+
+    fn try_from(value: WeakVfs) -> Result<Self, Self::Error> {
+        value.0.upgrade().map(Vfs).ok_or_else(|| value)
+    }
+}
+
 #[bon::bon]
 impl Vfs {
     #[builder(derive(Debug))]
@@ -621,7 +632,6 @@ impl Vfs {
             cache.clone(),
             sia_client.clone(),
             head.clone(),
-            &vfs_id,
         )
         .await?;
 
@@ -647,7 +657,20 @@ impl Vfs {
             read_only,
         }));
 
-        syncer_tx.send(this.clone()).expect("syncer to be alive");
+        if this.is_empty().await? {
+            // sync from network first before proceeding
+            this.sync()
+                .await
+                .map_err(|e| VfsError::Other(e.to_string()))?;
+            if this.is_empty().await? {
+                // still empty after sync attempt
+                return Err(VfsError::InitialSyncError);
+            }
+        }
+
+        syncer_tx
+            .send(this.clone().into())
+            .expect("syncer to be alive");
 
         Ok(this)
     }
@@ -659,6 +682,71 @@ impl Vfs {
     }
     pub fn head(&self) -> &Head {
         &self.0.head
+    }
+
+    pub(crate) async fn is_empty(&self) -> Result<bool, VfsError> {
+        Ok(self.0.db.read().await?.is_empty().await?)
+    }
+
+    pub async fn create_new(
+        description: Option<String>,
+        sia_client: &Sia,
+    ) -> Result<VfsId, VfsError> {
+        let vfs_id = VfsId::generate();
+        let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT")?, vec![]);
+        let entity_key = EntityKey::new(root.entity_id().clone(), root.revision().clone());
+
+        let commit = CommitMut {
+            entity_key,
+            preceding_commit_id: CommitId::zeroed(),
+            commit_count: 0,
+            created: Timestamp::now(),
+        }
+        .freeze();
+
+        let mut config = ConfigMut::new(vfs_id.clone());
+        config.heads.insert(
+            BranchName::default().into(),
+            OwnedEntry {
+                description,
+                commit_id: commit.id().clone(),
+            },
+        );
+        let config = config.freeze();
+
+        let mut uploader = sia_client
+            .prepare_multi_upload()
+            .map_err(std::io::Error::other)?;
+
+        uploader
+            .enqueue(root.to_uploadable_object(&vfs_id))
+            .await
+            .map_err(std::io::Error::other)?;
+        if uploader.is_full() {
+            uploader.process().await.map_err(std::io::Error::other)?;
+            uploader = sia_client
+                .prepare_multi_upload()
+                .map_err(std::io::Error::other)?;
+        }
+
+        uploader
+            .enqueue(commit.to_uploadable_object(&vfs_id))
+            .await
+            .map_err(std::io::Error::other)?;
+        if uploader.is_full() {
+            uploader.process().await.map_err(std::io::Error::other)?;
+            uploader = sia_client
+                .prepare_multi_upload()
+                .map_err(std::io::Error::other)?;
+        }
+
+        uploader
+            .enqueue(config.to_uploadable_object(&vfs_id))
+            .await
+            .map_err(std::io::Error::other)?;
+
+        uploader.process().await.map_err(std::io::Error::other)?;
+        Ok(vfs_id)
     }
 }
 
@@ -734,7 +822,10 @@ impl Vfs {
     pub async fn current_commit(&self) -> VfsResult<Commit> {
         //todo: caching
         let mut tx = self.tx().await?;
-        let commit_id = tx.current_commit_id(self.head().clone()).await?;
+        let commit_id = tx
+            .current_commit_id(self.head().clone())
+            .await?
+            .ok_or_else(|| DbError::DataError(DataError::HeadEntryNotFound(self.head().clone())))?;
         Ok(tx
             .commit_by_id(&commit_id)
             .await?
@@ -1012,7 +1103,7 @@ where
 pub(crate) mod tests {
     use crate::vfs::directory::Directory;
     use crate::vfs::path::VfsPath;
-    use crate::vfs::{Inode, InodeId, Name, OwnedName, Vfs, VfsError, VfsId};
+    use crate::vfs::{Inode, InodeId, Name, OwnedName, Vfs, VfsError};
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
     use sia_io::Client as Sia;
@@ -1023,11 +1114,10 @@ pub(crate) mod tests {
     use tempfile::{TempDir, tempdir};
 
     pub(crate) async fn new_vfs() -> anyhow::Result<(Vfs, TempDir)> {
-        new_vfs_with_opts(None, None).await
+        new_vfs_with_opts(None).await
     }
 
     pub(crate) async fn new_vfs_with_opts(
-        vfs_id: Option<VfsId>,
         sia_client: Option<Sia>,
     ) -> anyhow::Result<(Vfs, TempDir)> {
         let temp_dir = tempdir()?;
@@ -1036,7 +1126,7 @@ pub(crate) mod tests {
             Some(sia_client) => sia_client,
             None => Sia::mock().await,
         };
-        let vfs_id = vfs_id.unwrap_or_else(|| VfsId::generate());
+        let vfs_id = Vfs::create_new(None, &sia_client).await?;
         Ok((
             Vfs::builder()
                 .sia_client(sia_client)

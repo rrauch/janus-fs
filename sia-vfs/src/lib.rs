@@ -194,3 +194,136 @@ mod gen_flatbuffers {
         include!(concat!(env!("OUT_DIR"), "/flatbuffers/vfs/mod.rs"));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::vfs::file::File;
+    use crate::vfs::path::VfsPath;
+    use crate::vfs::{Inode, Vfs};
+    use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    use sia_io::Client as Sia;
+    use std::io::SeekFrom;
+    use std::num::NonZero;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn full_tree_test() -> anyhow::Result<()> {
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join("vfs.sqlite");
+        let sia_client = Sia::mock().await;
+
+        // create a new vfs & upload to network
+        let vfs_id = Vfs::create_new(None, &sia_client).await?;
+
+        // instantiate vfs + initial sync from network
+        let vfs = Vfs::builder()
+            .vfs_id(vfs_id.clone())
+            .sia_client(sia_client.clone())
+            .db_file(path.clone())
+            .max_sync_concurrency(NonZero::new(1).unwrap())
+            .build()
+            .await?;
+
+        assert!(vfs.current_commit().await?.is_synced());
+
+        // make multiple local changes
+        let dir1 = vfs
+            .create_dir(&vfs.root().await?, "dir1".try_into()?)
+            .await?;
+        assert!(!dir1.is_synced());
+        let file1 = vfs.create_file(&dir1, "file1".try_into()?).await?;
+        assert!(!file1.is_synced());
+        assert_eq!(file1.len(), 0);
+        let mut fh = vfs.open_rw(&file1).await?;
+        fh.write_all("some bytes".as_bytes()).await?;
+        fh.close().await?;
+        let file1 = fh.commit().await?;
+        assert_eq!(file1.len(), 10);
+        let mut fh = vfs.open_rw(&file1).await?;
+        fh.seek(SeekFrom::End(0)).await?;
+        fh.write_all("more".as_bytes()).await?;
+        let file1 = fh.commit().await?;
+        assert_eq!(file1.len(), 14);
+
+        let commit = vfs.current_commit().await?;
+        assert!(!commit.is_synced());
+
+        read_file(&vfs, b"some bytesmore", false).await?;
+
+        // sync changes back to network
+        vfs.sync().await?;
+
+        let current_commit = vfs.current_commit().await?;
+        assert!(current_commit.is_synced());
+        assert_eq!(current_commit.id(), commit.id());
+
+        read_file(&vfs, b"some bytesmore", true).await?;
+
+        drop(vfs);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // start completely from scratch & sync from the network
+        let path = temp_dir.path().join("vfs2.sqlite");
+
+        let vfs = Vfs::builder()
+            .vfs_id(vfs_id)
+            .sia_client(sia_client)
+            .db_file(path)
+            .max_sync_concurrency(NonZero::new(1).unwrap())
+            .build()
+            .await?;
+
+        let current_commit = vfs.current_commit().await?;
+        assert!(current_commit.is_synced());
+        assert_eq!(current_commit.id(), commit.id());
+
+        read_file(&vfs, b"some bytesmore", true).await?;
+
+        // make additional changes
+
+        let file = get_file(&vfs).await?;
+        let mut fh = vfs.open_rw(&file).await?;
+        fh.seek(SeekFrom::End(0)).await?;
+        fh.write_all(b"even more").await?;
+        fh.commit().await?;
+
+        read_file(&vfs, b"some bytesmoreeven more", false).await?;
+
+        // sync changes back to network
+        vfs.sync().await?;
+
+        read_file(&vfs, b"some bytesmoreeven more", true).await?;
+
+        Ok(())
+    }
+
+    async fn read_file(
+        vfs: &Vfs,
+        expected_content: &[u8],
+        expect_synced: bool,
+    ) -> anyhow::Result<()> {
+        let file1 = get_file(vfs).await?;
+        assert_eq!(file1.len(), expected_content.len() as u64);
+        assert_eq!(file1.is_synced(), expect_synced);
+        let mut fh = vfs.open(&file1).await?;
+        let mut buffer = Vec::with_capacity(fh.len() as usize);
+        fh.read_to_end(&mut buffer).await?;
+        assert_eq!(buffer.as_slice(), expected_content);
+
+        Ok(())
+    }
+
+    async fn get_file(vfs: &Vfs) -> anyhow::Result<File> {
+        Ok(
+            match vfs
+                .inode_by_path(&VfsPath::try_from("/dir1/file1")?)
+                .await?
+                .unwrap()
+            {
+                Inode::File(file) => file,
+                _ => unreachable!("should be a file"),
+            },
+        )
+    }
+}

@@ -210,7 +210,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         let mut finalize_resources: JoinSet<()> = JoinSet::new();
 
         let mut ctx = Context {
-            started: queue.started,
             last_activity: SystemTime::now(),
             previous_call: None,
             iteration: 0,
@@ -374,7 +373,6 @@ struct QueueInner<RM: ResourceManager + Send + Sync + 'static>
 where
     <RM as ResourceManager>::Resource: 'static,
 {
-    started: SystemTime,
     ct: CancellationToken,
     return_tx: mpsc::Sender<(usize, RM::Resource)>,
     max_idle: Duration,
@@ -409,7 +407,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> QueueInner<RM> {
         }
 
         Self {
-            started: SystemTime::now(),
             ct,
             return_tx,
             max_idle,

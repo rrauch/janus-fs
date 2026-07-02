@@ -3,12 +3,14 @@ use crate::indexd::AppDetails;
 use bon::bon;
 use derive_where::derive_where;
 use sia_storage::{
-    AppKey, ApprovedState, Builder, BuilderError, Error as SiaError, IntoUrl,
-    RequestingApprovalState, SDK, SealedObjectError, Url,
+    ApprovedState, Builder, BuilderError, Error as SiaError, IntoUrl, RequestingApprovalState, Sdk,
+    SealedObjectError, Url,
 };
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
+
+pub use sia_storage::AppKey;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -35,9 +37,8 @@ impl Client {
         indexd_endpoint: impl IntoUrl,
         app_details: AppDetails,
         app_key: &AppKey,
-        #[builder(default = 65536)] download_buffer_size: usize,
-        download_max_inflight: Option<usize>,
-        upload_max_inflight: Option<usize>,
+        download_max_buffered_chunks: Option<usize>,
+        upload_max_buffered_slabs: Option<usize>,
     ) -> Result<Self, ClientError> {
         let builder = Builder::new(indexd_endpoint, app_details.into())?;
         let sdk = builder
@@ -47,9 +48,8 @@ impl Client {
 
         Ok(Self(Arc::new(Inner {
             sdk,
-            download_buffer_size,
-            download_max_inflight,
-            upload_max_inflight,
+            download_max_buffered_chunks,
+            upload_max_buffered_slabs,
         })))
     }
 }
@@ -110,31 +110,25 @@ impl Client {
     }
 
     #[inline]
-    pub(crate) fn sdk(&self) -> &SDK {
+    pub(crate) fn sdk(&self) -> &Sdk {
         &self.0.sdk
     }
 
     #[inline]
-    pub(crate) fn download_buffer_size(&self) -> usize {
-        self.0.download_buffer_size
+    pub(crate) fn download_max_buffered_chunks(&self) -> Option<usize> {
+        self.0.download_max_buffered_chunks
     }
 
     #[inline]
-    pub(crate) fn download_max_inflight(&self) -> Option<usize> {
-        self.0.download_max_inflight
-    }
-
-    #[inline]
-    pub(crate) fn upload_max_inflight(&self) -> Option<usize> {
-        self.0.upload_max_inflight
+    pub(crate) fn upload_max_buffered_slabs(&self) -> Option<usize> {
+        self.0.upload_max_buffered_slabs
     }
 }
 
 #[derive_where(Debug)]
 pub(crate) struct Inner {
     #[derive_where(skip)]
-    sdk: SDK,
-    download_buffer_size: usize,
-    download_max_inflight: Option<usize>,
-    upload_max_inflight: Option<usize>,
+    sdk: Sdk,
+    download_max_buffered_chunks: Option<usize>,
+    upload_max_buffered_slabs: Option<usize>,
 }

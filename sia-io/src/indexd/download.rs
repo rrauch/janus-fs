@@ -3,11 +3,10 @@ use crate::indexd::object::{Object, ObjectId};
 use crate::scheduler::resource_manager::Resource;
 use async_trait::async_trait;
 use futures_util::AsyncRead;
-use sia_storage::{DownloadError, DownloadOptions};
+use sia_storage::DownloadOptions;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead as TokioAsyncRead, DuplexStream};
-use tokio::task::JoinHandle;
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 #[derive(Debug, Clone)]
 pub struct DownloadableObject {
@@ -28,37 +27,44 @@ impl DownloadableObject {
             options.offset = offset;
         }
         let offset = offset.unwrap_or(0);
-        if let Some(max_inflight) = self.client.download_max_inflight() {
-            options.max_inflight = max_inflight;
+        if let Some(max_buffered_chunks) = self.client.download_max_buffered_chunks() {
+            options.max_buffered_chunks = Some(max_buffered_chunks);
         }
-
-        let (mut writer, reader) = tokio::io::duplex(self.client.download_buffer_size());
 
         let client = self.client.clone();
         let object = self.inner.as_inner().clone();
         let len = object.size();
-        let jh =
-            tokio::spawn(async move { client.sdk().download(&mut writer, &object, options).await });
+
+        let download = client
+            .sdk()
+            .download(&object, options)
+            .map_err(sia_storage::Error::Download)?;
 
         Ok(Download {
-            reader,
-            jh: Some(jh),
-            task_error: None,
-            error_count: 0,
+            download: download.compat(),
             offset,
             len,
+            error_count: 0,
         })
     }
 }
 
-#[derive(Debug)]
 pub struct Download {
-    reader: DuplexStream,
-    jh: Option<JoinHandle<Result<(), DownloadError>>>,
-    task_error: Option<std::io::Error>,
-    error_count: usize,
+    download: Compat<sia_storage::Download>,
     offset: u64,
     len: u64,
+    error_count: usize,
+}
+
+impl std::fmt::Debug for Download {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Download")
+            .field("download", &"<Compat<sia_storage::Download>>")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .field("error_count", &self.error_count)
+            .finish()
+    }
 }
 
 impl Download {
@@ -82,75 +88,23 @@ impl Resource for Download {
     }
 }
 
-impl Drop for Download {
-    fn drop(&mut self) {
-        if let Some(jh) = self.jh.take() {
-            jh.abort();
-        }
-    }
-}
-
-impl Download {
-    fn poll_task(&mut self, cx: &mut Context<'_>, eof: bool) -> Poll<std::io::Result<usize>> {
-        let Some(jh) = &mut self.jh else {
-            return if eof {
-                Poll::Ready(Ok(0))
-            } else {
-                Poll::Pending
-            };
-        };
-
-        match Pin::new(jh).poll(cx) {
-            Poll::Ready(result) => {
-                self.jh = None;
-                let err = match result {
-                    Ok(Ok(())) => {
-                        return if eof {
-                            Poll::Ready(Ok(0))
-                        } else {
-                            Poll::Pending
-                        };
-                    }
-                    Ok(Err(e)) => std::io::Error::new(std::io::ErrorKind::Other, e),
-                    Err(e) => std::io::Error::new(std::io::ErrorKind::Other, e),
-                };
-                self.error_count += 1;
-                if eof {
-                    Poll::Ready(Err(err))
-                } else {
-                    self.task_error = Some(err);
-                    Poll::Pending
-                }
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 impl AsyncRead for Download {
+    #[inline]
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-
-        if let Some(e) = this.task_error.take() {
-            return Poll::Ready(Err(e));
-        }
-
-        let mut read_buf = tokio::io::ReadBuf::new(buf);
-        match Pin::new(&mut this.reader).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) if !read_buf.filled().is_empty() => {
-                let n = read_buf.filled().len();
+        match Pin::new(&mut this.download).poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(n)) => {
                 this.offset += n as u64;
                 Poll::Ready(Ok(n))
             }
-            Poll::Ready(Ok(())) => this.poll_task(cx, true),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                let _ = this.poll_task(cx, false);
-                Poll::Pending
+            Poll::Ready(Err(e)) => {
+                this.error_count += 1;
+                Poll::Ready(Err(e))
             }
         }
     }

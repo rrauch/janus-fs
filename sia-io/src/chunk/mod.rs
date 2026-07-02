@@ -1,5 +1,5 @@
-mod reader;
 mod downloader;
+mod reader;
 
 use crate::object::{Object, ObjectId, Version};
 use bytes::Bytes;
@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
 
-pub(crate) use reader::ChunkedReader;
 pub(crate) use downloader::ChunkDownloader;
+pub(crate) use reader::ChunkedReader;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId {
@@ -39,16 +39,6 @@ impl ChunkId {
     #[inline]
     pub fn range(&self) -> &Range<u64> {
         &self.range
-    }
-
-    pub(crate) fn check_object_details(&self, object: &Object) -> Result<(), ChunkError> {
-        if &self.object_id != object.id() {
-            Err(ChunkError::ObjectIdMismatch)?;
-        }
-        if self.object_version != object.version() {
-            Err(ChunkError::ObjectModified)?;
-        }
-        Ok(())
     }
 }
 

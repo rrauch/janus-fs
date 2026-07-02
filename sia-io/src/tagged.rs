@@ -131,7 +131,7 @@ impl<Tag, Value> AsMut<Value> for TaggedValue<Tag, Value> {
     }
 }
 
-pub(crate) trait TryFromInner<Value> {
+pub trait TryFromInner<Value> {
     type Err: Display;
 
     fn try_from_inner(inner: Value) -> Result<Self, Self::Err>

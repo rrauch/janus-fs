@@ -1189,3 +1189,18 @@ CREATE TRIGGER change_log_vfs_update
 BEGIN
     INSERT INTO change_log(change, type, key1) VALUES ('U', 'I', NEW.inode_id);
 END;
+
+CREATE TRIGGER change_log_entity_update_inodes
+    AFTER UPDATE
+    ON entity
+    FOR EACH ROW
+    WHEN OLD.mode IS NOT NEW.mode
+        OR OLD.object_id IS NOT NEW.object_id
+        OR OLD.data IS NOT NEW.data
+BEGIN
+    INSERT INTO change_log(change, type, key1)
+    SELECT 'U', 'I', inode_id
+    FROM vfs
+    WHERE entity_id = NEW.id
+      AND entity_rev = NEW.revision;
+END;
