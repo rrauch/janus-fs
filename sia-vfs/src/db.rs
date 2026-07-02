@@ -575,7 +575,7 @@ async fn prepare_db(db_file: &Path, page_size: PageSize) -> Result<(), Error> {
 
     let mut conn = connect_with_retry::<10>(&opts).await?;
 
-    async { sqlx::migrate!("./migrations").run_direct(&mut conn).await }.await?;
+    async { sqlx::migrate!("./migrations").run(&mut conn).await }.await?;
 
     async fn get_page_size(conn: &mut SqliteConnection) -> Result<PageSize, Error> {
         Ok(sqlx::query!("PRAGMA page_size")

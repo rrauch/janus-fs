@@ -723,7 +723,9 @@ impl Vfs {
         );
         let config = config.freeze();
 
-        let mut uploader = sia_client.prepare_multi_upload();
+        let mut uploader = sia_client
+            .prepare_multi_upload()
+            .map_err(std::io::Error::other)?;
 
         uploader
             .enqueue(root.to_uploadable_object(&vfs_id))
@@ -731,7 +733,9 @@ impl Vfs {
             .map_err(std::io::Error::other)?;
         if uploader.is_full() {
             uploader.process().await.map_err(std::io::Error::other)?;
-            uploader = sia_client.prepare_multi_upload();
+            uploader = sia_client
+                .prepare_multi_upload()
+                .map_err(std::io::Error::other)?;
         }
 
         uploader
@@ -740,7 +744,9 @@ impl Vfs {
             .map_err(std::io::Error::other)?;
         if uploader.is_full() {
             uploader.process().await.map_err(std::io::Error::other)?;
-            uploader = sia_client.prepare_multi_upload();
+            uploader = sia_client
+                .prepare_multi_upload()
+                .map_err(std::io::Error::other)?;
         }
 
         uploader

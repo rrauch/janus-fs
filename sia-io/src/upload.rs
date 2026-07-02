@@ -15,6 +15,8 @@ pub enum UploadError {
     IoError(#[from] std::io::Error),
     #[error("number of uploaded objects does not match expected number")]
     ObjectMismatch,
+    #[error(transparent)]
+    SiaError(#[from] sia_storage::UploadError),
     #[error("upload error: {0}")]
     Other(String),
 }
@@ -231,20 +233,20 @@ impl<'a> MultiUploader<'a> {
 
 impl Client {
     #[inline]
-    pub fn prepare_multi_upload<'a>(&self) -> MultiUploader<'a> {
+    pub fn prepare_multi_upload<'a>(&self) -> Result<MultiUploader<'a>, crate::Error> {
         let inner = match &self.backend {
             #[cfg(feature = "indexd")]
-            Backend::Indexd(indexd) => UploaderInner::Packed(indexd.new_packed_upload(), vec![]),
+            Backend::Indexd(indexd) => UploaderInner::Packed(indexd.new_packed_upload()?, vec![]),
             _ => UploaderInner::Simple(None),
         };
 
-        MultiUploader {
+        Ok(MultiUploader {
             inner,
             backend: self.backend.clone(),
             cache: self.cache.clone(),
             known_object_ids: self.known_object_ids.clone(),
             idx: 0,
-        }
+        })
     }
 
     #[inline]
@@ -252,7 +254,7 @@ impl Client {
         &self,
         uploadable_object: UploadableObject<M, C>,
     ) -> Result<Object, crate::Error> {
-        let mut uploader = self.prepare_multi_upload();
+        let mut uploader = self.prepare_multi_upload()?;
         uploader.enqueue(uploadable_object).await?;
         let mut objects = uploader.process().await?;
         assert_eq!(objects.len(), 1);

@@ -13,10 +13,10 @@ async-trait = { workspace = true }
 bimap = { workspace = true }
 bytesize = { workspace = true }
 chrono = { workspace = true }
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 ct-codecs = { workspace = true }
 futures-util = { workspace = true }
-humantime = "2.1"
+humantime = "2.3"
 itertools = { workspace = true }
 nfsserve = "0.10"
 parking_lot = { workspace = true }

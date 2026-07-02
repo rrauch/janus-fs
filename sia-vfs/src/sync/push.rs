@@ -154,7 +154,7 @@ impl PushTask {
         tx.commit().await?;
 
         let mut pending = FrozenVec::new();
-        let mut uploader = self.vfs.sia_client().prepare_multi_upload();
+        let mut uploader = self.vfs.sia_client().prepare_multi_upload()?;
         let vfs_id = self.vfs.id().clone();
 
         loop {
@@ -212,7 +212,7 @@ impl PushTask {
                 }
             }
             tx.commit().await?;
-            uploader = self.vfs.sia_client().prepare_multi_upload();
+            uploader = self.vfs.sia_client().prepare_multi_upload()?;
         }
     }
 

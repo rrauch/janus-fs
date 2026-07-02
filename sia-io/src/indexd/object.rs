@@ -1,5 +1,6 @@
 use crate::indexd::client::{Client, ClientError};
 use crate::tagged::{TaggedValue, TryFromInner, WithFromStr, WithSerde};
+use crate::upload::UploadError;
 use chrono::{DateTime, Utc};
 use futures_io::AsyncRead;
 use futures_util::{StreamExt, TryStream, TryStreamExt};
@@ -170,12 +171,12 @@ impl Client {
         Ok(self.sdk().object(object_id.as_ref()).await?.into())
     }
 
-    pub(crate) fn new_packed_upload(&self) -> PackedUpload {
+    pub(crate) fn new_packed_upload(&self) -> Result<PackedUpload, UploadError> {
         let mut options = UploadOptions::default();
-        if let Some(max_inflight) = self.upload_max_inflight() {
-            options.max_inflight = max_inflight;
+        if let Some(max_buffered_slabs) = self.upload_max_buffered_slabs() {
+            options.max_buffered_slabs = Some(max_buffered_slabs);
         }
-        self.sdk().upload_packed(options)
+        Ok(self.sdk().upload_packed(options)?)
     }
 
     pub async fn upload<U: AsyncRead + Send + Unpin + 'static>(
@@ -184,8 +185,8 @@ impl Client {
         metadata: Option<Vec<u8>>,
     ) -> Result<Object, ClientError> {
         let mut options = UploadOptions::default();
-        if let Some(max_inflight) = self.upload_max_inflight() {
-            options.max_inflight = max_inflight;
+        if let Some(max_buffered_slabs) = self.upload_max_buffered_slabs() {
+            options.max_buffered_slabs = Some(max_buffered_slabs);
         }
 
         let mut object = SiaObject::default();

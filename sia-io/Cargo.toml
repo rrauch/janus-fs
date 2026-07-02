@@ -31,7 +31,7 @@ parking_lot = { workspace = true }
 reqwest = { version = "0.13", features = ["stream", "json", "query"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-sia_storage = { version = "0.6", optional = true }
+sia_storage = { version = "0.10", optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["default"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
