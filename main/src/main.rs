@@ -1,18 +1,19 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use bytesize::ByteSize;
-use clap::{Args, Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ct_codecs::{Decoder, Hex};
 use foyer_cache::{FoyerChunkCache, FoyerMetadataCache};
 use sia_io::indexd::client::AppKey;
 use sia_io::indexd::{AppDetails, AppId};
-use sia_io::renterd::client::ApiPassword;
 use sia_io::renterd::BucketName;
+use sia_io::renterd::client::ApiPassword;
 use sia_nfs::SiaNfs;
+use sia_vfs::vfs::{BranchName, Head, TagName};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Instrument, Level};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -27,8 +28,7 @@ enum Backend {
 #[derive(Debug, Args)]
 struct IndexdArgs {
     /// URL for indexd's API endpoint.
-    #[arg(long, short = 'i', env, value_hint = clap::ValueHint::Url, default_value = "https://sia.storage"
-    )]
+    #[arg(long, short = 'i', env, value_hint = clap::ValueHint::Url, default_value = "https://sia.storage")]
     indexd_endpoint: Url,
 
     /// Appkey for the indexd API.
@@ -51,13 +51,8 @@ struct RenterdArgs {
     bucket: Option<String>,
 }
 
-#[derive(Debug, Parser)]
-#[command(version)]
-/// Exports Sia stored data via NFS.
-/// Connects to backend, allowing direct NFS access.
-struct Arguments {
-    vfs_id: String,
-
+#[derive(Debug, Args)]
+struct BackendArgs {
     /// Backend to use.
     #[arg(long, env, value_enum, default_value_t = Backend::Indexd)]
     backend: Backend,
@@ -67,47 +62,79 @@ struct Arguments {
 
     #[command(flatten)]
     renterd: RenterdArgs,
+}
 
-    /// Directory to store persistent data in. Will be created if it doesn't exist.
-    #[arg(long, short = 'd', env, value_hint = clap::ValueHint::DirPath)]
-    data_dir: PathBuf,
+#[derive(Debug, Args)]
+struct CacheArgs {
     /// Optional directory to store the content cache in. Defaults to `DATA_DIR` if not set. Will be created if it doesn't exist.
     #[arg(long, short = 'c', env)]
     cache_dir: Option<PathBuf>,
     /// Maximum size of content cache. Set to `0` to disable.
-    #[arg(long, short = 'm', env)]
-    #[clap(default_value = "2 GiB")]
+    #[arg(long, short = 'm', env, default_value = "2 GiB")]
     max_cache_size: ByteSize,
     /// Maximum size of metadata cache. Set to `0` to disable.
-    #[arg(long, short = 'n', env)]
-    #[clap(default_value = "256 MiB")]
+    #[arg(long, short = 'n', env, default_value = "256 MiB")]
     max_metadata_cache_size: ByteSize,
+}
+
+#[derive(Debug, Parser)]
+#[command(version)]
+/// Exports Sia stored data via NFS.
+struct Arguments {
+    /// Directory to store persistent data in. Will be created if it doesn't exist.
+    #[arg(long, short = 'd', env, value_hint = clap::ValueHint::DirPath)]
+    data_dir: PathBuf,
+
+    #[command(flatten)]
+    backend: BackendArgs,
+
+    #[command(flatten)]
+    cache: CacheArgs,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Serve a VFS via NFS.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Id of file system to serve.
+    vfs_id: String,
+
+    /// Branch name to serve.
+    #[arg(long, conflicts_with = "tag")]
+    branch: Option<String>,
+
+    /// Tag name to serve.
+    #[arg(long, conflicts_with = "branch")]
+    tag: Option<String>,
+
+    /// Serve read-only.
+    #[arg(long)]
+    read_only: bool,
+
     /// Host and port to listen on.
-    #[arg(long, short = 'l', env)]
-    #[clap(default_value = "localhost:12000")]
+    #[arg(long, short = 'l', env, default_value = "localhost:12000")]
     listen_address: String,
     /// UID of files and directories
-    #[arg(long, env = "INODE_UID")]
-    #[clap(default_value = "1000")]
+    #[arg(long, env = "INODE_UID", default_value = "1000")]
     uid: u32,
     /// GID of files and directories
-    #[arg(long, env = "INODE_GID")]
-    #[clap(default_value = "1000")]
+    #[arg(long, env = "INODE_GID", default_value = "1000")]
     gid: u32,
     /// Unix file permissions.
-    #[arg(long, env)]
-    #[clap(default_value = "0600")]
-    #[clap(value_parser = parse_octal)]
+    #[arg(long, env, default_value = "0600", value_parser = parse_octal)]
     file_mode: u32,
     /// Unix directory permissions.
-    #[arg(long, env)]
-    #[clap(default_value = "0700")]
-    #[clap(value_parser = parse_octal)]
+    #[arg(long, env, default_value = "0700", value_parser = parse_octal)]
     dir_mode: u32,
     /// Time without write activity after which a new file is considered complete.
-    #[arg(long, env)]
-    #[clap(default_value = "10s")]
-    #[clap(value_parser = humantime::parse_duration)]
+    #[arg(long, env, default_value = "10s", value_parser = humantime::parse_duration)]
     write_autocommit_after: Duration,
 }
 
@@ -119,7 +146,6 @@ enum ConfiguredBackend {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        //.without_time()
         .with_env_filter(
             EnvFilter::builder()
                 .with_default_directive(Level::INFO.into())
@@ -131,9 +157,26 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&arguments.data_dir).await?;
 
-    let backend = match arguments.backend {
+    let backend = build_backend(&mut arguments.backend).await?;
+    let cache = build_cache(&arguments.cache, &arguments.data_dir).await?;
+
+    let sia_builder = sia_io::Client::builder().cache(cache);
+    let sia = match backend {
+        ConfiguredBackend::Indexd(indexd) => sia_builder.backend(indexd).build().await?,
+        ConfiguredBackend::Renterd(renterd) => sia_builder.backend(renterd).build().await?,
+    };
+
+    match arguments.command {
+        Command::Serve(args) => serve(sia, &arguments.data_dir, args).await?,
+    }
+
+    Ok(())
+}
+
+async fn build_backend(args: &mut BackendArgs) -> anyhow::Result<ConfiguredBackend> {
+    match args.backend {
         Backend::Indexd => {
-            let mut app_key_arg = arguments
+            let mut app_key_arg = args
                 .indexd
                 .indexd_appkey
                 .take()
@@ -151,28 +194,26 @@ async fn main() -> anyhow::Result<()> {
                 .build();
 
             let indexd = sia_io::indexd::client::Client::builder()
-                .indexd_endpoint(arguments.indexd.indexd_endpoint)
+                .indexd_endpoint(args.indexd.indexd_endpoint.clone())
                 .app_key(&app_key)
                 .app_details(app_details)
                 .build()
                 .await?;
 
-            ConfiguredBackend::Indexd(indexd)
+            Ok(ConfiguredBackend::Indexd(indexd))
         }
         Backend::Renterd => {
-            let api_password = if arguments
+            let api_password = if args
                 .renterd
                 .renterd_api_password
-                .as_ref()
-                .map(|s| s.as_str())
+                .as_deref()
                 .unwrap_or("")
                 .is_empty()
             {
                 None
             } else {
                 Some(ApiPassword::from(
-                    arguments
-                        .renterd
+                    args.renterd
                         .renterd_api_password
                         .take()
                         .expect("password to be set"),
@@ -181,15 +222,14 @@ async fn main() -> anyhow::Result<()> {
 
             let renterd = sia_io::renterd::client::Client::builder()
                 .api_endpoint(
-                    arguments
-                        .renterd
+                    args.renterd
                         .renterd_api_endpoint
+                        .clone()
                         .ok_or_else(|| anyhow!("renterd api endpoint not set"))?,
                 )
                 .maybe_api_password(api_password)
                 .bucket(
-                    arguments
-                        .renterd
+                    args.renterd
                         .bucket
                         .as_ref()
                         .map(|b| -> Result<_, anyhow::Error> {
@@ -198,75 +238,77 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|| Ok(BucketName::default()))?,
                 )
                 .build()?;
-            ConfiguredBackend::Renterd(renterd)
+            Ok(ConfiguredBackend::Renterd(renterd))
         }
-    };
+    }
+}
 
-    let cache = if arguments.max_cache_size.as_u64() > 0
-        || arguments.max_metadata_cache_size.as_u64() > 0
-    {
-        let path = arguments
-            .cache_dir
-            .unwrap_or_else(|| arguments.data_dir.clone());
+async fn build_cache(args: &CacheArgs, data_dir: &PathBuf) -> anyhow::Result<sia_io::cache::Cache> {
+    if args.max_cache_size.as_u64() == 0 && args.max_metadata_cache_size.as_u64() == 0 {
+        return Ok(sia_io::cache::Cache::default());
+    }
 
-        let maybe_metadata_cache = if arguments.max_metadata_cache_size.as_u64() > 0 {
-            Some(
-                FoyerMetadataCache::builder()
-                    .max_disk_space(arguments.max_metadata_cache_size.as_u64())
-                    .disk_path(path.join("metadata_cache"))
-                    .build()
-                    .await?,
-            )
-        } else {
-            None
-        };
+    let path = args.cache_dir.clone().unwrap_or_else(|| data_dir.clone());
 
-        let maybe_chunk_cache = if arguments.max_cache_size.as_u64() > 0 {
-            Some(
-                FoyerChunkCache::builder()
-                    .max_disk_space(arguments.max_cache_size.as_u64())
-                    .disk_path(path.join("chunk_cache"))
-                    .build()
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        sia_io::cache::Cache::builder()
-            .maybe_metadata_l2_cache(maybe_metadata_cache)
-            .maybe_chunk_l2_cache(maybe_chunk_cache)
-            .build()
+    let maybe_metadata_cache = if args.max_metadata_cache_size.as_u64() > 0 {
+        Some(
+            FoyerMetadataCache::builder()
+                .max_disk_space(args.max_metadata_cache_size.as_u64())
+                .disk_path(path.join("metadata_cache"))
+                .build()
+                .await?,
+        )
     } else {
-        sia_io::cache::Cache::default()
+        None
     };
 
-    let sia_builder = sia_io::Client::builder().cache(cache);
-    let sia = match backend {
-        ConfiguredBackend::Indexd(indexd) => sia_builder.backend(indexd).build().await?,
-        ConfiguredBackend::Renterd(renterd) => sia_builder.backend(renterd).build().await?,
+    let maybe_chunk_cache = if args.max_cache_size.as_u64() > 0 {
+        Some(
+            FoyerChunkCache::builder()
+                .max_disk_space(args.max_cache_size.as_u64())
+                .disk_path(path.join("chunk_cache"))
+                .build()
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    Ok(sia_io::cache::Cache::builder()
+        .maybe_metadata_l2_cache(maybe_metadata_cache)
+        .maybe_chunk_l2_cache(maybe_chunk_cache)
+        .build())
+}
+
+async fn serve(sia: sia_io::Client, data_dir: &PathBuf, args: ServeArgs) -> anyhow::Result<()> {
+    let head = match (args.branch, args.tag) {
+        (Some(branch), None) => Some(Head::from(BranchName::from_str(branch.as_str())?)),
+        (None, Some(tag)) => Some(Head::from(TagName::from_str(tag.as_str())?)),
+        (None, None) => None,
+        (Some(_), Some(_)) => bail!("invalid configuration, branch and tag are mutually exclusive"),
     };
 
     let sia_nfs = SiaNfs::new(
         sia,
-        arguments.vfs_id.as_str(),
-        false,
-        &arguments.data_dir,
-        &arguments.listen_address,
-        arguments.uid,
-        arguments.gid,
-        arguments.file_mode,
-        arguments.dir_mode,
-        arguments.write_autocommit_after,
+        args.vfs_id.as_str(),
+        head,
+        args.read_only,
+        data_dir,
+        &args.listen_address,
+        args.uid,
+        args.gid,
+        args.file_mode,
+        args.dir_mode,
+        args.write_autocommit_after,
     )
     .await?;
 
     let run_fut = sia_nfs.run();
 
-    let mut sigint = signal(SignalKind::interrupt()).unwrap();
-    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
 
-    let span = tracing::trace_span!("main");
+    let span = tracing::trace_span!("serve");
 
     async move {
         tokio::select! {
@@ -279,9 +321,7 @@ async fn main() -> anyhow::Result<()> {
             res = run_fut => {
                 match res {
                     Ok(()) => tracing::info!("run finished, shutting down"),
-                    Err(err) => {
-                        return Err(err);
-                    }
+                    Err(err) => return Err(err),
                 }
             }
         }

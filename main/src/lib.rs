@@ -2,10 +2,10 @@ mod io_scheduler;
 mod nfs;
 
 use crate::nfs::SiaNfsFs;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sia_io::Client as Sia;
-use sia_vfs::vfs::{Vfs, VfsId};
+use sia_vfs::vfs::{Head, Vfs, VfsId};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -20,6 +20,7 @@ impl SiaNfs {
     pub async fn new(
         sia: Sia,
         vfs_id: &str,
+        head: Option<Head>,
         read_only: bool,
         db_path: &Path,
         listen_address: &str,
@@ -32,9 +33,12 @@ impl SiaNfs {
         let vfs_id = VfsId::from_str(vfs_id).map_err(|_| anyhow!("invalid vfs id"))?;
         let db_file = db_path.join(format!("{}.sqlite", vfs_id));
 
+        let export_name = format!("{}", &vfs_id);
+
         let vfs = Vfs::builder()
             .sia_client(sia)
             .vfs_id(vfs_id)
+            .maybe_head(head)
             .read_only(read_only)
             .max_chunk_size(CHUNK_SIZE)
             .db_file(db_file)
@@ -46,7 +50,7 @@ impl SiaNfs {
             SiaNfsFs::new(vfs, write_autocommit_after, uid, gid, file_mode, dir_mode).await?,
         )
         .await?;
-        listener.with_export_name("sia");
+        listener.with_export_name(export_name);
 
         Ok(Self { listener })
     }
