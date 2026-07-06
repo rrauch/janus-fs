@@ -9,11 +9,13 @@ use sia_io::indexd::{AppDetails, AppId};
 use sia_io::renterd::BucketName;
 use sia_io::renterd::client::ApiPassword;
 use sia_nfs::SiaNfs;
+use sia_vfs::vfs::config::Config;
 use sia_vfs::vfs::{BranchName, Head, TagName, Vfs};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Instrument, Level};
 use tracing_subscriber::EnvFilter;
@@ -102,6 +104,32 @@ enum Command {
     Serve(ServeArgs),
     /// Scan backend for available VFSs
     Scan,
+    /// Filesystem management commands.
+    Fs {
+        #[command(subcommand)]
+        command: FsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FsCommand {
+    /// Create a new VFS.
+    Create(FsCreateArgs),
+    /// Delete an existing VFS (dangerous).
+    Delete(FsDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct FsCreateArgs {
+    /// Optional description of new file system.
+    #[arg(long)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct FsDeleteArgs {
+    /// ID of file system to permanently delete.
+    vfs_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +200,12 @@ async fn main() -> anyhow::Result<()> {
     match arguments.command {
         Command::Serve(args) => serve(sia, &arguments.data_dir, args).await?,
         Command::Scan => scan(sia).await?,
+        Command::Fs {
+            command: FsCommand::Create(args),
+        } => create_fs(sia, args).await?,
+        Command::Fs {
+            command: FsCommand::Delete(args),
+        } => delete_fs(sia, args).await?,
     }
 
     Ok(())
@@ -351,43 +385,82 @@ async fn scan(sia: sia_io::Client) -> anyhow::Result<()> {
     println!();
 
     for config in configs {
-        println!("{}{}", INDENT, "VFS ID:".bold());
-        println!("{}{}", INDENT, config.vfs_id());
-        println!();
-        if let Some(description) = config.description() {
-            println!("{}{}", INDENT, "DESCRIPTION:".bold());
-            println!("{}{}", INDENT, description);
-            println!();
-        }
-        println!("{}{}", INDENT, "LAST MODIFIED:".bold());
-        println!("{}{}", INDENT, config.last_modified());
-        println!();
-
-        for (head, entry) in config.heads().iter() {
-            const INDENT: &str = "       ";
-            match head {
-                Head::Branch(name) => {
-                    println!("{}{}", INDENT, "BRANCH:".bold());
-                    println!("{}{} ({})", INDENT, name, entry.commit_id());
-                }
-                Head::Tag(name) => {
-                    println!("{}{}", INDENT, "TAG:".bold());
-                    println!("{}{} ({})", INDENT, name, entry.commit_id());
-                }
-            }
-            println!();
-            if let Some(description) = entry.description() {
-                println!("{}{}", INDENT, "DESCRIPTION:".bold());
-                println!("{}{}", INDENT, description);
-                println!();
-            }
-            println!();
-        }
-
-        println!();
+        print_config(&config, INDENT);
     }
 
     Ok(())
+}
+
+fn print_config(config: &Config, indent: &str) {
+    println!("{}{}", indent, "VFS ID:".bold());
+    println!("{}{}", indent, config.vfs_id());
+    println!();
+    if let Some(description) = config.description() {
+        println!("{}{}", indent, "DESCRIPTION:".bold());
+        println!("{}{}", indent, description);
+        println!();
+    }
+    println!("{}{}", indent, "LAST MODIFIED:".bold());
+    println!("{}{}", indent, config.last_modified());
+    println!();
+
+    for (head, entry) in config.heads().iter() {
+        let indent = format!("{}   ", indent);
+        let indent = indent.as_str();
+
+        match head {
+            Head::Branch(name) => {
+                println!("{}{}", indent, "BRANCH:".bold());
+                println!("{}{} ({})", indent, name, entry.commit_id());
+            }
+            Head::Tag(name) => {
+                println!("{}{}", indent, "TAG:".bold());
+                println!("{}{} ({})", indent, name, entry.commit_id());
+            }
+        }
+        println!();
+        if let Some(description) = entry.description() {
+            println!("{}{}", indent, "DESCRIPTION:".bold());
+            println!("{}{}", indent, description);
+            println!();
+        }
+        println!();
+    }
+}
+
+async fn create_fs(sia: sia_io::Client, args: FsCreateArgs) -> anyhow::Result<()> {
+    action_preview(
+        "Create New File System",
+        Some("Create a new, empty file system on the selected backend."),
+        &sia,
+    );
+
+    if !ask_proceed().await {
+        println!(" ❌ {}", "Aborting".red());
+        println!();
+        return Ok(());
+    }
+
+    let vfs_id = Vfs::create_new(args.description, &sia).await?;
+
+    const INDENT: &str = "    ";
+
+    println!();
+    println!("{} ✅", "File System Creation Complete".green().bold());
+    println!();
+
+    let configs = Vfs::scan(&sia).await?;
+    let config = configs
+        .into_iter()
+        .find(|c| c.vfs_id() == &vfs_id)
+        .ok_or_else(|| anyhow!("newly created VFS with id '{}' not found", &vfs_id))?;
+
+    print_config(&config, INDENT);
+    Ok(())
+}
+
+async fn delete_fs(_sia: sia_io::Client, _args: FsDeleteArgs) -> anyhow::Result<()> {
+    todo!()
 }
 
 fn action_preview(action: impl AsRef<str>, details: Option<&str>, sia: &sia_io::Client) {
@@ -410,6 +483,32 @@ fn action_preview(action: impl AsRef<str>, details: Option<&str>, sia: &sia_io::
         println!("{}", details);
         println!();
     }
+}
+
+async fn ask_confirmation(question: &str) -> bool {
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    loop {
+        println!("{}", question);
+        match reader.read_line(&mut line).await {
+            Ok(_) => {
+                let resp = line.trim();
+                if resp.eq_ignore_ascii_case("y") || resp.eq_ignore_ascii_case("yes") {
+                    return true;
+                }
+                if resp.eq_ignore_ascii_case("n") || resp.eq_ignore_ascii_case("no") {
+                    return false;
+                }
+                println!("{}", "Only y/n accepted, please try again".red());
+            }
+            Err(_) => return false,
+        }
+        line.clear();
+    }
+}
+
+async fn ask_proceed() -> bool {
+    ask_confirmation("Do you want to proceed (y/n)?").await
 }
 
 fn parse_appkey(hex: &str) -> Result<AppKey, anyhow::Error> {
