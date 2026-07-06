@@ -204,7 +204,6 @@ pub(crate) mod tests {
     use sia_io::Client as Sia;
     use std::io::SeekFrom;
     use std::num::NonZero;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -261,7 +260,6 @@ pub(crate) mod tests {
         read_file(&vfs, b"some bytesmore", true).await?;
 
         drop(vfs);
-        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // start completely from scratch & sync from the network
         let path = temp_dir.path().join("vfs2.sqlite");

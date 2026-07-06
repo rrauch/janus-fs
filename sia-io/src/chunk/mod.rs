@@ -1,4 +1,3 @@
-mod downloader;
 mod reader;
 
 use crate::object::{Object, ObjectId, Version};
@@ -7,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
 
-pub(crate) use downloader::ChunkDownloader;
 pub(crate) use reader::ChunkedReader;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

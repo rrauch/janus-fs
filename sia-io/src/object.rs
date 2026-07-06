@@ -1,15 +1,12 @@
 use crate::cache::Cache;
-use crate::chunk::{ChunkDownloader, ChunkedReader};
+use crate::chunk::ChunkedReader;
 #[cfg(feature = "indexd")]
 use crate::indexd;
 #[cfg(feature = "mock")]
 use crate::mock;
 #[cfg(feature = "renterd")]
 use crate::renterd;
-use crate::scheduler::Scheduler;
-use crate::scheduler::resource_manager::Resource;
 use crate::{Backend, Client, ETag, Metadata, MimeType};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_io::{AsyncRead, AsyncSeek};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
@@ -445,9 +442,8 @@ impl AsyncRead for Download {
     }
 }
 
-#[async_trait]
-impl Resource for Download {
-    fn offset(&self) -> u64 {
+impl Download {
+    pub fn offset(&self) -> u64 {
         match self {
             #[cfg(feature = "indexd")]
             Self::Indexd(indexd) => indexd.offset(),
@@ -458,7 +454,7 @@ impl Resource for Download {
         }
     }
 
-    fn can_reuse(&self) -> bool {
+    pub fn can_reuse(&self) -> bool {
         match self {
             #[cfg(feature = "indexd")]
             Self::Indexd(indexd) => indexd.can_reuse(),
@@ -472,7 +468,7 @@ impl Resource for Download {
         }
     }
 
-    async fn finalize(self) -> anyhow::Result<()> {
+    pub async fn finalize(self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "indexd")]
             Self::Indexd(indexd) => indexd.finalize().await,
@@ -712,26 +708,19 @@ impl ObjectEvent {
 #[derive(Debug, Clone)]
 pub struct DownloadableObject {
     chunk_size: usize,
-    object: Object,
+    object: BackendDO,
     cache: Cache,
-    downloader: Arc<Scheduler<ChunkDownloader>>,
 }
 
 impl DownloadableObject {
     #[inline]
     pub fn object(&self) -> &Object {
-        &self.object
+        self.object.object()
     }
 
     #[inline]
     pub async fn open(&self) -> Result<impl AsyncRead + AsyncSeek + Send + Unpin, crate::Error> {
-        ChunkedReader::new(
-            self.cache.clone(),
-            self.object.clone(),
-            self.chunk_size,
-            self.downloader.clone(),
-        )
-        .await
+        ChunkedReader::new(self.cache.clone(), self.object.clone(), self.chunk_size).await
     }
 }
 
@@ -790,15 +779,11 @@ impl Client {
     }
 
     #[inline]
-    pub async fn download(
-        &self,
-        id: &ObjectId,
-    ) -> Result<Option<DownloadableObject>, crate::Error> {
-        Ok(self.object(id).await?.map(|object| DownloadableObject {
+    pub async fn download(&self, id: &ObjectId) -> Result<DownloadableObject, crate::Error> {
+        Ok(DownloadableObject {
             chunk_size: self.chunk_size,
-            object,
+            object: self.backend.download(id).await?,
             cache: self.cache.clone(),
-            downloader: self.chunk_downloader.clone(),
-        }))
+        })
     }
 }

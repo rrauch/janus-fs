@@ -130,8 +130,11 @@ pub(super) mod tests {
     async fn acquire_authorization() -> Result<(), anyhow::Error> {
         dotenv::dotenv().ok();
         let app_details = app_details()?;
-        let handle =
-            Client::acquire_authorization(std::env::var("INDEXD_ENDPOINT")?, app_details).await?;
+        let handle = Client::acquire_authorization(
+            Url::parse(std::env::var("INDEXD_ENDPOINT")?.as_str())?,
+            app_details,
+        )
+        .await?;
 
         eprintln!();
         eprintln!("AUTHORIZATION URL: {}", handle.url().as_str());
@@ -161,7 +164,7 @@ pub(super) mod tests {
         let app_key = app_key()?;
 
         Ok(Client::builder()
-            .indexd_endpoint(std::env::var("INDEXD_ENDPOINT")?)
+            .indexd_endpoint(Url::parse(std::env::var("INDEXD_ENDPOINT")?.as_str())?)
             .app_details(app_details)
             .app_key(&app_key)
             .build()

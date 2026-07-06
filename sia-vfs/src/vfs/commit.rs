@@ -13,7 +13,6 @@ use futures_util::io::Cursor;
 use sia_io::Client as Sia;
 use sia_io::object::{Object as SiaObject, ObjectId as SiaObjectId};
 use sia_io::upload::UploadableObject;
-use std::io::ErrorKind;
 use std::ops::Deref;
 use std::sync::Arc;
 use thiserror::Error;
@@ -172,8 +171,7 @@ impl Commit {
         let dl = sia_client
             .download(sia_oid)
             .await
-            .map_err(std::io::Error::other)?
-            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
+            .map_err(std::io::Error::other)?;
 
         let metadata: object::metadata::Metadata = dl
             .object()

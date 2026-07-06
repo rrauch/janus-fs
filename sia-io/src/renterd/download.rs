@@ -1,8 +1,6 @@
 use crate::renterd::client::{ApiRequest, ApiRequestBuilder, Client, ClientError};
 use crate::renterd::encode_object_path;
 use crate::renterd::object::{File, FileId};
-use crate::scheduler::resource_manager::Resource;
-use async_trait::async_trait;
 use futures_io::AsyncRead;
 use futures_util::{TryStreamExt, ready};
 use std::fmt::{Debug, Formatter};
@@ -65,17 +63,16 @@ impl Download {
     }
 }
 
-#[async_trait]
-impl Resource for Download {
-    fn offset(&self) -> u64 {
+impl Download {
+    pub fn offset(&self) -> u64 {
         self.offset
     }
 
-    fn can_reuse(&self) -> bool {
+    pub fn can_reuse(&self) -> bool {
         self.offset < self.len && self.error_count == 0
     }
 
-    async fn finalize(self) -> anyhow::Result<()> {
+    pub async fn finalize(self) -> anyhow::Result<()> {
         Ok(())
     }
 }
