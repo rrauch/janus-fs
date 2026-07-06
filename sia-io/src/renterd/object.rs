@@ -415,6 +415,63 @@ pub struct Object<T> {
     metadata: HashMap<String, String>,
 }
 
+// bincode-safe mirror of Object<T> - workaround for https://github.com/bincode-org/bincode/issues/245
+// foyer-cache uses bincode-serialization
+#[derive_where(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectShadow<T> {
+    bucket: BucketName,
+    key: ObjectKey<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<ETag>,
+    health: f64,
+    mod_time: DateTime<Utc>,
+    size: u64,
+    mime_type: MimeType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_key: Option<ObjectEncryptionKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    slabs: Vec<SlabSlice>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    metadata: HashMap<String, String>,
+}
+
+impl<T> From<Object<T>> for ObjectShadow<T> {
+    fn from(value: Object<T>) -> Self {
+        Self {
+            bucket: value.id.bucket,
+            key: value.id.key,
+            etag: value.etag,
+            health: value.health,
+            mod_time: value.mod_time,
+            size: value.size,
+            mime_type: value.mime_type,
+            encryption_key: value.encryption_key,
+            slabs: value.slabs,
+            metadata: value.metadata,
+        }
+    }
+}
+
+impl<T> From<ObjectShadow<T>> for Object<T> {
+    fn from(value: ObjectShadow<T>) -> Self {
+        Self {
+            id: ObjectId {
+                bucket: value.bucket,
+                key: value.key,
+            },
+            etag: value.etag,
+            health: value.health,
+            mod_time: value.mod_time,
+            size: value.size,
+            mime_type: value.mime_type,
+            encryption_key: value.encryption_key,
+            slabs: value.slabs,
+            metadata: value.metadata,
+        }
+    }
+}
+
 impl Object<Unknown> {
     fn cast<U>(self) -> Object<U> {
         // SAFETY: Type only appears in PhantomData inside ObjectKeyKind<T>,
