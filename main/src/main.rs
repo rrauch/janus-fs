@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail};
 use bytesize::ByteSize;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use colored::Colorize;
 use ct_codecs::{Decoder, Hex};
 use foyer_cache::{FoyerChunkCache, FoyerMetadataCache};
 use sia_io::indexd::client::AppKey;
@@ -8,7 +9,7 @@ use sia_io::indexd::{AppDetails, AppId};
 use sia_io::renterd::BucketName;
 use sia_io::renterd::client::ApiPassword;
 use sia_nfs::SiaNfs;
-use sia_vfs::vfs::{BranchName, Head, TagName};
+use sia_vfs::vfs::{BranchName, Head, TagName, Vfs};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -99,6 +100,8 @@ struct Arguments {
 enum Command {
     /// Serve a VFS via NFS.
     Serve(ServeArgs),
+    /// Scan backend for available VFSs
+    Scan,
 }
 
 #[derive(Debug, Args)]
@@ -168,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
 
     match arguments.command {
         Command::Serve(args) => serve(sia, &arguments.data_dir, args).await?,
+        Command::Scan => scan(sia).await?,
     }
 
     Ok(())
@@ -329,6 +333,85 @@ async fn serve(sia: sia_io::Client, data_dir: &PathBuf, args: ServeArgs) -> anyh
     }
     .instrument(span)
     .await
+}
+
+async fn scan(sia: sia_io::Client) -> anyhow::Result<()> {
+    action_preview("Scan Backend", None, &sia);
+
+    let configs = Vfs::scan(&sia).await?;
+
+    const INDENT: &str = "    ";
+
+    println!();
+    println!("{} ✅", "Backend Scan Complete".green().bold());
+    println!();
+    println!("{}", "SCAN RESULT".cyan().bold());
+
+    println!("{}{} {}", INDENT, "TOTAL FOUND:".bold(), configs.len());
+    println!();
+
+    for config in configs {
+        println!("{}{}", INDENT, "VFS ID:".bold());
+        println!("{}{}", INDENT, config.vfs_id());
+        println!();
+        if let Some(description) = config.description() {
+            println!("{}{}", INDENT, "DESCRIPTION:".bold());
+            println!("{}{}", INDENT, description);
+            println!();
+        }
+        println!("{}{}", INDENT, "LAST MODIFIED:".bold());
+        println!("{}{}", INDENT, config.last_modified());
+        println!();
+
+        for (head, entry) in config.heads().iter() {
+            const INDENT: &str = "       ";
+            match head {
+                Head::Branch(name) => {
+                    println!("{}{}", INDENT, "BRANCH:".bold());
+                    println!("{}{}", INDENT, name);
+                }
+                Head::Tag(name) => {
+                    println!("{}{}", INDENT, "TAG:".bold());
+                    println!("{}{}", INDENT, name);
+                }
+            }
+            println!();
+            if let Some(description) = entry.description() {
+                println!("{}{}", INDENT, "DESCRIPTION:".bold());
+                println!("{}{}", INDENT, description);
+                println!();
+            }
+            println!("{}{}", INDENT, "COMMIT:".bold());
+            println!("{}{}", INDENT, entry.commit_id());
+            println!();
+        }
+
+        println!();
+    }
+
+    Ok(())
+}
+
+fn action_preview(action: impl AsRef<str>, details: Option<&str>, sia: &sia_io::Client) {
+    println!("{} {}", "ACTION:".bold(), action.as_ref().cyan().bold());
+
+    match sia.backend() {
+        sia_io::Backend::Indexd(indexd) => {
+            println!("{} {}", "BACKEND:".bold(), "indexd");
+            println!("{} {}", "ENDPOINT:".bold(), indexd.endpoint());
+        }
+        sia_io::Backend::Renterd(renterd) => {
+            println!("{} {}", "BACKEND:".bold(), "renterd");
+            println!("{} {}", "ENDPOINT:".bold(), renterd.endpoint());
+            println!("{} {}", "BUCKET:".bold(), renterd.bucket());
+        }
+    }
+
+    println!();
+    if let Some(details) = details {
+        println!("{}", details);
+        println!();
+    }
 }
 
 fn parse_appkey(hex: &str) -> Result<AppKey, anyhow::Error> {

@@ -1,6 +1,6 @@
 use crate::object::metadata::Metadata;
 use crate::object::{ObjectCreateResult, ObjectId};
-use crate::sync::{Error, METADATA_VFS_VERSION};
+use crate::sync::{Error, METADATA_VFS_ID, METADATA_VFS_VERSION};
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::EntityHandler;
 use crate::vfs::file::FileKind;
@@ -230,7 +230,7 @@ impl Vfs {
                         return Ok(None);
                     }
 
-                    if metadata.get("VFS-ID") != Some(vfs_id.as_str()) {
+                    if metadata.get(METADATA_VFS_ID) != Some(vfs_id.as_str()) {
                         // not the same vfs
                         return Ok(None);
                     }

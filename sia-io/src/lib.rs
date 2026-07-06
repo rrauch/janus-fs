@@ -232,6 +232,12 @@ pub struct Client {
     chunk_downloader: Arc<Scheduler<ChunkDownloader>>,
 }
 
+impl Client {
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(handle) = self.object_event_loop_handle.take() {
