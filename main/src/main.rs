@@ -368,11 +368,11 @@ async fn scan(sia: sia_io::Client) -> anyhow::Result<()> {
             match head {
                 Head::Branch(name) => {
                     println!("{}{}", INDENT, "BRANCH:".bold());
-                    println!("{}{}", INDENT, name);
+                    println!("{}{} ({})", INDENT, name, entry.commit_id());
                 }
                 Head::Tag(name) => {
                     println!("{}{}", INDENT, "TAG:".bold());
-                    println!("{}{}", INDENT, name);
+                    println!("{}{} ({})", INDENT, name, entry.commit_id());
                 }
             }
             println!();
@@ -381,8 +381,6 @@ async fn scan(sia: sia_io::Client) -> anyhow::Result<()> {
                 println!("{}{}", INDENT, description);
                 println!();
             }
-            println!("{}{}", INDENT, "COMMIT:".bold());
-            println!("{}{}", INDENT, entry.commit_id());
             println!();
         }
 

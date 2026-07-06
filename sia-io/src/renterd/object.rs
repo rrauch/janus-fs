@@ -411,8 +411,23 @@ pub struct Object<T> {
     encryption_key: Option<ObjectEncryptionKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     slabs: Vec<SlabSlice>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_uppercase_keys"
+    )]
     metadata: HashMap<String, String>,
+}
+
+fn deserialize_uppercase_keys<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let map = HashMap::<String, String>::deserialize(deserializer)?;
+    Ok(map
+        .into_iter()
+        .map(|(k, v)| (k.to_uppercase(), v))
+        .collect())
 }
 
 // bincode-safe mirror of Object<T> - workaround for https://github.com/bincode-org/bincode/issues/245
@@ -608,6 +623,14 @@ impl Client {
                                     continue; // skip root object
                                 }
                             }
+
+                            // objects lack metadata when retrieved via list
+                            // we need to retrieve the object manually to get the full metadata
+                            let object: AnyObject = match object {
+                                AnyObject::File(file) => this.object(file.id()).await?.into(),
+                                AnyObject::Folder(folder) => this.object(folder.id()).await?.into(),
+                            };
+
                             return Ok(Some((object, (objects, has_more, next_marker))));
                         }
 
