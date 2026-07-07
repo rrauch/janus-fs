@@ -9,6 +9,8 @@ use sia_io::SealedObject;
 use sia_io::cache::metadata::L2MetadataCache;
 #[cfg(feature = "indexd")]
 use sia_io::indexd::object::ObjectId;
+use sia_io::renterd::FileKind;
+use sia_io::renterd::object::ObjectShadow;
 #[cfg(feature = "renterd")]
 use sia_io::renterd::object::{File, FileId};
 use std::path::Path;
@@ -76,7 +78,7 @@ enum CacheValue {
     #[cfg(feature = "indexd")]
     Indexd(SealedObject),
     #[cfg(feature = "renterd")]
-    Renterd(File),
+    Renterd(ObjectShadow<FileKind>),
 }
 
 #[cfg(feature = "indexd")]
@@ -89,7 +91,7 @@ impl From<SealedObject> for CacheValue {
 #[cfg(feature = "renterd")]
 impl From<File> for CacheValue {
     fn from(value: File) -> Self {
-        Self::Renterd(value)
+        Self::Renterd(value.into())
     }
 }
 
@@ -111,7 +113,7 @@ impl TryFrom<CacheValue> for File {
 
     fn try_from(value: CacheValue) -> Result<Self, Self::Error> {
         match value {
-            CacheValue::Renterd(f) => Ok(f),
+            CacheValue::Renterd(f) => Ok(f.into()),
             _ => Err(()),
         }
     }

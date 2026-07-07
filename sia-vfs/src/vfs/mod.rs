@@ -1,10 +1,12 @@
 pub mod cache;
 pub mod commit;
 pub mod config;
+pub mod delete;
 pub mod directory;
 pub mod entity;
 pub mod file;
 pub mod path;
+pub mod scan;
 
 use crate::TypedUuid;
 use crate::blob::BlobId;

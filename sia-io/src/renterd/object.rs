@@ -411,8 +411,80 @@ pub struct Object<T> {
     encryption_key: Option<ObjectEncryptionKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     slabs: Vec<SlabSlice>,
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_uppercase_keys"
+    )]
+    metadata: HashMap<String, String>,
+}
+
+fn deserialize_uppercase_keys<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let map = HashMap::<String, String>::deserialize(deserializer)?;
+    Ok(map
+        .into_iter()
+        .map(|(k, v)| (k.to_uppercase(), v))
+        .collect())
+}
+
+// bincode-safe mirror of Object<T> - workaround for https://github.com/bincode-org/bincode/issues/245
+// foyer-cache uses bincode-serialization
+#[derive_where(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectShadow<T> {
+    bucket: BucketName,
+    key: ObjectKey<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<ETag>,
+    health: f64,
+    mod_time: DateTime<Utc>,
+    size: u64,
+    mime_type: MimeType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_key: Option<ObjectEncryptionKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    slabs: Vec<SlabSlice>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     metadata: HashMap<String, String>,
+}
+
+impl<T> From<Object<T>> for ObjectShadow<T> {
+    fn from(value: Object<T>) -> Self {
+        Self {
+            bucket: value.id.bucket,
+            key: value.id.key,
+            etag: value.etag,
+            health: value.health,
+            mod_time: value.mod_time,
+            size: value.size,
+            mime_type: value.mime_type,
+            encryption_key: value.encryption_key,
+            slabs: value.slabs,
+            metadata: value.metadata,
+        }
+    }
+}
+
+impl<T> From<ObjectShadow<T>> for Object<T> {
+    fn from(value: ObjectShadow<T>) -> Self {
+        Self {
+            id: ObjectId {
+                bucket: value.bucket,
+                key: value.key,
+            },
+            etag: value.etag,
+            health: value.health,
+            mod_time: value.mod_time,
+            size: value.size,
+            mime_type: value.mime_type,
+            encryption_key: value.encryption_key,
+            slabs: value.slabs,
+            metadata: value.metadata,
+        }
+    }
 }
 
 impl Object<Unknown> {
@@ -551,6 +623,14 @@ impl Client {
                                     continue; // skip root object
                                 }
                             }
+
+                            // objects lack metadata when retrieved via list
+                            // we need to retrieve the object manually to get the full metadata
+                            let object: AnyObject = match object {
+                                AnyObject::File(file) => this.object(file.id()).await?.into(),
+                                AnyObject::Folder(folder) => this.object(folder.id()).await?.into(),
+                            };
+
                             return Ok(Some((object, (objects, has_more, next_marker))));
                         }
 

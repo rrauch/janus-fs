@@ -28,7 +28,6 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::ErrorKind;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -140,8 +139,7 @@ impl<T: EntityHandler> SyncedEntity<T> {
         let dl = sia_client
             .download(sia_oid)
             .await
-            .map_err(std::io::Error::other)?
-            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
+            .map_err(std::io::Error::other)?;
 
         let metadata: object::metadata::Metadata = dl
             .object()

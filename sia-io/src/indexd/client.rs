@@ -3,7 +3,7 @@ use crate::indexd::AppDetails;
 use bon::bon;
 use derive_where::derive_where;
 use sia_storage::{
-    ApprovedState, Builder, BuilderError, Error as SiaError, IntoUrl, RequestingApprovalState, Sdk,
+    ApprovedState, Builder, BuilderError, Error as SiaError, RequestingApprovalState, Sdk,
     SealedObjectError, Url,
 };
 use std::str::FromStr;
@@ -34,13 +34,13 @@ pub struct Client(pub(crate) Arc<Inner>);
 impl Client {
     #[builder]
     pub async fn new(
-        indexd_endpoint: impl IntoUrl,
+        indexd_endpoint: Url,
         app_details: AppDetails,
         app_key: &AppKey,
         download_max_buffered_chunks: Option<usize>,
         upload_max_buffered_slabs: Option<usize>,
     ) -> Result<Self, ClientError> {
-        let builder = Builder::new(indexd_endpoint, app_details.into())?;
+        let builder = Builder::new(indexd_endpoint.clone(), app_details.into())?;
         let sdk = builder
             .connected(app_key)
             .await?
@@ -48,6 +48,7 @@ impl Client {
 
         Ok(Self(Arc::new(Inner {
             sdk,
+            endpoint: indexd_endpoint,
             download_max_buffered_chunks,
             upload_max_buffered_slabs,
         })))
@@ -95,8 +96,12 @@ impl AuthorizationHandle<Finalize> {
 }
 
 impl Client {
+    pub fn endpoint(&self) -> &Url {
+        &self.0.endpoint
+    }
+
     pub async fn acquire_authorization(
-        indexd_endpoint: impl IntoUrl,
+        indexd_endpoint: Url,
         app_details: AppDetails,
     ) -> Result<AuthorizationHandle<AwaitingUserAuthorization>, ClientError> {
         let builder = Builder::new(indexd_endpoint, app_details.into())?
@@ -129,6 +134,7 @@ impl Client {
 pub(crate) struct Inner {
     #[derive_where(skip)]
     sdk: Sdk,
+    endpoint: Url,
     download_max_buffered_chunks: Option<usize>,
     upload_max_buffered_slabs: Option<usize>,
 }

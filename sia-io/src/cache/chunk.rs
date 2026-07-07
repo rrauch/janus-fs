@@ -34,15 +34,6 @@ impl Cache {
             .await
             .map_err(|e| crate::Error::CachedError(e.to_string()))
     }
-
-    pub(crate) async fn insert_chunk(&self, chunk: Chunk) -> Result<(), crate::Error> {
-        if let Some(l2) = &self.0.chunk.l2 {
-            l2.insert_chunk(chunk.clone()).await?;
-        }
-        let id = chunk.id().clone();
-        self.0.chunk.l1.insert(id, chunk).await;
-        Ok(())
-    }
 }
 
 async fn retrieve_chunk<Fut, L2: L2ChunkCache>(

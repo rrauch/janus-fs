@@ -13,8 +13,8 @@ use futures_util::io::Cursor;
 use sia_io::Client as Sia;
 use sia_io::object::{Object as SiaObject, ObjectId as SiaObjectId};
 use sia_io::upload::UploadableObject;
-use std::io::ErrorKind;
 use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -23,6 +23,14 @@ pub(crate) const METADATA_COMMIT_ID: &'static str = "COMMIT-ID";
 
 pub struct CommitKind;
 pub type CommitId = ContentId<CommitKind>;
+
+impl FromStr for CommitId {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from_str(s).ok_or_else(|| ())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CommitError {
@@ -172,8 +180,7 @@ impl Commit {
         let dl = sia_client
             .download(sia_oid)
             .await
-            .map_err(std::io::Error::other)?
-            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "object not found"))?;
+            .map_err(std::io::Error::other)?;
 
         let metadata: object::metadata::Metadata = dl
             .object()

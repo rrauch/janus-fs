@@ -1,7 +1,5 @@
 use crate::indexd::client::{Client, ClientError};
 use crate::indexd::object::{Object, ObjectId};
-use crate::scheduler::resource_manager::Resource;
-use async_trait::async_trait;
 use futures_util::AsyncRead;
 use sia_storage::DownloadOptions;
 use std::pin::Pin;
@@ -73,17 +71,16 @@ impl Download {
     }
 }
 
-#[async_trait]
-impl Resource for Download {
-    fn offset(&self) -> u64 {
+impl Download {
+    pub fn offset(&self) -> u64 {
         self.offset
     }
 
-    fn can_reuse(&self) -> bool {
+    pub fn can_reuse(&self) -> bool {
         self.offset < self.len && self.error_count == 0
     }
 
-    async fn finalize(self) -> anyhow::Result<()> {
+    pub async fn finalize(self) -> anyhow::Result<()> {
         Ok(())
     }
 }

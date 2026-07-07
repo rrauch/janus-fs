@@ -195,6 +195,10 @@ impl Client {
         object_id.key().check_root(self.root().key())?;
         Ok(())
     }
+
+    pub fn endpoint(&self) -> &Url {
+        &self.0.api_endpoint
+    }
 }
 
 pub(crate) struct ApiRequest<'a> {

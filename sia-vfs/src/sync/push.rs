@@ -413,7 +413,6 @@ mod tests {
     use crate::vfs::tests::new_vfs;
     use futures_util::AsyncWriteExt;
     use std::num::NonZeroUsize;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn basic_push() -> anyhow::Result<()> {
@@ -437,13 +436,11 @@ mod tests {
 
         let mut task = PushTask::new(vfs.clone(), branch_name, NonZeroUsize::new(1).unwrap());
         task.run().await?;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
         let file = vfs.inode_by_id(file.inode_id()).await?.unwrap();
         assert!(file.is_synced());
 
         let dir = vfs.inode_by_id(dir.inode_id()).await?.unwrap();
         assert!(dir.is_synced());
-        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(vfs.current_commit().await?.is_synced());
         assert!(vfs.current_config().await?.is_synced());
 

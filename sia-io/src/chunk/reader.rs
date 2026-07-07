@@ -1,7 +1,6 @@
 use crate::cache::Cache;
-use crate::chunk::{Chunk, ChunkDownloader, ChunkError, ChunkId};
-use crate::object::{Object, ObjectId, Version};
-use crate::scheduler::Scheduler;
+use crate::chunk::{Chunk, ChunkId};
+use crate::object::{BackendDO, Download};
 use bytes::BytesMut;
 use futures_io::{AsyncRead, AsyncSeek};
 use futures_util::{AsyncReadExt, ready};
@@ -12,8 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 enum State {
-    Ready { chunk: Option<Chunk> },
-    Retrieving { fut: Mutex<RetrieveFut> },
+    Idle,
+    Ready {
+        chunk: Chunk,
+    },
+    Retrieving {
+        fut: Mutex<RetrieveFut>,
+        leftover: Arc<Mutex<Option<Download>>>,
+    },
 }
 
 impl State {
@@ -24,7 +29,7 @@ impl State {
 
 impl Default for State {
     fn default() -> Self {
-        Self::Ready { chunk: None }
+        Self::Idle
     }
 }
 
@@ -33,39 +38,29 @@ type RetrieveFut = Pin<Box<dyn Future<Output = Result<Chunk, crate::Error>> + Se
 pub struct ChunkedReader {
     chunk_size: usize,
     cache: Cache,
-    downloader: Arc<Scheduler<ChunkDownloader>>,
-    object: Object,
-    access_key: (ObjectId, Version),
+    object: BackendDO,
     pos: u64,
     len: u64,
     state: State,
+    download: Option<Download>,
 }
 
 impl ChunkedReader {
     pub(crate) async fn new(
         cache: Cache,
-        object: Object,
+        object: BackendDO,
         chunk_size: usize,
-        downloader: Arc<Scheduler<ChunkDownloader>>,
     ) -> Result<Self, crate::Error> {
         assert!(chunk_size > 0);
-        let access_key = downloader
-            .prepare(object.id())
-            .await
-            .map_err(|e| crate::Error::CachedError(e.to_string()))?;
-        if object.version() != access_key.1 {
-            Err(ChunkError::ObjectModified)?
-        }
 
         Ok(Self {
             cache,
             chunk_size,
-            downloader,
-            access_key,
             pos: 0,
-            len: object.size(),
+            len: object.object().size(),
             object,
             state: State::default(),
+            download: None,
         })
     }
 
@@ -89,21 +84,38 @@ impl ChunkedReader {
     fn retrieve_chunk(&mut self, pos: u64) -> Result<(), std::io::Error> {
         let (range, _) = self.calc_range(pos)?;
 
-        let chunk_id = ChunkId::from_object(&self.object, range);
+        let chunk_id = ChunkId::from_object(self.object.object(), range);
 
-        let downloader = self.downloader.clone();
+        let download = match self.download.take() {
+            Some(download) if download.offset() == pos && download.can_reuse() => Some(download),
+            _ => None,
+        };
+
         let id = chunk_id.clone();
-        let access_key = self.access_key.clone();
+        let object = self.object.clone();
+
+        // shared slot for the leftover download, written only on cache miss
+        let leftover: Arc<Mutex<Option<Download>>> = Arc::new(Mutex::new(None));
+        let leftover_src = leftover.clone();
+
         let source = async move {
-            let mut reader = downloader
-                .access(&access_key, id.range.start)
-                .await
-                .map_err(|e| crate::Error::CachedError(e.to_string()))?;
+            let mut download = if let Some(download) = download {
+                download
+            } else {
+                object.open(pos).await?
+            };
+
             let len = (id.range().end - id.range().start) as usize;
             let mut buf = BytesMut::zeroed(len);
-            reader.as_mut().read_exact(&mut buf).await?;
+
+            download.read_exact(&mut buf).await?;
             let content = buf.freeze();
-            Ok(Chunk::new(id, content)?)
+            let chunk = Chunk::new(id, content)?;
+
+            // stash the download for sequential reuse
+            *leftover_src.lock().unwrap() = Some(download);
+
+            Ok(chunk)
         };
 
         let cache = self.cache.clone();
@@ -111,6 +123,7 @@ impl ChunkedReader {
 
         self.state = State::Retrieving {
             fut: Mutex::new(fut),
+            leftover,
         };
         self.pos = pos;
         Ok(())
@@ -119,6 +132,7 @@ impl ChunkedReader {
     fn on_chunk(
         &mut self,
         mutex: Mutex<RetrieveFut>,
+        leftover: Arc<Mutex<Option<Download>>>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         let mut fut = mutex.lock().unwrap();
@@ -126,12 +140,19 @@ impl ChunkedReader {
         match fut.as_mut().poll(cx) {
             Poll::Pending => {
                 drop(fut);
-                self.state = State::Retrieving { fut: mutex };
+                self.state = State::Retrieving {
+                    fut: mutex,
+                    leftover,
+                };
                 Poll::Pending
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(std::io::Error::other(err))),
             Poll::Ready(Ok(chunk)) => {
-                self.state = State::Ready { chunk: Some(chunk) };
+                drop(fut);
+                // on a cache miss, source stashed the download here; on a
+                // hit it's empty and there's nothing to reuse
+                self.download = leftover.lock().unwrap().take();
+                self.state = State::Ready { chunk };
                 Poll::Ready(Ok(()))
             }
         }
@@ -145,7 +166,7 @@ impl AsyncRead for ChunkedReader {
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let pos = self.pos;
-        if pos >= self.object.size() {
+        if pos >= self.object.object().size() {
             // eof
             return Poll::Ready(Ok(0));
         }
@@ -154,7 +175,7 @@ impl AsyncRead for ChunkedReader {
 
         loop {
             match self.state.take() {
-                State::Ready { chunk: Some(chunk) } => {
+                State::Ready { chunk } => {
                     if chunk.id().range() != &range {
                         // this is not the chunk we're looking for
                         continue;
@@ -166,15 +187,15 @@ impl AsyncRead for ChunkedReader {
                     }
                     let n = std::cmp::min(content.len(), buf.len());
                     buf[..n].copy_from_slice(&content[..n]);
-                    self.state = State::Ready { chunk: Some(chunk) };
+                    self.state = State::Ready { chunk };
                     self.pos += n as u64;
                     return Poll::Ready(Ok(n));
                 }
-                State::Ready { chunk: None } => {
+                State::Idle => {
                     self.retrieve_chunk(pos)?;
                 }
-                State::Retrieving { fut } => {
-                    ready!(self.on_chunk(fut, cx))?;
+                State::Retrieving { fut, leftover } => {
+                    ready!(self.on_chunk(fut, leftover, cx))?;
                 }
             }
         }
@@ -199,7 +220,7 @@ impl AsyncSeek for ChunkedReader {
 
         // seeking to eof
         if pos == self.len {
-            self.state = State::Ready { chunk: None };
+            self.state = State::Idle;
             self.pos = pos;
             return Poll::Ready(Ok(pos));
         }
@@ -208,21 +229,21 @@ impl AsyncSeek for ChunkedReader {
 
         loop {
             match self.state.take() {
-                State::Ready { chunk: Some(chunk) } => {
+                State::Ready { chunk } => {
                     if chunk.id().range() != &range {
                         // this is not the chunk we're looking for
                         continue;
                     }
-                    self.state = State::Ready { chunk: Some(chunk) };
+                    self.state = State::Ready { chunk };
                     self.pos = pos;
                     return Poll::Ready(Ok(pos));
                 }
-                State::Ready { chunk: None } => {
+                State::Idle => {
                     // start retrieving chunk
                     self.retrieve_chunk(pos)?;
                 }
-                State::Retrieving { fut } => {
-                    ready!(self.on_chunk(fut, cx))?;
+                State::Retrieving { fut, leftover } => {
+                    ready!(self.on_chunk(fut, leftover, cx))?;
                 }
             }
         }
