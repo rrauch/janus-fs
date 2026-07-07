@@ -944,7 +944,7 @@ mod tests {
         );
         assert_eq!(file.metadata.len(), 1);
         assert_eq!(
-            file.metadata.get("additionalProperty").map(|s| s.as_str()),
+            file.metadata.get("ADDITIONALPROPERTY").map(|s| s.as_str()),
             Some("add_prop")
         );
         assert_eq!(file.slabs.len(), 1);
