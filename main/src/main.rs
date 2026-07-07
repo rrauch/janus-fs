@@ -10,7 +10,7 @@ use sia_io::renterd::BucketName;
 use sia_io::renterd::client::ApiPassword;
 use sia_nfs::SiaNfs;
 use sia_vfs::vfs::config::Config;
-use sia_vfs::vfs::{BranchName, Head, TagName, Vfs};
+use sia_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -385,6 +385,10 @@ async fn scan(sia: sia_io::Client) -> anyhow::Result<()> {
     println!();
 
     for config in configs {
+        println!(
+            "{}---------------------------------------------------------------------------",
+            INDENT
+        );
         print_config(&config, INDENT);
     }
 
@@ -459,8 +463,51 @@ async fn create_fs(sia: sia_io::Client, args: FsCreateArgs) -> anyhow::Result<()
     Ok(())
 }
 
-async fn delete_fs(_sia: sia_io::Client, _args: FsDeleteArgs) -> anyhow::Result<()> {
-    todo!()
+async fn delete_fs(sia: sia_io::Client, args: FsDeleteArgs) -> anyhow::Result<()> {
+    let vfs_id = VfsId::from_str(args.vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
+    action_preview(
+        "Delete File System",
+        Some("File System will be permanently deleted! All data will be erased!"),
+        &sia,
+    );
+
+    let configs = Vfs::scan(&sia).await?;
+
+    if let Some(config) = configs.into_iter().find(|c| c.vfs_id() == &vfs_id) {
+        print_config(&config, "    ");
+        println!();
+    } else {
+        println!();
+        println!(
+            "{} {}",
+            "No File System Config found with ID".yellow().bold(),
+            &vfs_id
+        );
+        println!(
+            "{}", "Abandoned Objects associated with the File System might still be present and can be deleted".yellow(),
+        );
+        println!();
+    }
+
+    if !ask_proceed().await {
+        println!(" ❌ {}", "Aborting".red());
+        println!();
+        return Ok(());
+    }
+
+    let deleted_objects = Vfs::delete_fs(&vfs_id, &sia).await?;
+    if deleted_objects == 0 {
+        println!();
+        println!(" ❌ {}", "No objects found to delete".red().bold());
+        println!();
+        bail!("File System deletion failed");
+    }
+    println!();
+    println!("{} ✅", "File System Deletion Complete".green().bold());
+    println!("{} {}", "Objects deleted:".bold(), deleted_objects);
+    println!();
+
+    Ok(())
 }
 
 fn action_preview(action: impl AsRef<str>, details: Option<&str>, sia: &sia_io::Client) {
