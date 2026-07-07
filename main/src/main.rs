@@ -9,6 +9,7 @@ use sia_io::indexd::{AppDetails, AppId};
 use sia_io::renterd::BucketName;
 use sia_io::renterd::client::ApiPassword;
 use sia_nfs::SiaNfs;
+use sia_vfs::vfs::commit::CommitId;
 use sia_vfs::vfs::config::Config;
 use sia_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
 use std::num::ParseIntError;
@@ -109,6 +110,16 @@ enum Command {
         #[command(subcommand)]
         command: FsCommand,
     },
+    /// Branch management commands.
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
+    /// Tag management commands.
+    Tag {
+        #[command(subcommand)]
+        command: TagCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -129,6 +140,64 @@ struct FsCreateArgs {
 #[derive(Debug, Args)]
 struct FsDeleteArgs {
     /// ID of file system to permanently delete.
+    vfs_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum BranchCommand {
+    /// Create a new Branch.
+    Create(BranchCreateArgs),
+    /// Delete an existing Branch (dangerous).
+    Delete(BranchDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct BranchCreateArgs {
+    /// Name of new branch
+    name: String,
+    /// Optional description of new branch.
+    #[arg(long)]
+    description: Option<String>,
+    /// ID of file system.
+    vfs_id: String,
+    /// Commit ID associated with new branch.
+    commit: String,
+}
+
+#[derive(Debug, Args)]
+struct BranchDeleteArgs {
+    /// Name of branch to delete.
+    name: String,
+    /// ID of file system.
+    vfs_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum TagCommand {
+    /// Create a new Tag.
+    Create(TagCreateArgs),
+    /// Delete an existing Tag (dangerous).
+    Delete(TagDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+struct TagCreateArgs {
+    /// Name of new tag.
+    name: String,
+    /// Optional description of new tag.
+    #[arg(long)]
+    description: Option<String>,
+    /// ID of file system.
+    vfs_id: String,
+    /// Commit ID associated with new tag.
+    commit: String,
+}
+
+#[derive(Debug, Args)]
+struct TagDeleteArgs {
+    /// Name of tag to delete.
+    name: String,
+    /// ID of file system.
     vfs_id: String,
 }
 
@@ -206,6 +275,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Fs {
             command: FsCommand::Delete(args),
         } => delete_fs(sia, args).await?,
+        Command::Branch {
+            command: BranchCommand::Create(args),
+        } => create_branch(sia, args).await?,
+        Command::Branch {
+            command: BranchCommand::Delete(args),
+        } => delete_branch(sia, args).await?,
+        Command::Tag {
+            command: TagCommand::Create(args),
+        } => create_tag(sia, args).await?,
+        Command::Tag {
+            command: TagCommand::Delete(args),
+        } => delete_tag(sia, args).await?,
     }
 
     Ok(())
@@ -398,12 +479,11 @@ async fn scan(sia: sia_io::Client) -> anyhow::Result<()> {
 fn print_config(config: &Config, indent: &str) {
     println!("{}{}", indent, "VFS ID:".bold());
     println!("{}{}", indent, config.vfs_id());
-    println!();
     if let Some(description) = config.description() {
-        println!("{}{}", indent, "DESCRIPTION:".bold());
         println!("{}{}", indent, description);
         println!();
     }
+    println!();
     println!("{}{}", indent, "LAST MODIFIED:".bold());
     println!("{}{}", indent, config.last_modified());
     println!();
@@ -422,12 +502,10 @@ fn print_config(config: &Config, indent: &str) {
                 println!("{}{} ({})", indent, name, entry.commit_id());
             }
         }
-        println!();
         if let Some(description) = entry.description() {
-            println!("{}{}", indent, "DESCRIPTION:".bold());
             println!("{}{}", indent, description);
-            println!();
         }
+        println!();
         println!();
     }
 }
@@ -506,6 +584,158 @@ async fn delete_fs(sia: sia_io::Client, args: FsDeleteArgs) -> anyhow::Result<()
     println!("{} ✅", "File System Deletion Complete".green().bold());
     println!("{} {}", "Objects deleted:".bold(), deleted_objects);
     println!();
+
+    Ok(())
+}
+
+async fn create_branch(sia: sia_io::Client, args: BranchCreateArgs) -> anyhow::Result<()> {
+    let branch_name = BranchName::from_str(args.name.as_str())?;
+    create_head(
+        sia,
+        branch_name.into(),
+        args.description,
+        args.vfs_id,
+        args.commit,
+    )
+    .await
+}
+
+async fn create_tag(sia: sia_io::Client, args: TagCreateArgs) -> anyhow::Result<()> {
+    let tag_name = TagName::from_str(args.name.as_str())?;
+    create_head(
+        sia,
+        tag_name.into(),
+        args.description,
+        args.vfs_id,
+        args.commit,
+    )
+    .await
+}
+
+async fn create_head(
+    sia: sia_io::Client,
+    head: Head,
+    description: Option<String>,
+    vfs_id: String,
+    commit_id: String,
+) -> anyhow::Result<()> {
+    let vfs_id = VfsId::from_str(vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
+    let commit_id =
+        CommitId::from_str(commit_id.as_str()).map_err(|_| anyhow!("invalid commit id"))?;
+
+    let title = match &head {
+        Head::Branch(_) => "Create New Branch",
+        Head::Tag(_) => "Create New Tag",
+    };
+    action_preview(title, None, &sia);
+
+    const INDENT: &str = "    ";
+
+    match &head {
+        Head::Branch(name) => {
+            println!("{}{}", INDENT, "NEW BRANCH NAME:".bold());
+            println!("{}{}", INDENT, name);
+        }
+        Head::Tag(name) => {
+            println!("{}{}", INDENT, "NEW TAG NAME:".bold());
+            println!("{}{}", INDENT, name);
+        }
+    }
+    println!();
+    if let Some(description) = &description {
+        println!("{}{}", INDENT, "DESCRIPTION:".bold());
+        println!("{}{}", INDENT, description);
+        println!();
+    }
+
+    println!("{}{}", INDENT, "VFS-ID:".bold());
+    println!("{}{}", INDENT, &vfs_id);
+    println!();
+
+    println!("{}{}", INDENT, "COMMIT-ID:".bold());
+    println!("{}{}", INDENT, &commit_id);
+    println!();
+
+    if !ask_proceed().await {
+        println!(" ❌ {}", "Aborting".red());
+        println!();
+        return Ok(());
+    }
+
+    let config = match head {
+        Head::Branch(branch_name) => {
+            Vfs::create_branch(&vfs_id, &sia, branch_name, description, commit_id).await?
+        }
+        Head::Tag(tag_name) => {
+            Vfs::create_tag(&vfs_id, &sia, tag_name, description, commit_id).await?
+        }
+    };
+
+    println!();
+    println!("{} ✅", "Creation Complete".green().bold());
+    println!();
+
+    print_config(&config, INDENT);
+
+    Ok(())
+}
+
+async fn delete_branch(sia: sia_io::Client, args: BranchDeleteArgs) -> anyhow::Result<()> {
+    let branch_name = BranchName::from_str(args.name.as_str())?;
+    delete_head(sia, branch_name.into(), args.vfs_id).await
+}
+
+async fn delete_tag(sia: sia_io::Client, args: TagDeleteArgs) -> anyhow::Result<()> {
+    let tag_name = TagName::from_str(args.name.as_str())?;
+    delete_head(sia, tag_name.into(), args.vfs_id).await
+}
+
+async fn delete_head(sia: sia_io::Client, head: Head, vfs_id: String) -> anyhow::Result<()> {
+    let vfs_id = VfsId::from_str(vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
+
+    let title = match &head {
+        Head::Branch(_) => "Delete Branch",
+        Head::Tag(_) => "Delete Tag",
+    };
+    action_preview(
+        title,
+        Some("Permanently delete the selected branch/tag"),
+        &sia,
+    );
+
+    const INDENT: &str = "    ";
+
+    match &head {
+        Head::Branch(name) => {
+            println!("{}{}", INDENT, "BRANCH NAME:".bold());
+            println!("{}{}", INDENT, name);
+        }
+        Head::Tag(name) => {
+            println!("{}{}", INDENT, "TAG NAME:".bold());
+            println!("{}{}", INDENT, name);
+        }
+    }
+    println!();
+    println!("{}{}", INDENT, "VFS-ID:".bold());
+    println!("{}{}", INDENT, &vfs_id);
+    println!();
+
+    if !ask_proceed().await {
+        println!(" ❌ {}", "Aborting".red());
+        println!();
+        return Ok(());
+    }
+
+    let config = match head {
+        Head::Branch(branch_name) => Vfs::delete_branch(&vfs_id, &sia, branch_name).await?,
+        Head::Tag(tag_name) => Vfs::delete_tag(&vfs_id, &sia, tag_name).await?,
+    };
+
+    println!();
+    println!("{} ✅", "Deletion Complete".green().bold());
+    println!();
+
+    print_config(&config, INDENT);
 
     Ok(())
 }

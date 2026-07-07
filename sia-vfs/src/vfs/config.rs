@@ -12,7 +12,9 @@ use crate::vfs::commit::CommitId;
 use crate::vfs::directory::DirectoryKind;
 use crate::vfs::entity::{Entity, EntityId, EntityKey, Revision};
 use crate::vfs::file::FileKind;
-use crate::vfs::{BranchName, Head, Name, ROOT_INODE_ID, StorageMode, TagName, Timestamp, VfsId};
+use crate::vfs::{
+    BranchName, Head, Name, ROOT_INODE_ID, StorageMode, TagName, Timestamp, Vfs, VfsError, VfsId,
+};
 use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
@@ -848,11 +850,132 @@ impl FileOrDir {
     }
 }
 
+impl Vfs {
+    pub async fn create_branch(
+        vfs_id: &VfsId,
+        sia_client: &Sia,
+        branch_name: BranchName,
+        description: Option<String>,
+        commit_id: CommitId,
+    ) -> Result<Config, VfsError> {
+        Self::create_head(
+            vfs_id,
+            sia_client,
+            branch_name.into(),
+            description,
+            commit_id,
+        )
+        .await
+    }
+
+    pub async fn create_tag(
+        vfs_id: &VfsId,
+        sia_client: &Sia,
+        tag_name: TagName,
+        description: Option<String>,
+        commit_id: CommitId,
+    ) -> Result<Config, VfsError> {
+        Self::create_head(vfs_id, sia_client, tag_name.into(), description, commit_id).await
+    }
+
+    async fn create_head(
+        vfs_id: &VfsId,
+        sia_client: &Sia,
+        head: Head,
+        description: Option<String>,
+        commit_id: CommitId,
+    ) -> Result<Config, VfsError> {
+        let mut config: ConfigMut = Vfs::scan(sia_client)
+            .await?
+            .into_iter()
+            .find(|c| c.vfs_id() == vfs_id)
+            .ok_or_else(|| VfsError::Other("vfs not found".to_string()))?
+            .into();
+        if config.heads.contains_key(&head) {
+            return Err(VfsError::Other(
+                "head already exists, cannot create".to_string(),
+            ));
+        }
+
+        if config
+            .heads
+            .values()
+            .map(|e| &e.commit_id)
+            .find(|c| &&commit_id == c)
+            .is_none()
+        {
+            return Err(VfsError::Other("commit not found".to_string()));
+        }
+
+        config.heads.insert(
+            head,
+            OwnedEntry {
+                description,
+                commit_id,
+            },
+        );
+        config.last_modified = Timestamp::now();
+
+        let config = config.freeze();
+
+        sia_client
+            .upload(config.to_uploadable_object(vfs_id))
+            .await
+            .map_err(std::io::Error::other)?;
+
+        Ok(config)
+    }
+
+    pub async fn delete_branch(
+        vfs_id: &VfsId,
+        sia_client: &Sia,
+        branch_name: BranchName,
+    ) -> Result<Config, VfsError> {
+        let head = Head::from(branch_name);
+        Self::delete_head(vfs_id, sia_client, &head).await
+    }
+
+    pub async fn delete_tag(
+        vfs_id: &VfsId,
+        sia_client: &Sia,
+        tag_name: TagName,
+    ) -> Result<Config, VfsError> {
+        let head = Head::from(tag_name);
+        Self::delete_head(vfs_id, sia_client, &head).await
+    }
+
+    async fn delete_head(
+        vfs_id: &VfsId,
+        sia_client: &Sia,
+        head: &Head,
+    ) -> Result<Config, VfsError> {
+        let mut config: ConfigMut = Vfs::scan(sia_client)
+            .await?
+            .into_iter()
+            .find(|c| c.vfs_id() == vfs_id)
+            .ok_or_else(|| VfsError::Other("vfs not found".to_string()))?
+            .into();
+        if config.heads.remove(&head).is_none() {
+            return Err(VfsError::Other("head not found in vfs config".to_string()));
+        };
+        config.last_modified = Timestamp::now();
+        let config = config.freeze();
+
+        sia_client
+            .upload(config.to_uploadable_object(vfs_id))
+            .await
+            .map_err(std::io::Error::other)?;
+
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::vfs::commit::CommitId;
     use crate::vfs::config::{ConfigMut, OwnedEntry};
-    use crate::vfs::{BranchName, Head, TagName, Timestamp, VfsId};
+    use crate::vfs::{BranchName, Head, TagName, Timestamp, Vfs, VfsId};
+    use sia_io::Client as Sia;
     use std::str::FromStr;
 
     #[test]
@@ -904,6 +1027,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&commit_id2, &commit_id1] //sort order check
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_delete_branch() -> anyhow::Result<()> {
+        create_delete_head(BranchName::from_str("branch1")?.into()).await
+    }
+
+    #[tokio::test]
+    async fn create_delete_tag() -> anyhow::Result<()> {
+        create_delete_head(TagName::from_str("tag1")?.into()).await
+    }
+
+    async fn create_delete_head(head: Head) -> anyhow::Result<()> {
+        let sia_client = Sia::mock().await;
+        let vfs_id = Vfs::create_new(None, &sia_client).await?;
+        let config = Vfs::scan(&sia_client)
+            .await?
+            .into_iter()
+            .find(|c| c.vfs_id() == &vfs_id)
+            .unwrap();
+
+        let main = BranchName::default().into();
+        let commit = config
+            .heads()
+            .get(&main)
+            .map(|e| e.commit_id.clone())
+            .unwrap();
+
+        let config =
+            Vfs::create_head(&vfs_id, &sia_client, head.clone(), None, commit.clone()).await?;
+        assert_eq!(config.heads().get(&head).unwrap().commit_id(), &commit);
+
+        let config = Vfs::delete_head(&vfs_id, &sia_client, &head).await?;
+        assert!(!config.heads().contains_key(&head));
 
         Ok(())
     }
