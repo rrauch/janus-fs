@@ -245,14 +245,6 @@ enum ConfiguredBackend {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(Level::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
-
     let mut arguments = Arguments::parse();
 
     tokio::fs::create_dir_all(&arguments.data_dir).await?;
@@ -400,6 +392,14 @@ async fn build_cache(args: &CacheArgs, data_dir: &PathBuf) -> anyhow::Result<sia
 }
 
 async fn serve(sia: sia_io::Client, data_dir: &PathBuf, args: ServeArgs) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(Level::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+
     let head = match (args.branch, args.tag) {
         (Some(branch), None) => Some(Head::from(BranchName::from_str(branch.as_str())?)),
         (None, Some(tag)) => Some(Head::from(TagName::from_str(tag.as_str())?)),
