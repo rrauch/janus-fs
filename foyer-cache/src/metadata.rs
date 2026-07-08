@@ -3,16 +3,18 @@ use crate::disk_cache::{DiskCache, Error};
 use async_trait::async_trait;
 use bon::bon;
 use equivalent::Equivalent;
-use serde::{Deserialize, Serialize};
 #[cfg(feature = "indexd")]
-use sia_io::SealedObject;
-use sia_io::cache::metadata::L2MetadataCache;
+use janus_io::SealedObject;
+use janus_io::cache::metadata::L2MetadataCache;
 #[cfg(feature = "indexd")]
-use sia_io::indexd::object::ObjectId;
-use sia_io::renterd::FileKind;
-use sia_io::renterd::object::ObjectShadow;
+use janus_io::indexd::object::ObjectId;
 #[cfg(feature = "renterd")]
-use sia_io::renterd::object::{File, FileId};
+use janus_io::renterd::FileKind;
+#[cfg(feature = "renterd")]
+use janus_io::renterd::object::ObjectShadow;
+#[cfg(feature = "renterd")]
+use janus_io::renterd::object::{File, FileId};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const COMPAT_FILE_CONTENT_TYPE: &str = "sia-io/cache/metadata";

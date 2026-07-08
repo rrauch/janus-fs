@@ -3,8 +3,8 @@ use crate::disk_cache::{DiskCache, Error};
 use async_trait::async_trait;
 use bon::bon;
 use equivalent::Equivalent;
-use sia_io::cache::chunk::L2ChunkCache;
-use sia_io::chunk::{Chunk, ChunkId};
+use janus_io::cache::chunk::L2ChunkCache;
+use janus_io::chunk::{Chunk, ChunkId};
 use std::path::Path;
 
 const COMPAT_FILE_CONTENT_TYPE: &str = "sia-io/cache/chunk";
