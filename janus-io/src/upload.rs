@@ -1,6 +1,6 @@
 use crate::cache::Cache;
 use crate::object::{Object, ObjectId};
-use crate::{Backend, Client, Metadata, MetadataSource};
+use crate::{Backend, RemoteStorage, Metadata, MetadataSource};
 use futures_io::AsyncRead;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -231,7 +231,7 @@ impl<'a> MultiUploader<'a> {
     }
 }
 
-impl Client {
+impl RemoteStorage {
     #[inline]
     pub fn prepare_multi_upload<'a>(&self) -> Result<MultiUploader<'a>, crate::Error> {
         let inner = match &self.backend {

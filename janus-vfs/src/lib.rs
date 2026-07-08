@@ -201,7 +201,7 @@ pub(crate) mod tests {
     use crate::vfs::path::VfsPath;
     use crate::vfs::{Inode, Vfs};
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    use janus_io::Client as Sia;
+    use janus_io::RemoteStorage;
     use std::io::SeekFrom;
     use std::num::NonZero;
     use tempfile::tempdir;
@@ -210,15 +210,15 @@ pub(crate) mod tests {
     async fn full_tree_test() -> anyhow::Result<()> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
-        let sia_client = Sia::mock().await;
+        let remote_storage = RemoteStorage::mock().await;
 
         // create a new vfs & upload to network
-        let vfs_id = Vfs::create_new(None, &sia_client).await?;
+        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
 
         // instantiate vfs + initial sync from network
         let vfs = Vfs::builder()
             .vfs_id(vfs_id.clone())
-            .sia_client(sia_client.clone())
+            .remote_storage(remote_storage.clone())
             .db_file(path.clone())
             .max_sync_concurrency(NonZero::new(1).unwrap())
             .build()
@@ -266,7 +266,7 @@ pub(crate) mod tests {
 
         let vfs = Vfs::builder()
             .vfs_id(vfs_id)
-            .sia_client(sia_client)
+            .remote_storage(remote_storage)
             .db_file(path)
             .max_sync_concurrency(NonZero::new(1).unwrap())
             .build()

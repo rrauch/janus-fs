@@ -13,9 +13,9 @@ use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
-use janus_io::Client as Sia;
-use janus_io::object::Object as SiaObject;
-use janus_io::object::ObjectId as SiaObjectId;
+use janus_io::RemoteStorage;
+use janus_io::object::Object as RemoteObject;
+use janus_io::object::ObjectId as RemoteObjectId;
 use janus_io::upload::UploadableObject;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -46,11 +46,11 @@ pub struct Blob {
 impl Blob {
     pub(crate) async fn load_from_backend(
         object_id: ObjectId,
-        sia_oid: &SiaObjectId,
-        sia_client: &Sia,
+        remote_oid: &RemoteObjectId,
+        remote_storage: &RemoteStorage,
     ) -> Result<Self, std::io::Error> {
-        let dl = sia_client
-            .download(sia_oid)
+        let dl = remote_storage
+            .download(remote_oid)
             .await
             .map_err(std::io::Error::other)?;
 
@@ -211,7 +211,7 @@ impl BlobMut {
 }
 
 fn hash(chunk_map: &ChunkMap) -> BlobId {
-    let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[blob_id]");
+    let mut hasher = blake3::Hasher::new_derive_key("[janus-vfs]/[v1]/[blob_id]");
     chunk_map.hash(&mut hasher);
     BlobId::new_internal(hasher.finalize())
 }
@@ -225,9 +225,9 @@ impl Vfs {
 impl PullTask {
     pub(crate) async fn blob_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         blob_id: &str,
-        sia_object: &SiaObject,
+        remote_object: &RemoteObject,
         object_id: ObjectId,
     ) -> Result<(), SyncError>
     where
@@ -235,7 +235,7 @@ impl PullTask {
     {
         let blob_id = BlobId::try_from_str(blob_id).ok_or_else(|| BlobError::InvalidBlobId)?;
 
-        let blob = Blob::load_from_backend(object_id, sia_object.id(), sia_client).await?;
+        let blob = Blob::load_from_backend(object_id, remote_object.id(), remote_storage).await?;
 
         tx.register_blob(&blob).await.map_err(VfsError::DbError)?;
 
@@ -278,7 +278,7 @@ impl PushTask {
     pub(crate) async fn process_blob<TX: TxScope>(
         &mut self,
         blob: Blob,
-        object: SiaObject,
+        object: RemoteObject,
         tx: &mut Transaction<TX>,
     ) -> Result<(), Error>
     where

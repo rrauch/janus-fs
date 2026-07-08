@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
-pub(crate) const METADATA_VFS_VERSION: &'static str = "SIA-VFS";
+pub(crate) const METADATA_VFS_VERSION: &'static str = "JANUS-VFS";
 pub(crate) const METADATA_VFS_ID: &'static str = "VFS-ID";
 
 static SYNC_SEMAPHORE: Semaphore = Semaphore::const_new(1);
@@ -30,7 +30,7 @@ pub enum Error {
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]
-    SiaError(#[from] janus_io::Error),
+    JanusRemoteError(#[from] janus_io::Error),
     #[error(transparent)]
     EntityError(#[from] EntityError),
     #[error("chunk_id invalid")]

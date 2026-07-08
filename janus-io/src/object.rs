@@ -6,7 +6,7 @@ use crate::indexd;
 use crate::mock;
 #[cfg(feature = "renterd")]
 use crate::renterd;
-use crate::{Backend, Client, ETag, Metadata, MimeType};
+use crate::{Backend, ETag, Metadata, MimeType, RemoteStorage};
 use chrono::{DateTime, Utc};
 use futures_io::{AsyncRead, AsyncSeek};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
@@ -25,8 +25,8 @@ use std::{fmt, iter};
 use thiserror::Error;
 use twox_hash::XxHash3_64;
 
-const VERSION_HASH_PREFIX: &[u8] = b"_SIA_OBJECT_VERSION_BEGIN_\n";
-const VERSION_HASH_SUFFIX: &[u8] = b"\n_SIA_OBJECT_VERSION_END_";
+const VERSION_HASH_PREFIX: &[u8] = b"_JANUS_OBJECT_VERSION_BEGIN_\n";
+const VERSION_HASH_SUFFIX: &[u8] = b"\n_JANUS_OBJECT_VERSION_END_";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectId {
@@ -735,7 +735,7 @@ struct IterHolder<K: 'static> {
     iter: papaya::Iter<'this, K, (), papaya::OwnedGuard<'this>>,
 }
 
-impl Client {
+impl RemoteStorage {
     pub fn list_objects(
         &self,
     ) -> impl TryStream<Ok = Object, Error = crate::Error> + Send + Unpin + '_ {

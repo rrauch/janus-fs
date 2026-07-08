@@ -20,9 +20,9 @@ use derive_where::derive_where;
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer, UnionWIPOffset, WIPOffset};
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
-use janus_io::Client as Sia;
-use janus_io::object::Object as SiaObject;
-use janus_io::object::ObjectId as SiaObjectId;
+use janus_io::RemoteStorage;
+use janus_io::object::Object as RemoteObject;
+use janus_io::object::ObjectId as RemoteObjectId;
 use janus_io::upload::UploadableObject;
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -133,11 +133,11 @@ pub type SyncedEntity<T> = RawEntity<T, SyncedMode>;
 impl<T: EntityHandler> SyncedEntity<T> {
     pub(crate) async fn load_from_backend(
         object_id: ObjectId,
-        sia_oid: &SiaObjectId,
-        sia_client: &Sia,
+        remote_oid: &RemoteObjectId,
+        remote_storage: &RemoteStorage,
     ) -> Result<Self, std::io::Error> {
-        let dl = sia_client
-            .download(sia_oid)
+        let dl = remote_storage
+            .download(remote_oid)
             .await
             .map_err(std::io::Error::other)?;
 
@@ -601,8 +601,8 @@ where
                 Some(object_id) => {
                     // synced entity
                     let object = self.object_by_id(object_id).await?.ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                    let sia_oid = object.try_to_sia_oid().ok_or_else(|| DataError::ConversionError("invalid remote_location".into()))?;
-                    Ok::<_, DbError>(Some(Entity::Synced(SyncedEntity::<T>::load_from_backend(object_id, &sia_oid, self.sia_client()).await?)))
+                    let remote_oid = object.try_to_remote_oid().ok_or_else(|| DataError::ConversionError("invalid remote_location".into()))?;
+                    Ok::<_, DbError>(Some(Entity::Synced(SyncedEntity::<T>::load_from_backend(object_id, &remote_oid, self.remote_storage()).await?)))
                 }
                 None => {
                     // local entity
@@ -735,8 +735,8 @@ impl<T: EntityHandler> TryFrom<EntityRow> for LocalEntity<T> {
 
 impl PullTask {
     pub(crate) async fn sort_entities(
-        objects: &mut Vec<SiaObject>,
-        sia_client: &Sia,
+        objects: &mut Vec<RemoteObject>,
+        remote_storage: &RemoteStorage,
     ) -> Result<(), SyncError> {
         const MAX_DEPTH: usize = 1024;
 
@@ -746,10 +746,10 @@ impl PullTask {
         }
 
         let mut dirs: HashMap<EntityKey, DirInfo> = HashMap::new();
-        let mut key_of: HashMap<SiaObjectId, EntityKey> = HashMap::new();
+        let mut key_of: HashMap<RemoteObjectId, EntityKey> = HashMap::new();
 
-        for sia_object in objects.iter() {
-            let metadata: object::metadata::Metadata = sia_object
+        for remote_object in objects.iter() {
+            let metadata: object::metadata::Metadata = remote_object
                 .metadata()
                 .try_into()
                 .expect("metadata conversion to never fail");
@@ -762,13 +762,13 @@ impl PullTask {
 
             let dir = SyncedEntity::<DirectoryKind>::load_from_backend(
                 0u64.into(),
-                sia_object.id(),
-                sia_client,
+                remote_object.id(),
+                remote_storage,
             )
             .await?;
 
             let key = EntityKey::new(dir.entity_id().clone(), dir.revision().clone());
-            key_of.insert(sia_object.id().clone(), key);
+            key_of.insert(remote_object.id().clone(), key);
             dirs.insert(
                 key,
                 DirInfo {
@@ -817,10 +817,10 @@ impl PullTask {
 
     pub(crate) async fn entity_sync<T: EntityHandler, TX: TxScope>(
         tx: &mut Transaction<TX>,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         entity_id: &str,
         rev: &str,
-        sia_object: &SiaObject,
+        remote_object: &RemoteObject,
         object_id: ObjectId,
     ) -> Result<(), SyncError>
     where
@@ -830,7 +830,8 @@ impl PullTask {
         let rev = Revision::try_from_str(rev).ok_or_else(|| EntityError::InvalidRevision)?;
 
         let entity =
-            SyncedEntity::<T>::load_from_backend(object_id, sia_object.id(), sia_client).await?;
+            SyncedEntity::<T>::load_from_backend(object_id, remote_object.id(), remote_storage)
+                .await?;
 
         let entity_key = tx
             .register_entity(entity)
@@ -885,7 +886,7 @@ impl PushTask {
     pub(crate) async fn process_entity<E: EntityHandler, TX: TxScope>(
         &mut self,
         entity: LocalEntity<E>,
-        object: SiaObject,
+        object: RemoteObject,
         tx: &mut Transaction<TX>,
     ) -> Result<(), Error>
     where

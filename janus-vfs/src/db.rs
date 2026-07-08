@@ -6,7 +6,7 @@ use crate::vfs::commit::CommitId;
 use crate::vfs::directory::{DirectoryBody, DirectoryMut};
 use crate::vfs::entity::{EntityId, EntityKey, Revision};
 use crate::vfs::{BranchName, Head, Inode, InodeId};
-use janus_io::Client as Sia;
+use janus_io::RemoteStorage;
 use sqlx::migrate::MigrateError;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -89,7 +89,7 @@ pub enum DataError {
     HeadEntryNotFound(Head),
 }
 
-pub struct ReadOnly(PoolConnection<Sqlite>, Arc<Sia>);
+pub struct ReadOnly(PoolConnection<Sqlite>, Arc<RemoteStorage>);
 
 impl AsMut<SqliteConnection> for ReadOnly {
     fn as_mut(&mut self) -> &mut SqliteConnection {
@@ -100,7 +100,7 @@ impl AsMut<SqliteConnection> for ReadOnly {
 pub struct ReadWrite(
     SqlxTransaction<'static, Sqlite>,
     Cache,
-    Arc<Sia>,
+    Arc<RemoteStorage>,
     Option<BranchName>,
 );
 
@@ -117,17 +117,17 @@ pub(crate) trait Read: AsMut<SqliteConnection> {
         self.as_mut()
     }
 
-    fn sia_client(&self) -> &Sia;
+    fn remote_storage(&self) -> &RemoteStorage;
 }
 impl Read for Transaction<ReadOnly> {
-    fn sia_client(&self) -> &Sia {
+    fn remote_storage(&self) -> &RemoteStorage {
         &self.0.1
     }
 }
 
 pub(crate) trait Write: Read {}
 impl Read for Transaction<ReadWrite> {
-    fn sia_client(&self) -> &Sia {
+    fn remote_storage(&self) -> &RemoteStorage {
         &self.0.2
     }
 }
@@ -350,23 +350,26 @@ struct SqlitePool {
 }
 
 impl SqlitePool {
-    async fn read(&self, sia_client: Arc<Sia>) -> Result<Transaction<ReadOnly>, SqlxError> {
+    async fn read(
+        &self,
+        remote_storage: Arc<RemoteStorage>,
+    ) -> Result<Transaction<ReadOnly>, SqlxError> {
         Ok(Transaction(ReadOnly(
             self.reader.acquire().await?,
-            sia_client,
+            remote_storage,
         )))
     }
 
     async fn write(
         &self,
         cache: Cache,
-        sia_client: Arc<Sia>,
+        remote_storage: Arc<RemoteStorage>,
         branch_name: Option<BranchName>,
     ) -> Result<Transaction<ReadWrite>, SqlxError> {
         Ok(Transaction(ReadWrite(
             self.writer.begin().await?,
             cache,
-            sia_client,
+            remote_storage,
             branch_name,
         )))
     }
@@ -376,7 +379,7 @@ impl SqlitePool {
 struct DbInner {
     pool: Option<SqlitePool>,
     cache: Cache,
-    sia_client: Arc<Sia>,
+    remote_storage: Arc<RemoteStorage>,
     head: Head,
 }
 
@@ -446,13 +449,17 @@ impl Db {
         max_connections: u8,
         page_size: PageSize,
         cache: Cache,
-        sia_client: Arc<Sia>,
+        remote_storage: Arc<RemoteStorage>,
         head: Head,
     ) -> Result<Self, Error> {
         let pool = db_init(db_file.as_path(), max_connections, page_size).await?;
 
         let mut tx = pool
-            .write(cache.clone(), sia_client.clone(), head.maybe_branch_name())
+            .write(
+                cache.clone(),
+                remote_storage.clone(),
+                head.maybe_branch_name(),
+            )
             .await?;
         tx.housekeeping().await?;
         tx.commit().await?;
@@ -460,7 +467,7 @@ impl Db {
         Ok(Self(Arc::new(DbInner {
             pool: Some(pool),
             cache,
-            sia_client,
+            remote_storage,
             head,
         })))
     }
@@ -471,7 +478,7 @@ impl Db {
             .pool
             .as_ref()
             .ok_or_else(|| DbStateError::PoolIsClosed)?
-            .read(self.0.sia_client.clone())
+            .read(self.0.remote_storage.clone())
             .await?)
     }
 
@@ -483,7 +490,7 @@ impl Db {
             .ok_or_else(|| DbStateError::PoolIsClosed)?
             .write(
                 self.0.cache.clone(),
-                self.0.sia_client.clone(),
+                self.0.remote_storage.clone(),
                 self.0.head.maybe_branch_name(),
             )
             .await?;

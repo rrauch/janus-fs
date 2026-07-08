@@ -7,7 +7,7 @@ use crate::vfs::file::FileKind;
 use crate::vfs::{Timestamp, Vfs, VfsResult, commit, config, entity};
 use crate::{blob, chunk, object};
 use futures_util::{StreamExt, TryStream, TryStreamExt, stream};
-use janus_io::object::Object as SiaObject;
+use janus_io::object::Object as RemoteObject;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -38,25 +38,25 @@ impl PullTask {
         let mut configs = vec![];
 
         let mut stream = self.vfs.backend_objects().await?;
-        while let Some(sia_object) = stream.try_next().await? {
-            let metadata: Metadata = sia_object
+        while let Some(remote_object) = stream.try_next().await? {
+            let metadata: Metadata = remote_object
                 .metadata()
                 .try_into()
                 .expect("metadata conversion to never fail");
 
             match metadata.get(object::METADATA_VFS_OBJECT_TYPE) {
-                Some(chunk::METADATA_OBJECT_TYPE) => chunks.push(sia_object),
-                Some(blob::METADATA_OBJECT_TYPE) => blobs.push(sia_object),
-                Some(entity::METADATA_OBJECT_TYPE) => entities.push(sia_object),
-                Some(commit::METADATA_OBJECT_TYPE) => commits.push(sia_object),
-                Some(config::METADATA_OBJECT_TYPE) => configs.push(sia_object),
+                Some(chunk::METADATA_OBJECT_TYPE) => chunks.push(remote_object),
+                Some(blob::METADATA_OBJECT_TYPE) => blobs.push(remote_object),
+                Some(entity::METADATA_OBJECT_TYPE) => entities.push(remote_object),
+                Some(commit::METADATA_OBJECT_TYPE) => commits.push(remote_object),
+                Some(config::METADATA_OBJECT_TYPE) => configs.push(remote_object),
                 _ => {} // ignore
             }
         }
 
         // Some entities depend on others being created first (e.g. children before
         // their parent directory), so reorder them to respect those dependencies.
-        Self::sort_entities(&mut entities, self.vfs.sia_client()).await?;
+        Self::sort_entities(&mut entities, self.vfs.remote_storage()).await?;
 
         for group in [chunks, blobs, entities, commits, configs] {
             let processed = self.process_objects(group).await;
@@ -73,8 +73,8 @@ impl PullTask {
         Ok(())
     }
 
-    async fn process_objects(&self, sia_objects: Vec<SiaObject>) -> Vec<ObjectId> {
-        stream::iter(sia_objects)
+    async fn process_objects(&self, remote_objects: Vec<RemoteObject>) -> Vec<ObjectId> {
+        stream::iter(remote_objects)
             .map(|obj| self.sync_object(obj))
             .buffer_unordered(self.max_concurrency)
             .filter_map(|res| async move {
@@ -91,8 +91,8 @@ impl PullTask {
             .await
     }
 
-    async fn sync_object(&self, sia_object: SiaObject) -> Result<ObjectId, Error> {
-        let remote_location = sia_object.id().to_string();
+    async fn sync_object(&self, remote_object: RemoteObject) -> Result<ObjectId, Error> {
+        let remote_location = remote_object.id().to_string();
         let mut tx = self.vfs.tx_rw().await?;
         let id = match tx
             .create_or_mark_object(&remote_location, Timestamp::now())
@@ -100,7 +100,7 @@ impl PullTask {
         {
             ObjectCreateResult::Existing(existing) => existing.id(),
             ObjectCreateResult::New(id) => {
-                let metadata: Metadata = sia_object
+                let metadata: Metadata = remote_object
                     .metadata()
                     .try_into()
                     .expect("metadata conversion to never fail");
@@ -119,10 +119,10 @@ impl PullTask {
                             ) => {
                                 Self::entity_sync::<FileKind, _>(
                                     &mut tx,
-                                    self.vfs.sia_client(),
+                                    self.vfs.remote_storage(),
                                     entity_id,
                                     rev,
-                                    &sia_object,
+                                    &remote_object,
                                     id,
                                 )
                                 .await?;
@@ -134,10 +134,10 @@ impl PullTask {
                             ) => {
                                 Self::entity_sync::<DirectoryKind, _>(
                                     &mut tx,
-                                    self.vfs.sia_client(),
+                                    self.vfs.remote_storage(),
                                     entity_id,
                                     rev,
-                                    &sia_object,
+                                    &remote_object,
                                     id,
                                 )
                                 .await?;
@@ -149,9 +149,9 @@ impl PullTask {
                         if let Some(blob_id) = metadata.get(blob::METADATA_BLOB_ID) {
                             Self::blob_sync(
                                 &mut tx,
-                                self.vfs.sia_client(),
+                                self.vfs.remote_storage(),
                                 blob_id,
-                                &sia_object,
+                                &remote_object,
                                 id,
                             )
                             .await?;
@@ -166,9 +166,9 @@ impl PullTask {
                         if let Some(commit_id) = metadata.get(commit::METADATA_COMMIT_ID) {
                             Self::commit_sync(
                                 &mut tx,
-                                self.vfs.sia_client(),
+                                self.vfs.remote_storage(),
                                 commit_id,
-                                &sia_object,
+                                &remote_object,
                                 id,
                             )
                             .await?;
@@ -179,8 +179,8 @@ impl PullTask {
                             &mut tx,
                             self.vfs.head(),
                             self.vfs.id(),
-                            self.vfs.sia_client(),
-                            &sia_object,
+                            self.vfs.remote_storage(),
+                            &remote_object,
                             id,
                         )
                         .await?;
@@ -210,11 +210,11 @@ impl Vfs {
 
     async fn backend_objects(
         &self,
-    ) -> VfsResult<impl TryStream<Ok = SiaObject, Error = std::io::Error> + Unpin + '_> {
+    ) -> VfsResult<impl TryStream<Ok = RemoteObject, Error = std::io::Error> + Unpin + '_> {
         let vfs_id = Arc::new(self.id().to_string());
 
         Ok(self
-            .sia_client()
+            .remote_storage()
             .list_objects()
             .try_filter_map(move |o| {
                 let vfs_id = vfs_id.clone();
@@ -694,35 +694,35 @@ mod tests {
         vfs: &Vfs,
         entity: &DraftEntity<T>,
     ) -> anyhow::Result<()> {
-        vfs.sia_client()
+        vfs.remote_storage()
             .upload(entity.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }
 
     async fn upload_blob_object(vfs: &Vfs, blob: &Blob) -> anyhow::Result<()> {
-        vfs.sia_client()
+        vfs.remote_storage()
             .upload(blob.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }
 
     async fn upload_chunk_object(vfs: &Vfs, chunk: &Chunk) -> anyhow::Result<()> {
-        vfs.sia_client()
+        vfs.remote_storage()
             .upload(chunk.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }
 
     async fn upload_commit_object(vfs: &Vfs, commit: &Commit) -> anyhow::Result<()> {
-        vfs.sia_client()
+        vfs.remote_storage()
             .upload(commit.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())
     }
 
     async fn upload_config_object(vfs: &Vfs, config: &Config) -> anyhow::Result<()> {
-        vfs.sia_client()
+        vfs.remote_storage()
             .upload(config.to_uploadable_object(vfs.id()))
             .await?;
         Ok(())

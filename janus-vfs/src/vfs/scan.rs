@@ -4,13 +4,13 @@ use crate::sync::{METADATA_VFS_ID, METADATA_VFS_VERSION};
 use crate::vfs::config::Config;
 use crate::vfs::{Vfs, VfsError, VfsId, config};
 use futures_util::{StreamExt, TryStreamExt};
-use janus_io::Client as Sia;
+use janus_io::RemoteStorage;
 use std::collections::HashMap;
 use std::str::FromStr;
 
 impl Vfs {
-    pub async fn scan(sia_client: &Sia) -> Result<Vec<Config>, VfsError> {
-        let mut config_objects = sia_client
+    pub async fn scan(remote_storage: &RemoteStorage) -> Result<Vec<Config>, VfsError> {
+        let mut config_objects = remote_storage
             .list_objects()
             .try_filter_map(move |o| async move {
                 let metadata: Metadata = if let Some(metadata) = o.metadata().try_into().ok() {
@@ -47,7 +47,7 @@ impl Vfs {
         let mut configs: HashMap<VfsId, Config> = HashMap::new();
         let mut id = 0u64;
         while let Some(Ok((o, vfs_id))) = config_objects.next().await {
-            let config = Config::load_from_backend(id.into(), o.id(), sia_client).await?;
+            let config = Config::load_from_backend(id.into(), o.id(), remote_storage).await?;
             if config.vfs_id() != &vfs_id {
                 continue;
             }
@@ -69,15 +69,15 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use crate::vfs::Vfs;
-    use janus_io::Client as Sia;
+    use janus_io::RemoteStorage;
     use std::time::Duration;
 
     #[tokio::test]
     async fn single_vfs() -> anyhow::Result<()> {
-        let sia_client = Sia::mock().await;
-        let vfs_id = Vfs::create_new(None, &sia_client).await?;
+        let remote_storage = RemoteStorage::mock().await;
+        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
 
-        let configs = Vfs::scan(&sia_client).await?;
+        let configs = Vfs::scan(&remote_storage).await?;
         assert_eq!(configs.len(), 1);
 
         let config = configs.get(0).unwrap();
@@ -88,14 +88,14 @@ mod tests {
 
     #[tokio::test]
     async fn multi_vfs() -> anyhow::Result<()> {
-        let sia_client = Sia::mock().await;
-        let vfs_id1 = Vfs::create_new(None, &sia_client).await?;
+        let remote_storage = RemoteStorage::mock().await;
+        let vfs_id1 = Vfs::create_new(None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let vfs_id2 = Vfs::create_new(None, &sia_client).await?;
+        let vfs_id2 = Vfs::create_new(None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let vfs_id3 = Vfs::create_new(None, &sia_client).await?;
+        let vfs_id3 = Vfs::create_new(None, &remote_storage).await?;
 
-        let configs = Vfs::scan(&sia_client).await?;
+        let configs = Vfs::scan(&remote_storage).await?;
         assert_eq!(configs.len(), 3);
 
         assert!(configs.iter().find(|c| c.vfs_id() == &vfs_id1).is_some());
@@ -107,8 +107,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty() -> anyhow::Result<()> {
-        let sia_client = Sia::mock().await;
-        let configs = Vfs::scan(&sia_client).await?;
+        let remote_storage = RemoteStorage::mock().await;
+        let configs = Vfs::scan(&remote_storage).await?;
         assert!(configs.is_empty());
 
         Ok(())

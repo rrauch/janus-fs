@@ -83,7 +83,7 @@ struct CacheArgs {
 
 #[derive(Debug, Parser)]
 #[command(version)]
-/// Exports Sia stored data via NFS.
+/// Exports a JanusFS instance via NFS.
 struct Arguments {
     /// Directory to store persistent data in. Will be created if it doesn't exist.
     #[arg(long, short = 'd', env, value_hint = clap::ValueHint::DirPath)]
@@ -252,33 +252,35 @@ async fn main() -> anyhow::Result<()> {
     let backend = build_backend(&mut arguments.backend).await?;
     let cache = build_cache(&arguments.cache, &arguments.data_dir).await?;
 
-    let sia_builder = janus_io::Client::builder().cache(cache);
-    let sia = match backend {
-        ConfiguredBackend::Indexd(indexd) => sia_builder.backend(indexd).build().await?,
-        ConfiguredBackend::Renterd(renterd) => sia_builder.backend(renterd).build().await?,
+    let remote_storage_builder = janus_io::RemoteStorage::builder().cache(cache);
+    let remote_storage = match backend {
+        ConfiguredBackend::Indexd(indexd) => remote_storage_builder.backend(indexd).build().await?,
+        ConfiguredBackend::Renterd(renterd) => {
+            remote_storage_builder.backend(renterd).build().await?
+        }
     };
 
     match arguments.command {
-        Command::Serve(args) => serve(sia, &arguments.data_dir, args).await?,
-        Command::Scan => scan(sia).await?,
+        Command::Serve(args) => serve(remote_storage, &arguments.data_dir, args).await?,
+        Command::Scan => scan(remote_storage).await?,
         Command::Fs {
             command: FsCommand::Create(args),
-        } => create_fs(sia, args).await?,
+        } => create_fs(remote_storage, args).await?,
         Command::Fs {
             command: FsCommand::Delete(args),
-        } => delete_fs(sia, args).await?,
+        } => delete_fs(remote_storage, args).await?,
         Command::Branch {
             command: BranchCommand::Create(args),
-        } => create_branch(sia, args).await?,
+        } => create_branch(remote_storage, args).await?,
         Command::Branch {
             command: BranchCommand::Delete(args),
-        } => delete_branch(sia, args).await?,
+        } => delete_branch(remote_storage, args).await?,
         Command::Tag {
             command: TagCommand::Create(args),
-        } => create_tag(sia, args).await?,
+        } => create_tag(remote_storage, args).await?,
         Command::Tag {
             command: TagCommand::Delete(args),
-        } => delete_tag(sia, args).await?,
+        } => delete_tag(remote_storage, args).await?,
     }
 
     Ok(())
@@ -354,7 +356,10 @@ async fn build_backend(args: &mut BackendArgs) -> anyhow::Result<ConfiguredBacke
     }
 }
 
-async fn build_cache(args: &CacheArgs, data_dir: &PathBuf) -> anyhow::Result<janus_io::cache::Cache> {
+async fn build_cache(
+    args: &CacheArgs,
+    data_dir: &PathBuf,
+) -> anyhow::Result<janus_io::cache::Cache> {
     if args.max_cache_size.as_u64() == 0 && args.max_metadata_cache_size.as_u64() == 0 {
         return Ok(janus_io::cache::Cache::default());
     }
@@ -391,7 +396,11 @@ async fn build_cache(args: &CacheArgs, data_dir: &PathBuf) -> anyhow::Result<jan
         .build())
 }
 
-async fn serve(sia: janus_io::Client, data_dir: &PathBuf, args: ServeArgs) -> anyhow::Result<()> {
+async fn serve(
+    remote_storage: janus_io::RemoteStorage,
+    data_dir: &PathBuf,
+    args: ServeArgs,
+) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
@@ -407,8 +416,8 @@ async fn serve(sia: janus_io::Client, data_dir: &PathBuf, args: ServeArgs) -> an
         (Some(_), Some(_)) => bail!("invalid configuration, branch and tag are mutually exclusive"),
     };
 
-    let sia_nfs = JanusNfs::new(
-        sia,
+    let janus_nfs = JanusNfs::new(
+        remote_storage,
         args.vfs_id.as_str(),
         head,
         args.read_only,
@@ -422,7 +431,7 @@ async fn serve(sia: janus_io::Client, data_dir: &PathBuf, args: ServeArgs) -> an
     )
     .await?;
 
-    let run_fut = sia_nfs.run();
+    let run_fut = janus_nfs.run();
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -450,10 +459,10 @@ async fn serve(sia: janus_io::Client, data_dir: &PathBuf, args: ServeArgs) -> an
     .await
 }
 
-async fn scan(sia: janus_io::Client) -> anyhow::Result<()> {
-    action_preview("Scan Backend", None, &sia);
+async fn scan(remote_storage: janus_io::RemoteStorage) -> anyhow::Result<()> {
+    action_preview("Scan Backend", None, &remote_storage);
 
-    let configs = Vfs::scan(&sia).await?;
+    let configs = Vfs::scan(&remote_storage).await?;
 
     const INDENT: &str = "    ";
 
@@ -510,11 +519,14 @@ fn print_config(config: &Config, indent: &str) {
     }
 }
 
-async fn create_fs(sia: janus_io::Client, args: FsCreateArgs) -> anyhow::Result<()> {
+async fn create_fs(
+    remote_storage: janus_io::RemoteStorage,
+    args: FsCreateArgs,
+) -> anyhow::Result<()> {
     action_preview(
         "Create New File System",
         Some("Create a new, empty file system on the selected backend."),
-        &sia,
+        &remote_storage,
     );
 
     if !ask_proceed().await {
@@ -523,7 +535,7 @@ async fn create_fs(sia: janus_io::Client, args: FsCreateArgs) -> anyhow::Result<
         return Ok(());
     }
 
-    let vfs_id = Vfs::create_new(args.description, &sia).await?;
+    let vfs_id = Vfs::create_new(args.description, &remote_storage).await?;
 
     const INDENT: &str = "    ";
 
@@ -531,7 +543,7 @@ async fn create_fs(sia: janus_io::Client, args: FsCreateArgs) -> anyhow::Result<
     println!("{} ✅", "File System Creation Complete".green().bold());
     println!();
 
-    let configs = Vfs::scan(&sia).await?;
+    let configs = Vfs::scan(&remote_storage).await?;
     let config = configs
         .into_iter()
         .find(|c| c.vfs_id() == &vfs_id)
@@ -541,15 +553,18 @@ async fn create_fs(sia: janus_io::Client, args: FsCreateArgs) -> anyhow::Result<
     Ok(())
 }
 
-async fn delete_fs(sia: janus_io::Client, args: FsDeleteArgs) -> anyhow::Result<()> {
+async fn delete_fs(
+    remote_storage: janus_io::RemoteStorage,
+    args: FsDeleteArgs,
+) -> anyhow::Result<()> {
     let vfs_id = VfsId::from_str(args.vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
     action_preview(
         "Delete File System",
         Some("File System will be permanently deleted! All data will be erased!"),
-        &sia,
+        &remote_storage,
     );
 
-    let configs = Vfs::scan(&sia).await?;
+    let configs = Vfs::scan(&remote_storage).await?;
 
     if let Some(config) = configs.into_iter().find(|c| c.vfs_id() == &vfs_id) {
         print_config(&config, "    ");
@@ -573,7 +588,7 @@ async fn delete_fs(sia: janus_io::Client, args: FsDeleteArgs) -> anyhow::Result<
         return Ok(());
     }
 
-    let deleted_objects = Vfs::delete_fs(&vfs_id, &sia).await?;
+    let deleted_objects = Vfs::delete_fs(&vfs_id, &remote_storage).await?;
     if deleted_objects == 0 {
         println!();
         println!(" ❌ {}", "No objects found to delete".red().bold());
@@ -588,10 +603,13 @@ async fn delete_fs(sia: janus_io::Client, args: FsDeleteArgs) -> anyhow::Result<
     Ok(())
 }
 
-async fn create_branch(sia: janus_io::Client, args: BranchCreateArgs) -> anyhow::Result<()> {
+async fn create_branch(
+    remote_storage: janus_io::RemoteStorage,
+    args: BranchCreateArgs,
+) -> anyhow::Result<()> {
     let branch_name = BranchName::from_str(args.name.as_str())?;
     create_head(
-        sia,
+        remote_storage,
         branch_name.into(),
         args.description,
         args.vfs_id,
@@ -600,10 +618,13 @@ async fn create_branch(sia: janus_io::Client, args: BranchCreateArgs) -> anyhow:
     .await
 }
 
-async fn create_tag(sia: janus_io::Client, args: TagCreateArgs) -> anyhow::Result<()> {
+async fn create_tag(
+    remote_storage: janus_io::RemoteStorage,
+    args: TagCreateArgs,
+) -> anyhow::Result<()> {
     let tag_name = TagName::from_str(args.name.as_str())?;
     create_head(
-        sia,
+        remote_storage,
         tag_name.into(),
         args.description,
         args.vfs_id,
@@ -613,7 +634,7 @@ async fn create_tag(sia: janus_io::Client, args: TagCreateArgs) -> anyhow::Resul
 }
 
 async fn create_head(
-    sia: janus_io::Client,
+    remote_storage: janus_io::RemoteStorage,
     head: Head,
     description: Option<String>,
     vfs_id: String,
@@ -627,7 +648,7 @@ async fn create_head(
         Head::Branch(_) => "Create New Branch",
         Head::Tag(_) => "Create New Tag",
     };
-    action_preview(title, None, &sia);
+    action_preview(title, None, &remote_storage);
 
     const INDENT: &str = "    ";
 
@@ -664,10 +685,17 @@ async fn create_head(
 
     let config = match head {
         Head::Branch(branch_name) => {
-            Vfs::create_branch(&vfs_id, &sia, branch_name, description, commit_id).await?
+            Vfs::create_branch(
+                &vfs_id,
+                &remote_storage,
+                branch_name,
+                description,
+                commit_id,
+            )
+            .await?
         }
         Head::Tag(tag_name) => {
-            Vfs::create_tag(&vfs_id, &sia, tag_name, description, commit_id).await?
+            Vfs::create_tag(&vfs_id, &remote_storage, tag_name, description, commit_id).await?
         }
     };
 
@@ -680,17 +708,27 @@ async fn create_head(
     Ok(())
 }
 
-async fn delete_branch(sia: janus_io::Client, args: BranchDeleteArgs) -> anyhow::Result<()> {
+async fn delete_branch(
+    remote_storage: janus_io::RemoteStorage,
+    args: BranchDeleteArgs,
+) -> anyhow::Result<()> {
     let branch_name = BranchName::from_str(args.name.as_str())?;
-    delete_head(sia, branch_name.into(), args.vfs_id).await
+    delete_head(remote_storage, branch_name.into(), args.vfs_id).await
 }
 
-async fn delete_tag(sia: janus_io::Client, args: TagDeleteArgs) -> anyhow::Result<()> {
+async fn delete_tag(
+    remote_storage: janus_io::RemoteStorage,
+    args: TagDeleteArgs,
+) -> anyhow::Result<()> {
     let tag_name = TagName::from_str(args.name.as_str())?;
-    delete_head(sia, tag_name.into(), args.vfs_id).await
+    delete_head(remote_storage, tag_name.into(), args.vfs_id).await
 }
 
-async fn delete_head(sia: janus_io::Client, head: Head, vfs_id: String) -> anyhow::Result<()> {
+async fn delete_head(
+    remote_storage: janus_io::RemoteStorage,
+    head: Head,
+    vfs_id: String,
+) -> anyhow::Result<()> {
     let vfs_id = VfsId::from_str(vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
 
     let title = match &head {
@@ -700,7 +738,7 @@ async fn delete_head(sia: janus_io::Client, head: Head, vfs_id: String) -> anyho
     action_preview(
         title,
         Some("Permanently delete the selected branch/tag"),
-        &sia,
+        &remote_storage,
     );
 
     const INDENT: &str = "    ";
@@ -727,8 +765,10 @@ async fn delete_head(sia: janus_io::Client, head: Head, vfs_id: String) -> anyho
     }
 
     let config = match head {
-        Head::Branch(branch_name) => Vfs::delete_branch(&vfs_id, &sia, branch_name).await?,
-        Head::Tag(tag_name) => Vfs::delete_tag(&vfs_id, &sia, tag_name).await?,
+        Head::Branch(branch_name) => {
+            Vfs::delete_branch(&vfs_id, &remote_storage, branch_name).await?
+        }
+        Head::Tag(tag_name) => Vfs::delete_tag(&vfs_id, &remote_storage, tag_name).await?,
     };
 
     println!();
@@ -740,10 +780,14 @@ async fn delete_head(sia: janus_io::Client, head: Head, vfs_id: String) -> anyho
     Ok(())
 }
 
-fn action_preview(action: impl AsRef<str>, details: Option<&str>, sia: &janus_io::Client) {
+fn action_preview(
+    action: impl AsRef<str>,
+    details: Option<&str>,
+    remote_storage: &janus_io::RemoteStorage,
+) {
     println!("{} {}", "ACTION:".bold(), action.as_ref().cyan().bold());
 
-    match sia.backend() {
+    match remote_storage.backend() {
         janus_io::Backend::Indexd(indexd) => {
             println!("{} {}", "BACKEND:".bold(), "indexd");
             println!("{} {}", "ENDPOINT:".bold(), indexd.endpoint());

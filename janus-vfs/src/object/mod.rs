@@ -55,7 +55,7 @@ impl Object {
         self.remote_location.as_str()
     }
 
-    pub fn try_to_sia_oid(&self) -> Option<janus_io::object::ObjectId> {
+    pub fn try_to_remote_oid(&self) -> Option<janus_io::object::ObjectId> {
         janus_io::object::ObjectId::from_str(self.remote_location.as_str()).ok()
     }
 }

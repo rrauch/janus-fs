@@ -219,7 +219,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone)]
-pub struct Client {
+pub struct RemoteStorage {
     backend: Backend,
     cache: Cache,
     known_object_ids: Arc<papaya::HashMap<ObjectId, ()>>,
@@ -227,13 +227,13 @@ pub struct Client {
     chunk_size: usize,
 }
 
-impl Client {
+impl RemoteStorage {
     pub fn backend(&self) -> &Backend {
         &self.backend
     }
 }
 
-impl Drop for Client {
+impl Drop for RemoteStorage {
     fn drop(&mut self) {
         if let Some(handle) = self.object_event_loop_handle.take() {
             if let Ok(handle) = Arc::try_unwrap(handle) {
@@ -244,7 +244,7 @@ impl Drop for Client {
 }
 
 #[cfg(feature = "mock")]
-impl Client {
+impl RemoteStorage {
     pub async fn mock() -> Self {
         Self::builder()
             .backend(Backend::Mock(mock::MockClient::default()))
@@ -256,7 +256,7 @@ impl Client {
 }
 
 #[bon]
-impl Client {
+impl RemoteStorage {
     #[builder]
     pub async fn new(
         #[builder(into)] backend: Backend,
@@ -367,7 +367,7 @@ fn clone_cursor(cursor: Option<&ObjectsCursor>) -> Option<ObjectsCursor> {
 #[cfg(test)]
 mod tests {
     use crate::upload::UploadableObject;
-    use crate::{Client, MetadataSource, indexd, renterd};
+    use crate::{MetadataSource, RemoteStorage, indexd, renterd};
     use futures_util::io::Cursor;
     use futures_util::{AsyncReadExt, AsyncSeekExt, TryStreamExt};
     use std::borrow::Cow;
@@ -397,7 +397,7 @@ mod tests {
             .try_init();
         dotenv::dotenv().ok();
         let indexd = indexd::tests::connect().await?;
-        integration_test1(Client::builder().backend(indexd).build().await?).await?;
+        integration_test1(RemoteStorage::builder().backend(indexd).build().await?).await?;
         Ok(())
     }
 
@@ -410,7 +410,7 @@ mod tests {
             .try_init();
         dotenv::dotenv().ok();
         let renterd = renterd::tests::new_client().await?;
-        integration_test1(Client::builder().backend(renterd).build().await?).await?;
+        integration_test1(RemoteStorage::builder().backend(renterd).build().await?).await?;
         Ok(())
     }
 
@@ -421,11 +421,11 @@ mod tests {
             .with_test_writer()
             .try_init();
         dotenv::dotenv().ok();
-        integration_test1(Client::mock().await).await?;
+        integration_test1(RemoteStorage::mock().await).await?;
         Ok(())
     }
 
-    async fn integration_test1(client: Client) -> Result<(), anyhow::Error> {
+    async fn integration_test1(client: RemoteStorage) -> Result<(), anyhow::Error> {
         assert!(client.num_objects() < 10);
 
         while let Some(object) = client.list_objects().try_next().await? {

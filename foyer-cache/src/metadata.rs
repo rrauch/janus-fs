@@ -17,8 +17,8 @@ use janus_io::renterd::object::{File, FileId};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-const COMPAT_FILE_CONTENT_TYPE: &str = "sia-io/cache/metadata";
-const COMPAT_FILE_COMP_VERSION: usize = 0;
+const COMPAT_FILE_CONTENT_TYPE: &str = "janus-io/cache/metadata";
+const COMPAT_FILE_COMP_VERSION: usize = 1;
 
 // foyer seems to have problems with types with lifetimes
 // so we are using owned types only here
@@ -132,7 +132,7 @@ impl FoyerMetadataCache {
         #[builder(default = DEFAULT_MEM_BUF_SIZE)] mem_buf: usize,
     ) -> Result<Self, Error> {
         let mut cache = DiskCache::new(
-            "sia_metadata_cache",
+            "janus_metadata_cache",
             disk_path,
             max_disk_space,
             mem_buf,

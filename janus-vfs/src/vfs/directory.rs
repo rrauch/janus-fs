@@ -96,7 +96,7 @@ impl EntityHandler for DirectoryKind {
     }
 
     fn hash(entity: &RawEntityInner<Self>) -> Hash {
-        let mut hasher = Hasher::new_derive_key("[sia-vfs]/[v0]/[directory_entity]");
+        let mut hasher = Hasher::new_derive_key("[janus-vfs]/[v1]/[directory_entity]");
         hasher.update(b"begin:\n");
         entity.hash_metadata(&mut hasher);
         hash_entries(&entity.body().entries, &mut hasher);

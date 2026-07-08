@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
-use janus_io::Client as Sia;
-use janus_io::object::{Object as SiaObject, ObjectId as SiaObjectId};
+use janus_io::RemoteStorage;
+use janus_io::object::{Object as RemoteObject, ObjectId as RemoteObjectId};
 use janus_io::upload::UploadableObject;
 use std::io::ErrorKind;
 use std::ops::Deref;
@@ -32,11 +32,11 @@ pub struct Chunk {
 
 impl Chunk {
     pub(crate) async fn load_from_backend(
-        sia_oid: &SiaObjectId,
-        sia_client: &Sia,
+        remote_oid: &RemoteObjectId,
+        remote_storage: &RemoteStorage,
     ) -> Result<Self, std::io::Error> {
-        let dl = sia_client
-            .download(sia_oid)
+        let dl = remote_storage
+            .download(remote_oid)
             .await
             .map_err(std::io::Error::other)?;
 
@@ -128,7 +128,7 @@ impl From<Arc<[u8]>> for Chunk {
 }
 
 fn hash(content: &[u8]) -> ChunkId {
-    let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[chunk_id]");
+    let mut hasher = blake3::Hasher::new_derive_key("[janus-vfs]/[v1]/[chunk_id]");
     hasher.update(b"begin\nlength:");
     hasher.update(&content.len().to_be_bytes());
     hasher.update(b"\ncontent:");
@@ -230,7 +230,7 @@ impl PushTask {
     pub(crate) async fn process_chunk<TX: TxScope>(
         &mut self,
         chunk: &Chunk,
-        object: SiaObject,
+        object: RemoteObject,
         tx: &mut Transaction<TX>,
     ) -> Result<(), Error>
     where
@@ -309,10 +309,10 @@ where
                     .object_by_id(object_id)
                     .await?
                     .ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                let sia_oid = object.try_to_sia_oid().ok_or_else(|| {
+                let remote_oid = object.try_to_remote_oid().ok_or_else(|| {
                     DataError::InvalidRemoteLocation(object.remote_location().to_string())
                 })?;
-                Chunk::load_from_backend(&sia_oid, self.sia_client()).await?
+                Chunk::load_from_backend(&remote_oid, self.remote_storage()).await?
             }
         };
 

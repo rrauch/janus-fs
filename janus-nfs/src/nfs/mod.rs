@@ -22,7 +22,7 @@ use std::io::SeekFrom;
 use std::time::Duration;
 use tracing::instrument;
 
-pub(crate) struct SiaNfsFs {
+pub(crate) struct JanusNfsFs {
     vfs: Vfs,
     uploader: Scheduler<Upload>,
     uid: u32,
@@ -33,7 +33,7 @@ pub(crate) struct SiaNfsFs {
     fs_id: u64,
 }
 
-impl SiaNfsFs {
+impl JanusNfsFs {
     pub(super) async fn new(
         vfs: Vfs,
         upload_max_idle: Duration,
@@ -60,7 +60,7 @@ impl SiaNfsFs {
 }
 
 #[async_trait]
-impl NFSFileSystem for SiaNfsFs {
+impl NFSFileSystem for JanusNfsFs {
     fn capabilities(&self) -> VFSCapabilities {
         if self.vfs.is_read_only() {
             VFSCapabilities::ReadOnly
@@ -389,7 +389,7 @@ impl NFSFileSystem for SiaNfsFs {
     }
 }
 
-impl SiaNfsFs {
+impl JanusNfsFs {
     async fn inode_by_id(&self, id: fileid3) -> Result<Inode, nfsstat3> {
         match self
             .vfs

@@ -97,7 +97,7 @@ impl EntityHandler for FileKind {
     }
 
     fn hash(entity: &RawEntityInner<Self>) -> Hash {
-        let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[file_entity]");
+        let mut hasher = blake3::Hasher::new_derive_key("[janus-vfs]/[v1]/[file_entity]");
         hasher.update(b"begin:\n");
         entity.hash_metadata(&mut hasher);
         hasher.update(b"\nbegin_blob:\nid:\n");

@@ -10,8 +10,8 @@ use crate::{ContentId, object};
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
-use janus_io::Client as Sia;
-use janus_io::object::{Object as SiaObject, ObjectId as SiaObjectId};
+use janus_io::RemoteStorage;
+use janus_io::object::{Object as RemoteObject, ObjectId as RemoteObjectId};
 use janus_io::upload::UploadableObject;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -89,7 +89,7 @@ fn hash(
     commit_count: u64,
     created: &Timestamp,
 ) -> CommitId {
-    let mut hasher = blake3::Hasher::new_derive_key("[sia-vfs]/[v0]/[commit]");
+    let mut hasher = blake3::Hasher::new_derive_key("[janus-vfs]/[v1]/[commit]");
     hasher.update(b"begin:");
     hasher.update(b"\nentity_id:");
     hasher.update(entity_key.id().as_slice());
@@ -174,11 +174,11 @@ impl Commit {
 
     pub(crate) async fn load_from_backend(
         object_id: ObjectId,
-        sia_oid: &SiaObjectId,
-        sia_client: &Sia,
+        remote_oid: &RemoteObjectId,
+        remote_storage: &RemoteStorage,
     ) -> Result<Self, std::io::Error> {
-        let dl = sia_client
-            .download(sia_oid)
+        let dl = remote_storage
+            .download(remote_oid)
             .await
             .map_err(std::io::Error::other)?;
 
@@ -256,9 +256,9 @@ impl Commit {
 impl PullTask {
     pub(crate) async fn commit_sync<TX: TxScope>(
         tx: &mut Transaction<TX>,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         commit_id: &str,
-        sia_object: &SiaObject,
+        remote_object: &RemoteObject,
         object_id: ObjectId,
     ) -> Result<(), Error>
     where
@@ -266,7 +266,8 @@ impl PullTask {
     {
         let commit_id = CommitId::try_from_str(commit_id)
             .ok_or_else(|| Error::CommitError(CommitError::InvalidCommitId))?;
-        let commit = Commit::load_from_backend(object_id, sia_object.id(), sia_client).await?;
+        let commit =
+            Commit::load_from_backend(object_id, remote_object.id(), remote_storage).await?;
 
         if commit.id() != &commit_id {
             return Err(Error::CommitError(CommitError::IdMismatch {
@@ -306,7 +307,7 @@ impl PushTask {
     pub(crate) async fn process_commit<TX: TxScope>(
         &mut self,
         commit: Commit,
-        object: SiaObject,
+        object: RemoteObject,
         tx: &mut Transaction<TX>,
     ) -> Result<(), Error>
     where
@@ -413,10 +414,10 @@ where
                     .object_by_id(object_id)
                     .await?
                     .ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                let sia_oid = object.try_to_sia_oid().ok_or_else(|| {
+                let remote_oid = object.try_to_remote_oid().ok_or_else(|| {
                     DataError::InvalidRemoteLocation(object.remote_location().to_string())
                 })?;
-                Commit::load_from_backend(object_id, &sia_oid, self.sia_client()).await?
+                Commit::load_from_backend(object_id, &remote_oid, self.remote_storage()).await?
             }
         };
 

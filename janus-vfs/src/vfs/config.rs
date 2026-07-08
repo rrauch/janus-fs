@@ -18,8 +18,8 @@ use crate::vfs::{
 use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, InvalidFlatbuffer};
 use futures_util::AsyncReadExt;
 use futures_util::io::Cursor;
-use janus_io::Client as Sia;
-use janus_io::object::{Object as SiaObject, ObjectId as SiaObjectId};
+use janus_io::RemoteStorage;
+use janus_io::object::{Object as RemoteObject, ObjectId as RemoteObjectId};
 use janus_io::upload::UploadableObject;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
@@ -81,11 +81,11 @@ impl Config {
 
     pub(crate) async fn load_from_backend(
         object_id: ObjectId,
-        sia_oid: &SiaObjectId,
-        sia_client: &Sia,
+        remote_oid: &RemoteObjectId,
+        remote_storage: &RemoteStorage,
     ) -> Result<Self, std::io::Error> {
-        let dl = sia_client
-            .download(sia_oid)
+        let dl = remote_storage
+            .download(remote_oid)
             .await
             .map_err(std::io::Error::other)?;
 
@@ -333,14 +333,15 @@ impl PullTask {
         tx: &mut Transaction<TX>,
         head: &Head,
         vfs_id: &VfsId,
-        sia_client: &Sia,
-        sia_object: &SiaObject,
+        remote_storage: &RemoteStorage,
+        remote_object: &RemoteObject,
         object_id: ObjectId,
     ) -> Result<(), Error>
     where
         Transaction<TX>: crate::db::Read + crate::db::Write,
     {
-        let config = Config::load_from_backend(object_id, sia_object.id(), sia_client).await?;
+        let config =
+            Config::load_from_backend(object_id, remote_object.id(), remote_storage).await?;
         tx.maybe_set_config(&config, head, vfs_id).await?;
         Ok(())
     }
@@ -381,7 +382,7 @@ impl PushTask {
     pub(crate) async fn process_config<TX: TxScope>(
         &mut self,
         config: &Config,
-        object: SiaObject,
+        object: RemoteObject,
         tx: &mut Transaction<TX>,
     ) -> Result<(), Error>
     where
@@ -435,10 +436,10 @@ where
                     .object_by_id(object_id)
                     .await?
                     .ok_or_else(|| DataError::ObjectNotFound(object_id))?;
-                let sia_oid = object.try_to_sia_oid().ok_or_else(|| {
+                let remote_oid = object.try_to_remote_oid().ok_or_else(|| {
                     DataError::InvalidRemoteLocation(object.remote_location().to_string())
                 })?;
-                Config::load_from_backend(object_id, &sia_oid, self.sia_client()).await?
+                Config::load_from_backend(object_id, &remote_oid, self.remote_storage()).await?
             }
         };
 
@@ -853,14 +854,14 @@ impl FileOrDir {
 impl Vfs {
     pub async fn create_branch(
         vfs_id: &VfsId,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         branch_name: BranchName,
         description: Option<String>,
         commit_id: CommitId,
     ) -> Result<Config, VfsError> {
         Self::create_head(
             vfs_id,
-            sia_client,
+            remote_storage,
             branch_name.into(),
             description,
             commit_id,
@@ -870,22 +871,29 @@ impl Vfs {
 
     pub async fn create_tag(
         vfs_id: &VfsId,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         tag_name: TagName,
         description: Option<String>,
         commit_id: CommitId,
     ) -> Result<Config, VfsError> {
-        Self::create_head(vfs_id, sia_client, tag_name.into(), description, commit_id).await
+        Self::create_head(
+            vfs_id,
+            remote_storage,
+            tag_name.into(),
+            description,
+            commit_id,
+        )
+        .await
     }
 
     async fn create_head(
         vfs_id: &VfsId,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         head: Head,
         description: Option<String>,
         commit_id: CommitId,
     ) -> Result<Config, VfsError> {
-        let mut config: ConfigMut = Vfs::scan(sia_client)
+        let mut config: ConfigMut = Vfs::scan(remote_storage)
             .await?
             .into_iter()
             .find(|c| c.vfs_id() == vfs_id)
@@ -918,7 +926,7 @@ impl Vfs {
 
         let config = config.freeze();
 
-        sia_client
+        remote_storage
             .upload(config.to_uploadable_object(vfs_id))
             .await
             .map_err(std::io::Error::other)?;
@@ -928,28 +936,28 @@ impl Vfs {
 
     pub async fn delete_branch(
         vfs_id: &VfsId,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         branch_name: BranchName,
     ) -> Result<Config, VfsError> {
         let head = Head::from(branch_name);
-        Self::delete_head(vfs_id, sia_client, &head).await
+        Self::delete_head(vfs_id, remote_storage, &head).await
     }
 
     pub async fn delete_tag(
         vfs_id: &VfsId,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         tag_name: TagName,
     ) -> Result<Config, VfsError> {
         let head = Head::from(tag_name);
-        Self::delete_head(vfs_id, sia_client, &head).await
+        Self::delete_head(vfs_id, remote_storage, &head).await
     }
 
     async fn delete_head(
         vfs_id: &VfsId,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
         head: &Head,
     ) -> Result<Config, VfsError> {
-        let mut config: ConfigMut = Vfs::scan(sia_client)
+        let mut config: ConfigMut = Vfs::scan(remote_storage)
             .await?
             .into_iter()
             .find(|c| c.vfs_id() == vfs_id)
@@ -961,7 +969,7 @@ impl Vfs {
         config.last_modified = Timestamp::now();
         let config = config.freeze();
 
-        sia_client
+        remote_storage
             .upload(config.to_uploadable_object(vfs_id))
             .await
             .map_err(std::io::Error::other)?;
@@ -975,7 +983,7 @@ mod tests {
     use crate::vfs::commit::CommitId;
     use crate::vfs::config::{ConfigMut, OwnedEntry};
     use crate::vfs::{BranchName, Head, TagName, Timestamp, Vfs, VfsId};
-    use janus_io::Client as Sia;
+    use janus_io::RemoteStorage;
     use std::str::FromStr;
 
     #[test]
@@ -1042,9 +1050,9 @@ mod tests {
     }
 
     async fn create_delete_head(head: Head) -> anyhow::Result<()> {
-        let sia_client = Sia::mock().await;
-        let vfs_id = Vfs::create_new(None, &sia_client).await?;
-        let config = Vfs::scan(&sia_client)
+        let remote_storage = RemoteStorage::mock().await;
+        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
+        let config = Vfs::scan(&remote_storage)
             .await?
             .into_iter()
             .find(|c| c.vfs_id() == &vfs_id)
@@ -1058,10 +1066,10 @@ mod tests {
             .unwrap();
 
         let config =
-            Vfs::create_head(&vfs_id, &sia_client, head.clone(), None, commit.clone()).await?;
+            Vfs::create_head(&vfs_id, &remote_storage, head.clone(), None, commit.clone()).await?;
         assert_eq!(config.heads().get(&head).unwrap().commit_id(), &commit);
 
-        let config = Vfs::delete_head(&vfs_id, &sia_client, &head).await?;
+        let config = Vfs::delete_head(&vfs_id, &remote_storage, &head).await?;
         assert!(!config.heads().contains_key(&head));
 
         Ok(())

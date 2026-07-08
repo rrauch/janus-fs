@@ -28,7 +28,7 @@ use crate::vfs::path::VfsPath;
 use bytemuck::TransparentWrapper;
 use chrono::{DateTime, Utc};
 use derive_where::derive_where;
-use janus_io::Client as Sia;
+use janus_io::RemoteStorage;
 use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
@@ -615,7 +615,7 @@ impl Vfs {
         #[builder(default, into)] head: Head,
         #[builder(default = false)] read_only: bool,
         db_file: PathBuf,
-        sia_client: Sia,
+        remote_storage: RemoteStorage,
         #[builder(default)] db_page_size: PageSize,
         #[builder(default = 25)] max_db_connections: u8,
         #[builder(default)] cache_settings: CacheSettings,
@@ -626,13 +626,13 @@ impl Vfs {
         #[builder(default = NonZeroUsize::new(10).unwrap())] max_sync_concurrency: NonZeroUsize,
     ) -> Result<Self, VfsError> {
         let cache = Cache::new(&cache_settings);
-        let sia_client = Arc::new(sia_client);
+        let remote_storage = Arc::new(remote_storage);
         let db = Db::new(
             db_file,
             max_db_connections,
             db_page_size,
             cache.clone(),
-            sia_client.clone(),
+            remote_storage.clone(),
             head.clone(),
         )
         .await?;
@@ -652,7 +652,7 @@ impl Vfs {
             max_chunk_size,
             dead_fh_reaper: reaper,
             file_write_locks: FileWriteLocks::new(),
-            sia_client,
+            remote_storage,
             _syncer: syncer,
             max_sync_attempts,
             max_sync_concurrency,
@@ -692,7 +692,7 @@ impl Vfs {
 
     pub async fn create_new(
         description: Option<String>,
-        sia_client: &Sia,
+        remote_storage: &RemoteStorage,
     ) -> Result<VfsId, VfsError> {
         let vfs_id = VfsId::generate();
         let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT")?, vec![]);
@@ -716,7 +716,7 @@ impl Vfs {
         );
         let config = config.freeze();
 
-        let mut uploader = sia_client
+        let mut uploader = remote_storage
             .prepare_multi_upload()
             .map_err(std::io::Error::other)?;
 
@@ -726,7 +726,7 @@ impl Vfs {
             .map_err(std::io::Error::other)?;
         if uploader.is_full() {
             uploader.process().await.map_err(std::io::Error::other)?;
-            uploader = sia_client
+            uploader = remote_storage
                 .prepare_multi_upload()
                 .map_err(std::io::Error::other)?;
         }
@@ -737,7 +737,7 @@ impl Vfs {
             .map_err(std::io::Error::other)?;
         if uploader.is_full() {
             uploader.process().await.map_err(std::io::Error::other)?;
-            uploader = sia_client
+            uploader = remote_storage
                 .prepare_multi_upload()
                 .map_err(std::io::Error::other)?;
         }
@@ -761,7 +761,7 @@ pub(crate) struct Inner {
     max_chunk_size: usize,
     dead_fh_reaper: Reaper,
     file_write_locks: FileWriteLocks,
-    sia_client: Arc<Sia>,
+    remote_storage: Arc<RemoteStorage>,
     _syncer: Syncer,
     max_sync_attempts: NonZeroUsize,
     max_sync_concurrency: NonZeroUsize,
@@ -797,8 +797,8 @@ impl Vfs {
     }
 
     #[inline]
-    pub(crate) fn sia_client(&self) -> &Sia {
-        &self.0.sia_client
+    pub(crate) fn remote_storage(&self) -> &RemoteStorage {
+        &self.0.remote_storage
     }
 
     #[inline]
@@ -1108,7 +1108,7 @@ pub(crate) mod tests {
     use crate::vfs::{Inode, InodeId, Name, OwnedName, Vfs, VfsError};
     use anyhow::bail;
     use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, TryStreamExt};
-    use janus_io::Client as Sia;
+    use janus_io::RemoteStorage;
     use std::io::SeekFrom;
     use std::ops::Deref;
     use std::str::FromStr;
@@ -1120,18 +1120,18 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn new_vfs_with_opts(
-        sia_client: Option<Sia>,
+        remote_storage: Option<RemoteStorage>,
     ) -> anyhow::Result<(Vfs, TempDir)> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("vfs.sqlite");
-        let sia_client = match sia_client {
-            Some(sia_client) => sia_client,
-            None => Sia::mock().await,
+        let remote_storage = match remote_storage {
+            Some(remote_storage) => remote_storage,
+            None => RemoteStorage::mock().await,
         };
-        let vfs_id = Vfs::create_new(None, &sia_client).await?;
+        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
         Ok((
             Vfs::builder()
-                .sia_client(sia_client)
+                .remote_storage(remote_storage)
                 .db_file(path)
                 .vfs_id(vfs_id)
                 .initial_sync_delay(Duration::from_secs(u64::MAX))

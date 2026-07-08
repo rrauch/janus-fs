@@ -1,9 +1,9 @@
 mod io_scheduler;
 mod nfs;
 
-use crate::nfs::SiaNfsFs;
+use crate::nfs::JanusNfsFs;
 use anyhow::{Result, anyhow};
-use janus_io::Client as Sia;
+use janus_io::RemoteStorage;
 use janus_vfs::vfs::{Head, Vfs, VfsId};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use std::path::Path;
@@ -13,12 +13,12 @@ use std::time::Duration;
 pub(crate) const CHUNK_SIZE: usize = 1024 * 64;
 
 pub struct JanusNfs {
-    listener: NFSTcpListener<SiaNfsFs>,
+    listener: NFSTcpListener<JanusNfsFs>,
 }
 
 impl JanusNfs {
     pub async fn new(
-        sia: Sia,
+        remote_storage: RemoteStorage,
         vfs_id: &str,
         head: Option<Head>,
         read_only: bool,
@@ -36,7 +36,7 @@ impl JanusNfs {
         let export_name = format!("{}", &vfs_id);
 
         let vfs = Vfs::builder()
-            .sia_client(sia)
+            .remote_storage(remote_storage)
             .vfs_id(vfs_id)
             .maybe_head(head)
             .read_only(read_only)
@@ -47,7 +47,7 @@ impl JanusNfs {
 
         let mut listener = NFSTcpListener::bind(
             listen_address,
-            SiaNfsFs::new(vfs, write_autocommit_after, uid, gid, file_mode, dir_mode).await?,
+            JanusNfsFs::new(vfs, write_autocommit_after, uid, gid, file_mode, dir_mode).await?,
         )
         .await?;
         listener.with_export_name(export_name);
