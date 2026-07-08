@@ -1,4 +1,4 @@
-# Sia NFS Gateway (sia_nfs)
+![JanusFS](logo.svg)
 
 ## Description
 
