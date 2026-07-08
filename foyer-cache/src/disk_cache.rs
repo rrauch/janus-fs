@@ -15,7 +15,7 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const COMPAT_FILE_NAME: &str = "_sia_cache.ctx";
+const COMPAT_FILE_NAME: &str = "_janus_cache.ctx";
 const MAX_COMPAT_FILE_SIZE: u64 = 1024 * 10;
 
 pub struct DiskCache<K: StorageKey, V: StorageValue> {

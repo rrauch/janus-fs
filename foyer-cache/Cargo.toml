@@ -5,11 +5,11 @@ edition = "2024"
 
 [features]
 default = ["indexd", "renterd"]
-indexd = ["sia-io/indexd"]
-renterd = ["sia-io/renterd"]
+indexd = ["janus-io/indexd"]
+renterd = ["janus-io/renterd"]
 
 [dependencies]
-sia-io = { path = "../sia-io", default-features = false }
+janus-io = { path = "../janus-io", default-features = false }
 
 async-trait = { workspace = true }
 blocking = "1.6"

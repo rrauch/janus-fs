@@ -1177,9 +1177,9 @@ dependencies = [
  "dotenv",
  "equivalent",
  "foyer",
+ "janus-io",
  "serde",
  "serde_json",
- "sia-io",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1940,6 +1940,106 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "janus-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bimap",
+ "bon",
+ "bytes",
+ "bytesize",
+ "chrono",
+ "ct-codecs",
+ "derive-where",
+ "dotenv",
+ "futures-io",
+ "futures-util",
+ "indexmap 2.14.0",
+ "itertools 0.15.0",
+ "mime",
+ "moka",
+ "ouroboros",
+ "papaya",
+ "parking_lot",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sia_storage",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "twox-hash",
+ "typed-path",
+ "zeroize",
+]
+
+[[package]]
+name = "janus-nfs"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bimap",
+ "bytesize",
+ "chrono",
+ "clap",
+ "colored",
+ "ct-codecs",
+ "foyer-cache",
+ "futures-util",
+ "humantime",
+ "itertools 0.15.0",
+ "janus-io",
+ "janus-vfs",
+ "nfsserve",
+ "parking_lot",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "janus-vfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bon",
+ "bytemuck",
+ "bytes",
+ "bytesize",
+ "chrono",
+ "derive-where",
+ "elsa",
+ "flatbuffers",
+ "flatbuffers-build",
+ "futures-channel",
+ "futures-io",
+ "futures-util",
+ "janus-io",
+ "janus-vfs",
+ "lz4_flex",
+ "moka",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "twox-hash",
+ "typed-path",
+ "uuid",
+ "yoke",
+ "zstd",
+]
 
 [[package]]
 name = "jni"
@@ -3237,78 +3337,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sia-io"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bimap",
- "bon",
- "bytes",
- "bytesize",
- "chrono",
- "ct-codecs",
- "derive-where",
- "dotenv",
- "futures-io",
- "futures-util",
- "indexmap 2.14.0",
- "itertools 0.15.0",
- "mime",
- "moka",
- "ouroboros",
- "papaya",
- "parking_lot",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "sia_storage",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "twox-hash",
- "typed-path",
- "zeroize",
-]
-
-[[package]]
-name = "sia-vfs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "bon",
- "bytemuck",
- "bytes",
- "bytesize",
- "chrono",
- "derive-where",
- "elsa",
- "flatbuffers",
- "flatbuffers-build",
- "futures-channel",
- "futures-io",
- "futures-util",
- "lz4_flex",
- "moka",
- "sia-io",
- "sia-vfs",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "twox-hash",
- "typed-path",
- "uuid",
- "yoke",
- "zstd",
-]
-
-[[package]]
 name = "sia_core"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3361,34 +3389,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "sia_nfs"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bimap",
- "bytesize",
- "chrono",
- "clap",
- "colored",
- "ct-codecs",
- "foyer-cache",
- "futures-util",
- "humantime",
- "itertools 0.15.0",
- "nfsserve",
- "parking_lot",
- "sia-io",
- "sia-vfs",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
  "zeroize",
 ]
 
