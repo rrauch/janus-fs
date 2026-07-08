@@ -16,19 +16,19 @@ RUN cd /usr/local/src/ \
  && cargo build --release \
  && cp target/release/depres /usr/local/bin/
 
-COPY Cargo.* /usr/local/src/sia_nfs/
-COPY foyer-cache /usr/local/src/sia_nfs/foyer-cache/
-COPY main /usr/local/src/sia_nfs/main/
-COPY sia-io /usr/local/src/sia_nfs/sia-io/
-COPY sia-vfs /usr/local/src/sia_nfs/sia-vfs/
+COPY Cargo.* /usr/local/src/janus_fs/
+COPY foyer-cache /usr/local/src/janus_fs/foyer-cache/
+COPY janus-nfs /usr/local/src/janus_fs/janus-nfs/
+COPY janus-io /usr/local/src/janus_fs/janus-io/
+COPY janus-vfs /usr/local/src/janus_fs/janus-vfs/
 
-# Build the `sia_nfs` binary.
-RUN cd /usr/local/src/sia_nfs/ \
+# Build the `janus-nfs` binary.
+RUN cd /usr/local/src/janus_fs/ \
  && cargo build --release \
- && cp ./target/release/sia_nfs /usr/local/bin/
+ && cp ./target/release/janus-nfs /usr/local/bin/
 
 # Use `depres` to identify all required files for the final image.
-RUN depres /bin/sh /bin/bash /bin/ls /usr/local/bin/sia_nfs \
+RUN depres /bin/sh /bin/bash /bin/ls /usr/local/bin/janus-nfs \
     /etc/ssl/certs/ \
     /usr/share/ca-certificates/ \
     >> /tmp/export.list
@@ -56,4 +56,4 @@ EXPOSE 12000
 ENV DATA_DIR="/data/"
 ENV LISTEN_ADDRESS="0.0.0.0:12000"
 
-ENTRYPOINT ["/usr/local/bin/sia_nfs"]
+ENTRYPOINT ["/usr/local/bin/janus-nfs"]
