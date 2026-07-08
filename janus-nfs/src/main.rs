@@ -301,9 +301,9 @@ async fn build_backend(args: &mut BackendArgs) -> anyhow::Result<ConfiguredBacke
                 .id(AppId::from_str(
                     "b9f0bda1b97b7d44ae6369ac830851a115311bb59aa2d848beda6ae95d10adff",
                 )?)
-                .name("sia_nfs test app")
-                .description("for sia_nfs unit & integration tests only")
-                .service_url(Url::parse("https://github.com/rrauch/sia_nfs/")?)
+                .name("JanusFS")
+                .description("Local-first storage, synced to remote backends")
+                .service_url(Url::parse("https://github.com/rrauch/janus-fs/")?)
                 .build();
 
             let indexd = janus_io::indexd::client::Client::builder()
