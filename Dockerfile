@@ -18,17 +18,17 @@ RUN cd /usr/local/src/ \
 
 COPY Cargo.* /usr/local/src/janus_fs/
 COPY foyer-cache /usr/local/src/janus_fs/foyer-cache/
-COPY janus-nfs /usr/local/src/janus_fs/janus-nfs/
+COPY janus-fs /usr/local/src/janus_fs/janus-fs/
 COPY janus-io /usr/local/src/janus_fs/janus-io/
 COPY janus-vfs /usr/local/src/janus_fs/janus-vfs/
 
 # Build the `janus-nfs` binary.
 RUN cd /usr/local/src/janus_fs/ \
  && cargo build --release \
- && cp ./target/release/janus-nfs /usr/local/bin/
+ && cp ./target/release/janus-fs /usr/local/bin/
 
 # Use `depres` to identify all required files for the final image.
-RUN depres /bin/sh /bin/bash /bin/ls /usr/local/bin/janus-nfs \
+RUN depres /bin/sh /bin/bash /bin/ls /usr/local/bin/janus-fs \
     /etc/ssl/certs/ \
     /usr/share/ca-certificates/ \
     >> /tmp/export.list
@@ -56,4 +56,4 @@ EXPOSE 12000
 ENV DATA_DIR="/data/"
 ENV LISTEN_ADDRESS="0.0.0.0:12000"
 
-ENTRYPOINT ["/usr/local/bin/janus-nfs"]
+ENTRYPOINT ["/usr/local/bin/janus-fs"]

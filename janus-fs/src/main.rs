@@ -8,7 +8,7 @@ use janus_io::indexd::client::AppKey;
 use janus_io::indexd::{AppDetails, AppId};
 use janus_io::renterd::BucketName;
 use janus_io::renterd::client::ApiPassword;
-use janus_nfs::JanusNfs;
+use janus_fs::JanusNfs;
 use janus_vfs::vfs::commit::CommitId;
 use janus_vfs::vfs::config::Config;
 use janus_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
