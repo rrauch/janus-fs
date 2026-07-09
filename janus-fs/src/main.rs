@@ -2,10 +2,11 @@ use anyhow::{anyhow, bail};
 use bytesize::ByteSize;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use ct_codecs::{Decoder, Hex};
+use ct_codecs::{Decoder, Encoder, Hex};
 use foyer_cache::{FoyerChunkCache, FoyerMetadataCache};
 use janus_fs::JanusNfs;
 use janus_io::RemoteStorage;
+use janus_io::confidential::{Confidential, NewSecretExt, RevealExt};
 use janus_io::indexd::client::AppKey;
 use janus_io::indexd::{AppDetails, AppId};
 use janus_io::renterd::BucketName;
@@ -273,6 +274,8 @@ enum ToolsCommand {
 enum IndexdToolsCommand {
     /// Show account status & details.
     Status,
+    /// Connect JanusFS to your indexer account.
+    Authorize,
 }
 
 enum ConfiguredBackend {
@@ -336,9 +339,101 @@ async fn main() -> anyhow::Result<()> {
                     command: IndexdToolsCommand::Status,
                 },
         } => indexd_status(&mut remote_storage_args).await?,
+        Command::Tools {
+            command:
+                ToolsCommand::Indexd {
+                    command: IndexdToolsCommand::Authorize,
+                },
+        } => indexd_auth(&remote_storage_args).await?,
     }
 
     Ok(())
+}
+
+async fn indexd_auth(arguments: &RemoteStorageArgs) -> anyhow::Result<()> {
+    action_preview("Connect to indexer", None, None);
+    let endpoint = arguments.backend.indexd.indexd_endpoint.clone();
+    let handle =
+        janus_io::indexd::client::Client::acquire_authorization(endpoint, app_details()?).await?;
+
+    println!();
+    println!("Open the following link in your browser and follow the authorization flow:");
+    println!();
+    println!("  {}", handle.url());
+    println!();
+    println!("Then return to the console to complete the process.");
+
+    let handle = handle.await_authorization().await?;
+
+    let mnemonic;
+
+    loop {
+        println!();
+        println!("To finalize the authorization process, please enter your mnemonic phrase.");
+        println!("Make sure its a 12-word English bip39 compatible phrase:");
+        let mnemonic1 = tokio::task::spawn_blocking(|| read_mnemonic()).await?;
+
+        println!("Please re-enter your mnemonic phrase:");
+        let mnemonic2 = tokio::task::spawn_blocking(|| read_mnemonic()).await?;
+
+        if mnemonic1.reveal() == mnemonic2.reveal() {
+            mnemonic = Some(mnemonic1);
+            break;
+        }
+
+        println!();
+        println!(
+            "{} Please try again.",
+            "Mnemonic phrases do NOT match".red()
+        );
+    }
+
+    let mnemonic = mnemonic.ok_or_else(|| anyhow!("mnemonic phrase is missing"))?;
+
+    let app_key = handle.finalize(&mnemonic).await?;
+
+    let hex_key = Hex::encode_to_string(app_key.reveal().export())?;
+
+    println!();
+    println!("{} ✅", "Indexer Authorization succeeded".green().bold());
+    println!();
+
+    println!(
+        "{} The following key is your INDEXD_APPKEY: ",
+        "IMPORTANT!".bold()
+    );
+    println!();
+    println!("    {}", hex_key);
+    println!();
+    println!("{}", "KEEP IT PRIVATE".bold());
+    println!();
+
+    Ok(())
+}
+
+fn read_mnemonic() -> Confidential<String> {
+    loop {
+        match try_read_mnemonic() {
+            Ok(mnemonic) => return mnemonic,
+            Err(err) => {
+                eprintln!("{} {}", "Error reading your mnemonic phrase:".red(), err);
+                eprintln!("Please try again");
+            }
+        }
+    }
+}
+
+fn try_read_mnemonic() -> anyhow::Result<Confidential<String>> {
+    let mnemonic = rpassword::prompt_password("Enter mnemonic phrase: ")?.confidential();
+    if !is_valid_word_count(mnemonic.reveal()) {
+        bail!("mnemonic has an invalid word count. Word count must be 12");
+    }
+    Ok(mnemonic)
+}
+
+fn is_valid_word_count(phrase: &str) -> bool {
+    let count = phrase.split_whitespace().count();
+    matches!(count, 12)
 }
 
 async fn indexd_status(arguments: &mut RemoteStorageArgs) -> anyhow::Result<()> {
@@ -348,7 +443,7 @@ async fn indexd_status(arguments: &mut RemoteStorageArgs) -> anyhow::Result<()> 
     };
 
     let backend = janus_io::Backend::from(indexd);
-    action_preview("Display Account details", None, &backend);
+    action_preview("Display Account details", None, Some(&backend));
 
     let indexd = if let janus_io::Backend::Indexd(indexd) = backend {
         indexd
@@ -577,7 +672,7 @@ async fn serve_nfs(
 }
 
 async fn scan(remote_storage: janus_io::RemoteStorage) -> anyhow::Result<()> {
-    action_preview("Scan Backend", None, remote_storage.backend());
+    action_preview("Scan Backend", None, Some(remote_storage.backend()));
 
     let configs = Vfs::scan(&remote_storage).await?;
 
@@ -643,7 +738,7 @@ async fn create_fs(
     action_preview(
         "Create New File System",
         Some("Create a new, empty file system on the selected backend."),
-        remote_storage.backend(),
+        Some(remote_storage.backend()),
     );
 
     if !ask_proceed().await {
@@ -678,7 +773,7 @@ async fn delete_fs(
     action_preview(
         "Delete File System",
         Some("File System will be permanently deleted! All data will be erased!"),
-        remote_storage.backend(),
+        Some(remote_storage.backend()),
     );
 
     let configs = Vfs::scan(&remote_storage).await?;
@@ -765,7 +860,7 @@ async fn create_head(
         Head::Branch(_) => "Create New Branch",
         Head::Tag(_) => "Create New Tag",
     };
-    action_preview(title, None, remote_storage.backend());
+    action_preview(title, None, Some(remote_storage.backend()));
 
     const INDENT: &str = "    ";
 
@@ -855,7 +950,7 @@ async fn delete_head(
     action_preview(
         title,
         Some("Permanently delete the selected branch/tag"),
-        remote_storage.backend(),
+        Some(remote_storage.backend()),
     );
 
     const INDENT: &str = "    ";
@@ -897,19 +992,24 @@ async fn delete_head(
     Ok(())
 }
 
-fn action_preview(action: impl AsRef<str>, details: Option<&str>, backend: &janus_io::Backend) {
+fn action_preview(
+    action: impl AsRef<str>,
+    details: Option<&str>,
+    backend: Option<&janus_io::Backend>,
+) {
     println!("{} {}", "ACTION:".bold(), action.as_ref().cyan().bold());
 
     match backend {
-        janus_io::Backend::Indexd(indexd) => {
+        Some(janus_io::Backend::Indexd(indexd)) => {
             println!("{} {}", "BACKEND:".bold(), "indexd");
             println!("{} {}", "ENDPOINT:".bold(), indexd.endpoint());
         }
-        janus_io::Backend::Renterd(renterd) => {
+        Some(janus_io::Backend::Renterd(renterd)) => {
             println!("{} {}", "BACKEND:".bold(), "renterd");
             println!("{} {}", "ENDPOINT:".bold(), renterd.endpoint());
             println!("{} {}", "BUCKET:".bold(), renterd.bucket());
         }
+        _ => {}
     }
 
     println!();

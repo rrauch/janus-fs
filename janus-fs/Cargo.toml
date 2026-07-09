@@ -21,6 +21,7 @@ humantime = "2.3"
 itertools = { workspace = true }
 nfsserve = "0.10"
 parking_lot = { workspace = true }
+rpassword = "7"
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = { workspace = true }
