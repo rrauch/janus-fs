@@ -101,8 +101,11 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Serve a VFS via NFS.
-    Serve(ServeArgs),
+    /// Serve a VFS.
+    Serve {
+        #[command(subcommand)]
+        command: ServeCommand,
+    },
     /// Scan backend for available VFSs
     Scan,
     /// Filesystem management commands.
@@ -120,6 +123,12 @@ enum Command {
         #[command(subcommand)]
         command: TagCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServeCommand {
+    /// Serve a VFS via NFS.
+    Nfs(NfsArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -202,7 +211,7 @@ struct TagDeleteArgs {
 }
 
 #[derive(Debug, Args)]
-struct ServeArgs {
+struct NfsArgs {
     /// Id of file system to serve.
     vfs_id: String,
 
@@ -261,7 +270,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match arguments.command {
-        Command::Serve(args) => serve(remote_storage, &arguments.data_dir, args).await?,
+        Command::Serve {
+            command: ServeCommand::Nfs(args),
+        } => serve_nfs(remote_storage, &arguments.data_dir, args).await?,
         Command::Scan => scan(remote_storage).await?,
         Command::Fs {
             command: FsCommand::Create(args),
@@ -396,10 +407,10 @@ async fn build_cache(
         .build())
 }
 
-async fn serve(
+async fn serve_nfs(
     remote_storage: janus_io::RemoteStorage,
     data_dir: &PathBuf,
-    args: ServeArgs,
+    args: NfsArgs,
 ) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
