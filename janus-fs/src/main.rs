@@ -4,11 +4,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use ct_codecs::{Decoder, Hex};
 use foyer_cache::{FoyerChunkCache, FoyerMetadataCache};
+use janus_fs::JanusNfs;
+use janus_io::RemoteStorage;
 use janus_io::indexd::client::AppKey;
 use janus_io::indexd::{AppDetails, AppId};
 use janus_io::renterd::BucketName;
 use janus_io::renterd::client::ApiPassword;
-use janus_fs::JanusNfs;
 use janus_vfs::vfs::commit::CommitId;
 use janus_vfs::vfs::config::Config;
 use janus_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
@@ -32,7 +33,8 @@ enum Backend {
 #[derive(Debug, Args)]
 struct IndexdArgs {
     /// URL for indexd's API endpoint.
-    #[arg(long, short = 'i', env, value_hint = clap::ValueHint::Url, default_value = "https://sia.storage")]
+    #[arg(long, short = 'i', env, value_hint = clap::ValueHint::Url, default_value = "https://sia.storage"
+    )]
     indexd_endpoint: Url,
 
     /// Appkey for the indexd API.
@@ -85,6 +87,15 @@ struct CacheArgs {
 #[command(version)]
 /// Exports a JanusFS instance via NFS.
 struct Arguments {
+    #[command(subcommand)]
+    command: Command,
+
+    #[command(flatten)]
+    remote_storage: RemoteStorageArgs,
+}
+
+#[derive(Debug, Args)]
+struct RemoteStorageArgs {
     /// Directory to store persistent data in. Will be created if it doesn't exist.
     #[arg(long, short = 'd', env, value_hint = clap::ValueHint::DirPath)]
     data_dir: PathBuf,
@@ -94,9 +105,6 @@ struct Arguments {
 
     #[command(flatten)]
     cache: CacheArgs,
-
-    #[command(subcommand)]
-    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
@@ -122,6 +130,11 @@ enum Command {
     Tag {
         #[command(subcommand)]
         command: TagCommand,
+    },
+    /// Additional Tools
+    Tools {
+        #[command(subcommand)]
+        command: ToolsCommand,
     },
 }
 
@@ -247,54 +260,154 @@ struct NfsArgs {
     write_autocommit_after: Duration,
 }
 
+#[derive(Debug, Subcommand)]
+enum ToolsCommand {
+    /// Indexd-related tools.
+    Indexd {
+        #[command(subcommand)]
+        command: IndexdToolsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexdToolsCommand {
+    /// Show account status & details.
+    Status,
+}
+
 enum ConfiguredBackend {
     Indexd(janus_io::indexd::client::Client),
     Renterd(janus_io::renterd::client::Client),
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut arguments = Arguments::parse();
-
+async fn remote_storage(arguments: &mut RemoteStorageArgs) -> anyhow::Result<RemoteStorage> {
     tokio::fs::create_dir_all(&arguments.data_dir).await?;
 
     let backend = build_backend(&mut arguments.backend).await?;
     let cache = build_cache(&arguments.cache, &arguments.data_dir).await?;
 
-    let remote_storage_builder = janus_io::RemoteStorage::builder().cache(cache);
-    let remote_storage = match backend {
+    let remote_storage_builder = RemoteStorage::builder().cache(cache);
+    Ok(match backend {
         ConfiguredBackend::Indexd(indexd) => remote_storage_builder.backend(indexd).build().await?,
         ConfiguredBackend::Renterd(renterd) => {
             remote_storage_builder.backend(renterd).build().await?
         }
-    };
+    })
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let arguments = Arguments::parse();
+    let mut remote_storage_args = arguments.remote_storage;
 
     match arguments.command {
         Command::Serve {
             command: ServeCommand::Nfs(args),
-        } => serve_nfs(remote_storage, &arguments.data_dir, args).await?,
-        Command::Scan => scan(remote_storage).await?,
+        } => {
+            serve_nfs(
+                remote_storage(&mut remote_storage_args).await?,
+                &remote_storage_args.data_dir,
+                args,
+            )
+            .await?
+        }
+        Command::Scan => scan(remote_storage(&mut remote_storage_args).await?).await?,
         Command::Fs {
             command: FsCommand::Create(args),
-        } => create_fs(remote_storage, args).await?,
+        } => create_fs(remote_storage(&mut remote_storage_args).await?, args).await?,
         Command::Fs {
             command: FsCommand::Delete(args),
-        } => delete_fs(remote_storage, args).await?,
+        } => delete_fs(remote_storage(&mut remote_storage_args).await?, args).await?,
         Command::Branch {
             command: BranchCommand::Create(args),
-        } => create_branch(remote_storage, args).await?,
+        } => create_branch(remote_storage(&mut remote_storage_args).await?, args).await?,
         Command::Branch {
             command: BranchCommand::Delete(args),
-        } => delete_branch(remote_storage, args).await?,
+        } => delete_branch(remote_storage(&mut remote_storage_args).await?, args).await?,
         Command::Tag {
             command: TagCommand::Create(args),
-        } => create_tag(remote_storage, args).await?,
+        } => create_tag(remote_storage(&mut remote_storage_args).await?, args).await?,
         Command::Tag {
             command: TagCommand::Delete(args),
-        } => delete_tag(remote_storage, args).await?,
+        } => delete_tag(remote_storage(&mut remote_storage_args).await?, args).await?,
+        Command::Tools {
+            command:
+                ToolsCommand::Indexd {
+                    command: IndexdToolsCommand::Status,
+                },
+        } => indexd_status(&mut remote_storage_args).await?,
     }
 
     Ok(())
+}
+
+async fn indexd_status(arguments: &mut RemoteStorageArgs) -> anyhow::Result<()> {
+    let indexd = match build_backend(&mut arguments.backend).await? {
+        ConfiguredBackend::Indexd(indexd) => indexd,
+        _ => bail!("backend needs to be indexd"),
+    };
+
+    let backend = janus_io::Backend::from(indexd);
+    action_preview("Display Account details", None, &backend);
+
+    let indexd = if let janus_io::Backend::Indexd(indexd) = backend {
+        indexd
+    } else {
+        unreachable!()
+    };
+
+    let account = indexd.account().await?;
+
+    const INDENT: &str = "    ";
+
+    println!();
+    println!("{} ✅", "Account Details retrieved".green().bold());
+    println!();
+
+    println!("{}{}", INDENT, "ACCOUNT KEY:".bold());
+    println!("{}{}", INDENT, account.account_key);
+    println!();
+
+    println!("{}{}", INDENT, "ACCOUNT STATUS:".bold());
+    if account.ready {
+        println!("{}{}", INDENT, "ready".green());
+    } else {
+        println!("{}{}", INDENT, "not ready".yellow());
+    }
+    println!();
+
+    println!("{}{}", INDENT, "LAST USED:".bold());
+    println!("{}{}", INDENT, account.last_used);
+    println!();
+
+    println!("{}{}", INDENT, "PINNED DATA:".bold());
+    println!("{}{}", INDENT, ByteSize::b(account.pinned_data));
+    println!();
+
+    println!("{}{}", INDENT, "MAX PINNED DATA:".bold());
+    println!("{}{}", INDENT, ByteSize::b(account.max_pinned_data));
+    println!();
+
+    println!("{}{}", INDENT, "PINNED SIZE:".bold());
+    println!("{}{}", INDENT, ByteSize::b(account.pinned_size));
+    println!();
+
+    println!("{}{}", INDENT, "REMAINING STORAGE:".bold());
+    println!("{}{}", INDENT, ByteSize::b(account.remaining_storage));
+    println!();
+
+    Ok(())
+}
+
+fn app_details() -> anyhow::Result<AppDetails> {
+    Ok(AppDetails::builder()
+        .id(AppId::from_str(
+            "b9f0bda1b97b7d44ae6369ac830851a115311bb59aa2d848beda6ae95d10adff",
+        )?)
+        .name("JanusFS")
+        .description("Local-first storage, synced to remote backends")
+        .service_url(Url::parse("https://github.com/rrauch/janus-fs/")?)
+        .build())
 }
 
 async fn build_backend(args: &mut BackendArgs) -> anyhow::Result<ConfiguredBackend> {
@@ -308,14 +421,7 @@ async fn build_backend(args: &mut BackendArgs) -> anyhow::Result<ConfiguredBacke
             let app_key = parse_appkey(app_key_arg.as_str())?;
             app_key_arg.zeroize();
 
-            let app_details = AppDetails::builder()
-                .id(AppId::from_str(
-                    "b9f0bda1b97b7d44ae6369ac830851a115311bb59aa2d848beda6ae95d10adff",
-                )?)
-                .name("JanusFS")
-                .description("Local-first storage, synced to remote backends")
-                .service_url(Url::parse("https://github.com/rrauch/janus-fs/")?)
-                .build();
+            let app_details = app_details()?;
 
             let indexd = janus_io::indexd::client::Client::builder()
                 .indexd_endpoint(args.indexd.indexd_endpoint.clone())
@@ -471,7 +577,7 @@ async fn serve_nfs(
 }
 
 async fn scan(remote_storage: janus_io::RemoteStorage) -> anyhow::Result<()> {
-    action_preview("Scan Backend", None, &remote_storage);
+    action_preview("Scan Backend", None, remote_storage.backend());
 
     let configs = Vfs::scan(&remote_storage).await?;
 
@@ -537,7 +643,7 @@ async fn create_fs(
     action_preview(
         "Create New File System",
         Some("Create a new, empty file system on the selected backend."),
-        &remote_storage,
+        remote_storage.backend(),
     );
 
     if !ask_proceed().await {
@@ -572,7 +678,7 @@ async fn delete_fs(
     action_preview(
         "Delete File System",
         Some("File System will be permanently deleted! All data will be erased!"),
-        &remote_storage,
+        remote_storage.backend(),
     );
 
     let configs = Vfs::scan(&remote_storage).await?;
@@ -659,7 +765,7 @@ async fn create_head(
         Head::Branch(_) => "Create New Branch",
         Head::Tag(_) => "Create New Tag",
     };
-    action_preview(title, None, &remote_storage);
+    action_preview(title, None, remote_storage.backend());
 
     const INDENT: &str = "    ";
 
@@ -749,7 +855,7 @@ async fn delete_head(
     action_preview(
         title,
         Some("Permanently delete the selected branch/tag"),
-        &remote_storage,
+        remote_storage.backend(),
     );
 
     const INDENT: &str = "    ";
@@ -791,14 +897,10 @@ async fn delete_head(
     Ok(())
 }
 
-fn action_preview(
-    action: impl AsRef<str>,
-    details: Option<&str>,
-    remote_storage: &janus_io::RemoteStorage,
-) {
+fn action_preview(action: impl AsRef<str>, details: Option<&str>, backend: &janus_io::Backend) {
     println!("{} {}", "ACTION:".bold(), action.as_ref().cyan().bold());
 
-    match remote_storage.backend() {
+    match backend {
         janus_io::Backend::Indexd(indexd) => {
             println!("{} {}", "BACKEND:".bold(), "indexd");
             println!("{} {}", "ENDPOINT:".bold(), indexd.endpoint());

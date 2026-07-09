@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
+pub use sia_storage::Account;
 pub use sia_storage::AppKey;
 
 #[derive(Debug, Error)]
@@ -112,6 +113,10 @@ impl Client {
         Ok(AuthorizationHandle {
             state: AwaitingUserAuthorization { url, builder },
         })
+    }
+
+    pub async fn account(&self) -> Result<Account, ClientError> {
+        Ok(self.0.sdk.account().await?)
     }
 
     #[inline]
