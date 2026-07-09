@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["foyer-cache", "janus-nfs", "janus-io", "janus-vfs"]
+members = ["foyer-cache", "janus-fs", "janus-io", "janus-vfs"]
 
 [workspace.dependencies]
 foyer-cache = { path = "foyer-cache" }
