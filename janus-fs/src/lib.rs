@@ -19,7 +19,7 @@ pub struct JanusNfs {
 impl JanusNfs {
     pub async fn new(
         remote_storage: RemoteStorage,
-        vfs_id: &str,
+        volume_id: &str,
         head: Option<Head>,
         read_only: bool,
         db_path: &Path,
@@ -30,7 +30,7 @@ impl JanusNfs {
         dir_mode: u32,
         write_autocommit_after: Duration,
     ) -> Result<Self> {
-        let vfs_id = VfsId::from_str(vfs_id).map_err(|_| anyhow!("invalid vfs id"))?;
+        let vfs_id = VfsId::from_str(volume_id).map_err(|_| anyhow!("invalid volume id"))?;
         let db_file = db_path.join(format!("{}.sqlite", vfs_id));
 
         let export_name = format!("{}", &vfs_id);
