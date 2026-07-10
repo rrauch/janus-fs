@@ -86,7 +86,7 @@ struct CacheArgs {
 
 #[derive(Debug, Parser)]
 #[command(version)]
-/// Exports a JanusFS instance via NFS.
+/// Exports a JanusFS Volume via NFS.
 struct Arguments {
     #[command(subcommand)]
     command: Command,
@@ -110,17 +110,17 @@ struct RemoteStorageArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Serve a VFS.
+    /// Serve a Volume.
     Serve {
         #[command(subcommand)]
         command: ServeCommand,
     },
-    /// Scan backend for available VFSs
+    /// Scan backend for available Volumes
     Scan,
-    /// Filesystem management commands.
-    Fs {
+    /// Volume management commands.
+    Volume {
         #[command(subcommand)]
-        command: FsCommand,
+        command: VolumeCommand,
     },
     /// Branch management commands.
     Branch {
@@ -141,29 +141,29 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ServeCommand {
-    /// Serve a VFS via NFS.
+    /// Serve a Volume via NFS.
     Nfs(NfsArgs),
 }
 
 #[derive(Debug, Subcommand)]
-enum FsCommand {
-    /// Create a new VFS.
-    Create(FsCreateArgs),
-    /// Delete an existing VFS (dangerous).
-    Delete(FsDeleteArgs),
+enum VolumeCommand {
+    /// Create a new Volume.
+    Create(VolumeCreateArgs),
+    /// Delete an existing Volume (dangerous).
+    Delete(VolumeDeleteArgs),
 }
 
 #[derive(Debug, Args)]
-struct FsCreateArgs {
-    /// Optional description of new file system.
+struct VolumeCreateArgs {
+    /// Optional description of new Volume.
     #[arg(long)]
     description: Option<String>,
 }
 
 #[derive(Debug, Args)]
-struct FsDeleteArgs {
-    /// ID of file system to permanently delete.
-    vfs_id: String,
+struct VolumeDeleteArgs {
+    /// ID of Volume to permanently delete.
+    volume_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -181,8 +181,8 @@ struct BranchCreateArgs {
     /// Optional description of new branch.
     #[arg(long)]
     description: Option<String>,
-    /// ID of file system.
-    vfs_id: String,
+    /// ID of Volume.
+    volume_id: String,
     /// Commit ID associated with new branch.
     commit: String,
 }
@@ -191,8 +191,8 @@ struct BranchCreateArgs {
 struct BranchDeleteArgs {
     /// Name of branch to delete.
     name: String,
-    /// ID of file system.
-    vfs_id: String,
+    /// ID of Volume.
+    volume_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,8 +210,8 @@ struct TagCreateArgs {
     /// Optional description of new tag.
     #[arg(long)]
     description: Option<String>,
-    /// ID of file system.
-    vfs_id: String,
+    /// ID of Volume.
+    volume_id: String,
     /// Commit ID associated with new tag.
     commit: String,
 }
@@ -220,14 +220,14 @@ struct TagCreateArgs {
 struct TagDeleteArgs {
     /// Name of tag to delete.
     name: String,
-    /// ID of file system.
-    vfs_id: String,
+    /// ID of Volume.
+    volume_id: String,
 }
 
 #[derive(Debug, Args)]
 struct NfsArgs {
-    /// Id of file system to serve.
-    vfs_id: String,
+    /// ID of Volume to serve.
+    volume_id: String,
 
     /// Branch name to serve.
     #[arg(long, conflicts_with = "tag")]
@@ -315,12 +315,12 @@ async fn main() -> anyhow::Result<()> {
             .await?
         }
         Command::Scan => scan(remote_storage(&mut remote_storage_args).await?).await?,
-        Command::Fs {
-            command: FsCommand::Create(args),
-        } => create_fs(remote_storage(&mut remote_storage_args).await?, args).await?,
-        Command::Fs {
-            command: FsCommand::Delete(args),
-        } => delete_fs(remote_storage(&mut remote_storage_args).await?, args).await?,
+        Command::Volume {
+            command: VolumeCommand::Create(args),
+        } => create_volume(remote_storage(&mut remote_storage_args).await?, args).await?,
+        Command::Volume {
+            command: VolumeCommand::Delete(args),
+        } => delete_volume(remote_storage(&mut remote_storage_args).await?, args).await?,
         Command::Branch {
             command: BranchCommand::Create(args),
         } => create_branch(remote_storage(&mut remote_storage_args).await?, args).await?,
@@ -630,7 +630,7 @@ async fn serve_nfs(
 
     let janus_nfs = JanusNfs::new(
         remote_storage,
-        args.vfs_id.as_str(),
+        args.volume_id.as_str(),
         head,
         args.read_only,
         data_dir,
@@ -698,7 +698,7 @@ async fn scan(remote_storage: janus_io::RemoteStorage) -> anyhow::Result<()> {
 }
 
 fn print_config(config: &Config, indent: &str) {
-    println!("{}{}", indent, "VFS ID:".bold());
+    println!("{}{}", indent, "VOLUME ID:".bold());
     println!("{}{}", indent, config.vfs_id());
     if let Some(description) = config.description() {
         println!("{}{}", indent, description);
@@ -731,13 +731,13 @@ fn print_config(config: &Config, indent: &str) {
     }
 }
 
-async fn create_fs(
+async fn create_volume(
     remote_storage: janus_io::RemoteStorage,
-    args: FsCreateArgs,
+    args: VolumeCreateArgs,
 ) -> anyhow::Result<()> {
     action_preview(
-        "Create New File System",
-        Some("Create a new, empty file system on the selected backend."),
+        "Create New Volume",
+        Some("Create a new, empty Volume on the selected backend."),
         Some(remote_storage.backend()),
     );
 
@@ -752,27 +752,28 @@ async fn create_fs(
     const INDENT: &str = "    ";
 
     println!();
-    println!("{} ✅", "File System Creation Complete".green().bold());
+    println!("{} ✅", "Volume Creation Complete".green().bold());
     println!();
 
     let configs = Vfs::scan(&remote_storage).await?;
     let config = configs
         .into_iter()
         .find(|c| c.vfs_id() == &vfs_id)
-        .ok_or_else(|| anyhow!("newly created VFS with id '{}' not found", &vfs_id))?;
+        .ok_or_else(|| anyhow!("newly created Volume with ID '{}' not found", &vfs_id))?;
 
     print_config(&config, INDENT);
     Ok(())
 }
 
-async fn delete_fs(
+async fn delete_volume(
     remote_storage: janus_io::RemoteStorage,
-    args: FsDeleteArgs,
+    args: VolumeDeleteArgs,
 ) -> anyhow::Result<()> {
-    let vfs_id = VfsId::from_str(args.vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
+    let vfs_id =
+        VfsId::from_str(args.volume_id.as_str()).map_err(|_| anyhow!("invalid volume id"))?;
     action_preview(
-        "Delete File System",
-        Some("File System will be permanently deleted! All data will be erased!"),
+        "Delete Volume",
+        Some("Volume will be permanently deleted! All data will be erased!"),
         Some(remote_storage.backend()),
     );
 
@@ -785,11 +786,11 @@ async fn delete_fs(
         println!();
         println!(
             "{} {}",
-            "No File System Config found with ID".yellow().bold(),
+            "No Volume Config found with ID".yellow().bold(),
             &vfs_id
         );
         println!(
-            "{}", "Abandoned Objects associated with the File System might still be present and can be deleted".yellow(),
+            "{}", "Abandoned Objects associated with the Volume might still be present and can be deleted".yellow(),
         );
         println!();
     }
@@ -805,10 +806,10 @@ async fn delete_fs(
         println!();
         println!(" ❌ {}", "No objects found to delete".red().bold());
         println!();
-        bail!("File System deletion failed");
+        bail!("Volume deletion failed");
     }
     println!();
-    println!("{} ✅", "File System Deletion Complete".green().bold());
+    println!("{} ✅", "Volume Deletion Complete".green().bold());
     println!("{} {}", "Objects deleted:".bold(), deleted_objects);
     println!();
 
@@ -824,7 +825,7 @@ async fn create_branch(
         remote_storage,
         branch_name.into(),
         args.description,
-        args.vfs_id,
+        args.volume_id,
         args.commit,
     )
     .await
@@ -839,7 +840,7 @@ async fn create_tag(
         remote_storage,
         tag_name.into(),
         args.description,
-        args.vfs_id,
+        args.volume_id,
         args.commit,
     )
     .await
@@ -849,10 +850,10 @@ async fn create_head(
     remote_storage: janus_io::RemoteStorage,
     head: Head,
     description: Option<String>,
-    vfs_id: String,
+    volume_id: String,
     commit_id: String,
 ) -> anyhow::Result<()> {
-    let vfs_id = VfsId::from_str(vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
+    let vfs_id = VfsId::from_str(volume_id.as_str()).map_err(|_| anyhow!("invalid volume id"))?;
     let commit_id =
         CommitId::from_str(commit_id.as_str()).map_err(|_| anyhow!("invalid commit id"))?;
 
@@ -881,7 +882,7 @@ async fn create_head(
         println!();
     }
 
-    println!("{}{}", INDENT, "VFS-ID:".bold());
+    println!("{}{}", INDENT, "VOLUME-ID:".bold());
     println!("{}{}", INDENT, &vfs_id);
     println!();
 
@@ -925,7 +926,7 @@ async fn delete_branch(
     args: BranchDeleteArgs,
 ) -> anyhow::Result<()> {
     let branch_name = BranchName::from_str(args.name.as_str())?;
-    delete_head(remote_storage, branch_name.into(), args.vfs_id).await
+    delete_head(remote_storage, branch_name.into(), args.volume_id).await
 }
 
 async fn delete_tag(
@@ -933,15 +934,15 @@ async fn delete_tag(
     args: TagDeleteArgs,
 ) -> anyhow::Result<()> {
     let tag_name = TagName::from_str(args.name.as_str())?;
-    delete_head(remote_storage, tag_name.into(), args.vfs_id).await
+    delete_head(remote_storage, tag_name.into(), args.volume_id).await
 }
 
 async fn delete_head(
     remote_storage: janus_io::RemoteStorage,
     head: Head,
-    vfs_id: String,
+    volume_id: String,
 ) -> anyhow::Result<()> {
-    let vfs_id = VfsId::from_str(vfs_id.as_str()).map_err(|_| anyhow!("invalid vfs id"))?;
+    let vfs_id = VfsId::from_str(volume_id.as_str()).map_err(|_| anyhow!("invalid volume id"))?;
 
     let title = match &head {
         Head::Branch(_) => "Delete Branch",
@@ -966,7 +967,7 @@ async fn delete_head(
         }
     }
     println!();
-    println!("{}{}", INDENT, "VFS-ID:".bold());
+    println!("{}{}", INDENT, "VOLUME-ID:".bold());
     println!("{}{}", INDENT, &vfs_id);
     println!();
 
