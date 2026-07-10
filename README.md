@@ -1,190 +1,216 @@
 ![JanusFS](logo.svg)
 
+A content-addressed storage system with local-first writes, backed by the Sia decentralized storage network.
+
 ## Description
 
-`sia_nfs` provides access to one or more Sia buckets via a plain NFS interface, allowing any compatible client to access
-the hosted files and directories directly without needing to run a Sia client
-or [renterd](https://sia.tech/software/renterd). This gateway can be used locally to mount a Sia filesystem or made
-available to an entire network. It is designed to work on Linux, macOS, Windows, and potentially other operating
-systems.
+JanusFS stores your data on the network but keeps writes fast by applying them locally first. It syncs in the
+background, caches aggressively, and avoids storing the same data twice.
 
-## Features
+If you know Git, the model will feel familiar: every change creates a new addressable state called a **commit**. Each
+commit has an ID you can point a branch or tag at. That gives you branching and tagging for free.
 
-- **NFS v3 support**
-- **Cross-Platform:** Runs on every platform where [renterd](https://sia.tech/software/renterd) is available.
-- **Integrated Metadata & Content Cache:** Improves access performance, reduces latency, and lowers usage costs.
-- **Open Source:** Released under the Apache-2.0 and MIT licenses.
+## How it works
 
-## Functionality
+- **Local-first writes.** You write locally. Writes finish at local disk speed, even offline.
+- **Periodic sync.** JanusFS pushes and pulls changes in the background to stay in sync with remote storage.
+- **Local cache.** Cached data is read locally, so you skip the network when you don't need it.
+- **Chunked storage.** Data is split into chunks, so you can read or write part of a file without fetching the whole
+  thing.
+- **Content addressing.** Each chunk is identified by its content, so identical chunks are stored only once. You get
+  deduplication automatically.
 
-- **Multi-Bucket Support:** One or more buckets can be made available for a unified file system.
-- **Mounting and Unmounting:** Mounting and unmounting works as expected.
-- **Directory Listing:** Files and directories can be listed and navigated.
-- **Directory Creation:** New empty directories can be created.
-- **Directory Removal:** Empty directories can be deleted.
-- **File Deletion:** Files can be deleted.
-- **Renaming and Moving:** Files and directories can be renamed and moved (within the same bucket).
-- **File Reading:** Files can be read as expected, including seeking.
-- **File Writing:** New files can be created and written to, including copying an existing file.
+Everything runs in userspace. There's no kernel module or FUSE dependency to manage.
 
-**Note:** Existing files cannot be written to as Sia objects are immutable.
+## The Git-like model
 
-## Status
+Every change produces a new addressable state (a commit). This gives you two things without extra work:
 
-**BETA**: The project has progressed well and is now in a fairly usable state. However, this version is not yet
-considered mature and comes with some limitations, caveats, and certainly some bugs. At this point, it is **not
-recommended** to use `sia_nfs` with important data.
+- **Branches** - mountable read-write or read-only.
+- **Tags (snapshots)** - mountable read-only.
 
-The server has been tested on Linux (x86_64). Clients have been tested on Linux, macOS, and Windows.
+You create and delete both through the CLI.
 
-*Use at your own risk.*
+## Storage backends
 
-## Test Drive
+Pick a backend with the `--backend` flag:
 
-A `Dockerfile` as well as a pre-built image is available to make it easy for you to try out `sia_nfs`.
+- **`indexd`** (default) - connects to the Sia network through an indexer. You authorize it against your indexer
+  account.
+- **`renterd`** - connects through your own `renterd` instance and a chosen bucket.
 
-### Build from Source
+## Docker
+
+Run JanusFS in a container. Build the image yourself, or pull the pre-built one.
+
+### Build locally
 
 ```bash
-# Clone the repository
-git clone https://github.com/rrauch/sia_nfs.git
-cd sia_nfs
-# Build the Docker image
-docker build ./ -t sia_nfs
+git clone https://github.com/rrauch/janus-fs.git
+cd janus-fs
+docker build ./ -t janus-fs
 ```
 
-or
-
-### Pull from Github Container Registry
+### Pull from GitHub Container Registry
 
 ```bash
-docker pull ghcr.io/rrauch/sia_nfs:latest
-docker tag ghcr.io/rrauch/sia_nfs:latest sia_nfs:latest
+docker pull ghcr.io/rrauch/janus-fs:latest
 ```
 
-### Run
+## Using the CLI
+
+The `janus-fs` command handles setup, management, and serving. The sections below walk through it.
+
+### Quick start (indexd backend)
+
+**1. Get an indexd app key.**
+
+Run the authorize flow. It connects JanusFS to your indexer account and gives you an app key:
 
 ```bash
-# Create a persistent volume `sia_nfs_data`
-docker volume create sia_nfs_data
-
-# Run the Docker container in the foreground
-docker run -it --rm -p 12000:12000 -v sia_nfs_data:/data sia_nfs -e [renterd_api_endpoint] -s [renterd_api_password] [bucket..]
+janus-fs tools indexd authorize
 ```
 
-Replace `[renterd_api_endpoint]` with the URL of your renterd API, e.g., `http://localhost:9880/api/`.
-Replace `[renterd_api_password]` with your API password. Finally, replace `[bucket..]` with the names of one or more
-buckets you want
-to export.
-
-You can now connect from any NFSv3-compatible client. Note that both the portmapper port and the mount port are set to
-`12000`.
-
-### Mount
-
-Replace `[host]` with the address of the machine where the Docker container is running, e.g., `localhost`.
-
-#### On Linux (`sudo` may be required):
+**2. Check your account status.**
 
 ```bash
-mkdir sia
-mount -t nfs -o nolock,vers=3,tcp,port=12000,mountport=12000,soft [host]:/sia sia
+janus-fs -k <INDEXD_APPKEY> tools indexd status
 ```
 
-#### On macOS:
+Wait until the account status shows **ready** before continuing. This can take a moment.
+
+**3. Create a storage volume.**
 
 ```bash
-mkdir sia
-mount_nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000 [host]:/sia sia
+janus-fs -d <DATA_DIR> -k <INDEXD_APPKEY> volume create --description "my first volume"
 ```
 
-#### On Windows:
+Replace `<DATA_DIR>` with a directory of your choice for persistent local data. JanusFS creates it if it doesn't exist.
+This command prints a volume ID (`volume_id`) that you'll use below.
 
-**Note:** Windows `Pro` is required, as `Home` does not include an NFS client. Additionally, the NFS client is not
-installed by default, so you may need to add it manually.
+**4. Serve it over NFS.**
 
 ```bash
-mount.exe -o anon,nolock \\[host]\sia S:
+janus-fs -d <DATA_DIR> -k <INDEXD_APPKEY> serve nfs <volume_id>
 ```
 
-**Another Note:** Windows expects the NFS mount port to be `111` and does not allow you to specify a different one. You
-need to run the Docker container with this command:
+By default this listens on `localhost:12000`. Mount it with your system's NFS client to start reading and writing.
+
+### Command reference
+
+All commands share the global storage options: `--data-dir`, `--backend`, and cache settings.
+See [Global options](#global-options) below.
+
+#### Discover volumes, branches, and tags
+
+Scan the backend to see what it holds. This lists every volume, along with its known branches and tags and their commit
+IDs.
 
 ```bash
-docker run -it --rm -p 111:111 -v sia_nfs_data:/data sia_nfs -e [renterd_api_endpoint] -s [renterd_api_password] -l 0.0.0.0:111 [bucket..]
+janus-fs -d <DATA_DIR> scan
 ```
 
-**Third Note:** If you encounter the error `failed to bind port 0.0.0.0:111/tcp`, check if `rpcbind.service`
-and/or `rpcbind.socket` are running on your system. Ensure both are stopped and that nothing is listening on port `111`
-before trying again.
+Use the commit IDs from this output when you create a branch or tag.
 
-## Caching
-
-`sia_nfs` caches both metadata and content. *Metadata* caching is always active and automatically syncs with `renterd`,
-either periodically or whenever a file system change is made via `sia_nfs`.
-
-*Content* is cached in deduplicated chunks and is always checked against `renterd` to ensure no stale content is
-delivered. By default, the disk cache is limited to a maximum size of `2 GiB`. This can be configured using
-the `--max-cache-size` argument. Setting this value to `0` completely disables the disk cache. The location of the disk
-cache can also be configured via the `--cache-dir` argument and can be set separately from the `--data-dir`, which
-contains `sia_nfs`'s main persistent data, such as the metadata cache.
-
-**Please note:** Changes made directly to `renterd` (not via `sia_nfs`) will **NOT** be reflected immediately, as there
-is currently no mechanism to receive notifications of changes via the `renterd` API.
-
-## Known Issues & Limitations
-
-- As mentioned above, file content can **NOT** be modified. Files can be renamed, moved around etc. but writing to /
-  overwriting existing files is not possible.
-- On Windows: The Windows client requires `sia_nfs` to run on port 111. Other ports are not supported.
-- On macOS: Mounting attempts seem to lead to an infinite loop from the client if `sia_nfs` runs on port `111`. Other
-  ports are fine.
-- Write errors: Due to the stateless nature of NFSv3, `sia_nfs` cannot clearly determine when a client is done writing
-  to a file, as there is no `close` call or equivalent. A file is considered closed if there are no more write calls for
-  a specific amount of time, with the default being `10s`. In rare cases, this can lead to `sia_nfs` closing a file
-  prematurely if the client pauses writing but hasn't actually finished. If you encounter this issue, you can adjust the
-  timeout period using the `--write-autocommit-after` argument. For example, you can set it to `20s`, `30s` or
-  even `1min` to better suit your specific situation.
-
-## Usage
+#### Manage volumes
 
 ```bash
-:~$ sia_nfs --help
-Exports Sia buckets via NFS. Connects to renterd, allowing direct NFS access to exported buckets
+# Create a volume (prints a new volume_id)
+janus-fs -d <DATA_DIR> volume create --description "notes"
 
-Usage: sia_nfs [OPTIONS] --renterd-api-endpoint <RENTERD_API_ENDPOINT> --renterd-api-password <RENTERD_API_PASSWORD> --data-dir <DATA_DIR> <BUCKETS>...
-
-Arguments:
-  <BUCKETS>...  List of buckets to export
-
-Options:
-  -e, --renterd-api-endpoint <RENTERD_API_ENDPOINT>
-          URL for renterd's API endpoint (e.g., http://localhost:9880/api/) [env: RENTERD_API_ENDPOINT=]
-  -s, --renterd-api-password <RENTERD_API_PASSWORD>
-          Password for the renterd API. It's recommended to use an environment variable for this [env: RENTERD_API_PASSWORD=]
-  -d, --data-dir <DATA_DIR>
-          Directory to store persistent data in. Will be created if it doesn't exist [env: DATA_DIR=/data/]
-  -c, --cache-dir <CACHE_DIR>
-          Optional directory to store the content cache in. Defaults to `DATA_DIR` if not set. Will be created if it doesn't exist [env: CACHE_DIR=]
-  -m, --max-cache-size <MAX_CACHE_SIZE>
-          Maximum size of content cache. Set to `0` to disable [env: MAX_CACHE_SIZE=] [default: "2 GiB"]
-  -l, --listen-address <LISTEN_ADDRESS>
-          Host and port to listen on [env: LISTEN_ADDRESS=0.0.0.0:12000] [default: localhost:12000]
-      --uid <UID>
-          UID of files and directories [env: INODE_UID=] [default: 1000]
-      --gid <GID>
-          GID of files and directories [env: INODE_GID=] [default: 1000]
-      --file-mode <FILE_MODE>
-          Unix file permissions [env: FILE_MODE=] [default: 0600]
-      --dir-mode <DIR_MODE>
-          Unix directory permissions [env: DIR_MODE=] [default: 0700]
-      --write-autocommit-after <WRITE_AUTOCOMMIT_AFTER>
-          Time without write activity after which a new file is considered complete [env: WRITE_AUTOCOMMIT_AFTER=] [default: 10s]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
+# Delete a volume permanently (this cannot be undone)
+janus-fs -d <DATA_DIR> volume delete <volume_id>
 ```
+
+#### Manage branches
+
+A branch points at a commit and can be served read-write or read-only. Get commit IDs by running `scan` (see
+[Discover volumes, branches, and tags](#discover-volumes-branches-and-tags)).
+
+```bash
+# Create a branch from a commit
+janus-fs -d <DATA_DIR> branch create <name> <volume_id> <commit_id> --description "feature work"
+
+# Delete a branch
+janus-fs -d <DATA_DIR> branch delete <name> <volume_id>
+```
+
+#### Manage tags
+
+A tag is a read-only snapshot of a commit. Get commit IDs by running `scan` (see
+[Discover volumes, branches, and tags](#discover-volumes-branches-and-tags)).
+
+```bash
+# Create a tag from a commit
+janus-fs -d <DATA_DIR> tag create <name> <volume_id> <commit_id> --description "backup 2026-12-17"
+
+# Delete a tag
+janus-fs -d <DATA_DIR> tag delete <name> <volume_id>
+```
+
+#### Serve over NFS
+
+```bash
+janus-fs -d <DATA_DIR> serve nfs <volume_id> [OPTIONS]
+```
+
+Serve a branch or a tag (not both):
+
+- `--branch <name>` - serve a branch.
+- `--tag <name>` - serve a tag (always read-only).
+- `--read-only` - serve read-only.
+
+Other NFS options:
+
+| Option                     | Default           | Description                                            |
+|----------------------------|-------------------|--------------------------------------------------------|
+| `--listen-address`, `-l`   | `localhost:12000` | Host and port to listen on.                            |
+| `--uid`                    | `1000`            | UID for files and directories.                         |
+| `--gid`                    | `1000`            | GID for files and directories.                         |
+| `--file-mode`              | `0600`            | Unix file permissions (octal).                         |
+| `--dir-mode`               | `0700`            | Unix directory permissions (octal).                    |
+| `--write-autocommit-after` | `10s`             | Idle time after which a file write counts as complete. |
+
+### Global options
+
+These apply to every command and can also be set through environment variables.
+
+#### Storage
+
+| Option             | Description                                                            |
+|--------------------|------------------------------------------------------------------------|
+| `--data-dir`, `-d` | Directory for persistent local data. Created if missing. **Required.** |
+| `--backend`        | `indexd` (default) or `renterd`.                                       |
+
+#### indexd backend
+
+| Option                    | Default               | Description                 |
+|---------------------------|-----------------------|-----------------------------|
+| `--indexd-endpoint`, `-i` | `https://sia.storage` | indexd API endpoint URL.    |
+| `--indexd-appkey`, `-k`   | -                     | App key for the indexd API. |
+
+#### renterd backend
+
+| Option                         | Description               |
+|--------------------------------|---------------------------|
+| `--renterd-api-endpoint`, `-e` | renterd API endpoint URL. |
+| `--renterd-api-password`, `-s` | renterd API password.     |
+| `--bucket`, `-b`               | Bucket to use.            |
+
+#### Cache
+
+| Option                            | Default                    | Description                                   |
+|-----------------------------------|----------------------------|-----------------------------------------------|
+| `--cache-dir`, `-c`               | falls back to `--data-dir` | Directory for cache data. Created if missing. |
+| `--max-cache-size`, `-m`          | `2 GiB`                    | Content cache size. Set to `0` to disable.    |
+| `--max-metadata-cache-size`, `-n` | `256 MiB`                  | Metadata cache size. Set to `0` to disable.   |
+
+All options accept environment variables. For example, set `DATA_DIR` instead of passing `--data-dir` on every call.
+
+## Using it as a library
+
+If you want to use JanusFS directly in your own Rust code, the `janus-vfs` crate exposes the same storage system the CLI
+is built on.
 
 ## License
 
@@ -200,4 +226,4 @@ defined in the Apache-2.0 license, shall be dual licensed as above, without any 
 
 ## Acknowledgements
 
-This project has been made possible by the [Sia Foundation's Grant program](https://sia.tech/grants). 
+This project has been made possible by the [Sia Foundation's Grant program](https://sia.tech/grants).
