@@ -1,7 +1,3 @@
-mod upload;
-
-use crate::io_scheduler::Scheduler;
-use crate::nfs::upload::Upload;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -19,12 +15,10 @@ use nfsserve::nfs::{
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use std::cmp::min;
 use std::io::SeekFrom;
-use std::time::Duration;
 use tracing::instrument;
 
 pub(crate) struct JanusNfsFs {
     vfs: Vfs,
-    uploader: Scheduler<Upload>,
     uid: u32,
     gid: u32,
     file_mode: u32,
@@ -36,7 +30,6 @@ pub(crate) struct JanusNfsFs {
 impl JanusNfsFs {
     pub(super) async fn new(
         vfs: Vfs,
-        upload_max_idle: Duration,
         uid: u32,
         gid: u32,
         file_mode: u32,
@@ -45,9 +38,7 @@ impl JanusNfsFs {
         let root_id = vfs.root().await?.inode_id();
         let (_, fs_id) = vfs.id().as_u64_pair();
 
-        let uploader = Upload::new(vfs.clone(), upload_max_idle);
         Ok(Self {
-            uploader,
             vfs,
             uid,
             gid,
@@ -154,28 +145,26 @@ impl NFSFileSystem for JanusNfsFs {
             .try_into()
             .map_err(|_| NFS3ERR_ISDIR)?;
 
-        let mut upload = self
-            .uploader
-            .access(&file.inode_id(), offset)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to acquire upload handle for {}", file.inode_id());
-                NFS3ERR_NOENT
-            })?;
-        let upload = upload.as_mut();
-
-        upload.write_all(data).await.map_err(|e| {
+        let mut fh = self.vfs.open_rw(&file).await.map_err(|e| {
+            tracing::error!(error = %e, "open_rw error");
+            NFS3ERR_IO
+        })?;
+        fh.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+            tracing::error!(error = %e, "seek error");
+            NFS3ERR_IO
+        })?;
+        fh.write_all(data).await.map_err(|e| {
             tracing::error!(error = %e, "write error");
             NFS3ERR_IO
         })?;
 
-        let inode = Inode::File(upload.fsync().await.map_err(|e| {
-            tracing::error!(error = %e, "fsync error");
+        let file = fh.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "commit error");
             NFS3ERR_IO
-        })?);
+        })?;
         tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
 
-        Ok(self.to_fattr3(&inode))
+        Ok(self.to_fattr3(&Inode::from(file)))
     }
 
     async fn create(
@@ -205,16 +194,14 @@ impl NFSFileSystem for JanusNfsFs {
             .try_into()
             .map_err(|_| NFS3ERR_NOTDIR)?;
 
-        let file_id = self
-            .uploader
-            .prepare(&(parent.inode_id(), name.to_owned()))
+        let inode: Inode = self
+            .vfs
+            .create_file(&parent, &name)
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to prepare upload");
-                NFS3ERR_IO
-            })?;
+            .map_err(|_| NFS3ERR_SERVERFAULT)?
+            .into();
 
-        Ok(*file_id)
+        Ok(*inode.id())
     }
 
     async fn mkdir(

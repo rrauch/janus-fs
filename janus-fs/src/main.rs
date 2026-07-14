@@ -17,7 +17,6 @@ use janus_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Instrument, Level};
@@ -256,9 +255,6 @@ struct NfsArgs {
     /// Unix directory permissions.
     #[arg(long, env, default_value = "0700", value_parser = parse_octal)]
     dir_mode: u32,
-    /// Time without write activity after which a new file is considered complete.
-    #[arg(long, env, default_value = "10s", value_parser = humantime::parse_duration)]
-    write_autocommit_after: Duration,
 }
 
 #[derive(Debug, Subcommand)]
@@ -639,7 +635,6 @@ async fn serve_nfs(
         args.gid,
         args.file_mode,
         args.dir_mode,
-        args.write_autocommit_after,
     )
     .await?;
 

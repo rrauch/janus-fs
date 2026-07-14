@@ -1,4 +1,3 @@
-mod io_scheduler;
 mod nfs;
 
 use crate::nfs::JanusNfsFs;
@@ -8,7 +7,6 @@ use janus_vfs::vfs::{Head, Vfs, VfsId};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
 
 pub(crate) const CHUNK_SIZE: usize = 1024 * 64;
 
@@ -28,7 +26,6 @@ impl JanusNfs {
         gid: u32,
         file_mode: u32,
         dir_mode: u32,
-        write_autocommit_after: Duration,
     ) -> Result<Self> {
         let vfs_id = VfsId::from_str(volume_id).map_err(|_| anyhow!("invalid volume id"))?;
         let db_file = db_path.join(format!("{}.sqlite", vfs_id));
@@ -47,7 +44,7 @@ impl JanusNfs {
 
         let mut listener = NFSTcpListener::bind(
             listen_address,
-            JanusNfsFs::new(vfs, write_autocommit_after, uid, gid, file_mode, dir_mode).await?,
+            JanusNfsFs::new(vfs, uid, gid, file_mode, dir_mode).await?,
         )
         .await?;
         listener.with_export_name(export_name);
