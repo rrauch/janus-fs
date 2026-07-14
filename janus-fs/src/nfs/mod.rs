@@ -14,7 +14,10 @@ use nfsserve::nfs::{
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use std::cmp::min;
+use std::collections::HashMap;
 use std::io::SeekFrom;
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::instrument;
 
 pub(crate) struct JanusNfsFs {
@@ -25,6 +28,7 @@ pub(crate) struct JanusNfsFs {
     dir_mode: u32,
     root_id: InodeId,
     fs_id: u64,
+    write_locks: WriteLocks,
 }
 
 impl JanusNfsFs {
@@ -38,6 +42,8 @@ impl JanusNfsFs {
         let root_id = vfs.root().await?.inode_id();
         let (_, fs_id) = vfs.id().as_u64_pair();
 
+        let write_locks = Arc::new(Mutex::new(HashMap::new()));
+
         Ok(Self {
             vfs,
             uid,
@@ -46,7 +52,46 @@ impl JanusNfsFs {
             dir_mode,
             root_id,
             fs_id,
+            write_locks,
         })
+    }
+
+    async fn acquire_write_lock(&self, file_id: fileid3) -> WriteLock {
+        let write_locks = self.write_locks.clone();
+        let semaphore = {
+            let mut lock = write_locks.lock().expect("lock to not be poisoned");
+            if let Some(semaphore) = lock.get(&file_id).and_then(|w| w.upgrade()) {
+                semaphore
+            } else {
+                let semaphore = Arc::new(Semaphore::new(1));
+                lock.insert(file_id, Arc::downgrade(&semaphore));
+                semaphore
+            }
+        };
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .expect("semaphore to not be closed");
+
+        WriteLock {
+            write_locks,
+            permit: Some(permit),
+        }
+    }
+}
+
+type WriteLocks = Arc<Mutex<HashMap<fileid3, Weak<Semaphore>>>>;
+
+struct WriteLock {
+    write_locks: WriteLocks,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        self.permit.take();
+        let mut guard = self.write_locks.lock().expect("lock to not be poisoned");
+        guard.retain(|_, v| v.strong_count() >= 1);
     }
 }
 
@@ -139,6 +184,8 @@ impl NFSFileSystem for JanusNfsFs {
 
     #[instrument(skip(self, data), fields(count = data.len()))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let _lock = self.acquire_write_lock(id).await;
+
         let file: File = self
             .inode_by_id(id)
             .await?
