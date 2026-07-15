@@ -76,18 +76,24 @@ impl Syncer {
                     return;
                 }
             };
+            tracing::debug!(
+                initial_sync_ms = initial_sync_delay.as_millis(),
+                "waiting for initial sync"
+            );
             tokio::time::sleep(initial_sync_delay).await;
             loop {
                 if let Ok(vfs) = Vfs::try_from(weak.clone()) {
                     if let Err(err) = vfs.sync().await {
-                        //todo: logging
-                        eprintln!("{}", err);
+                        tracing::error!(error = %err, "sync error");
                     }
                 } else {
                     // vfs shut down
                     return;
                 }
-
+                tracing::debug!(
+                    next_sync_ms = sync_frequency.as_millis(),
+                    "waiting for next sync"
+                );
                 tokio::time::sleep(sync_frequency).await;
             }
         });

@@ -1,6 +1,6 @@
 use crate::cache::Cache;
 use crate::object::{Object, ObjectId};
-use crate::{Backend, RemoteStorage, Metadata, MetadataSource};
+use crate::{Backend, Metadata, MetadataSource, RemoteStorage};
 use futures_io::AsyncRead;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -161,6 +161,8 @@ impl<'a> MultiUploader<'a> {
     }
 
     async fn process_simple(&mut self, simple: SimpleUpload<'a>) -> Result<Object, UploadError> {
+        tracing::debug!("processing simple upload");
+
         let metadata = simple.metadata_source.as_ref().map(|s| match self.backend {
             #[cfg(feature = "indexd")]
             Backend::Indexd(_) => Metadata::Indexd(s.to_bytes()),
@@ -170,11 +172,15 @@ impl<'a> MultiUploader<'a> {
             Backend::Mock(_) => Metadata::Mock(s.to_map()),
         });
 
-        Ok(self
+        let object = self
             .backend
             .upload(simple.name_hint, simple.content, metadata)
             .await
-            .map_err(|e| UploadError::Other(e.to_string()))?)
+            .map_err(|e| UploadError::Other(e.to_string()))?;
+
+        tracing::debug!(len = object.size(), "simple upload complete");
+
+        Ok(object)
     }
 
     #[cfg(feature = "indexd")]
@@ -191,6 +197,8 @@ impl<'a> MultiUploader<'a> {
                 ));
             }
         };
+
+        tracing::debug!(total_len = packed.length(), "processing packed upload");
 
         let objects = packed
             .finalize()
@@ -226,6 +234,11 @@ impl<'a> MultiUploader<'a> {
                 );
             }
         }
+
+        tracing::debug!(
+            num_uploaded_objects = result_objects.len(),
+            "packed upload complete"
+        );
 
         Ok(result_objects)
     }

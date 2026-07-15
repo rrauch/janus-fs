@@ -62,12 +62,13 @@ impl PushTask {
         if self.vfs.is_read_only() {
             return Err(VfsError::ReadOnlyFileSystem)?;
         }
-
+        tracing::info!("starting push sync");
         let res = self._run().await;
         // clean up
         let mut tx = self.vfs.tx_rw().await?;
         tx.clear_sync_job().await?;
         tx.commit().await?;
+        tracing::info!(success = res.is_ok(), "push sync complete");
         res
     }
 

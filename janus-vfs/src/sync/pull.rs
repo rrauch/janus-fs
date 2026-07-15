@@ -26,6 +26,7 @@ impl PullTask {
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
+        tracing::info!("running pull sync task");
         let mut erroneous_object_ids = self.vfs.known_object_ids().await?;
 
         // The order in which objects are processed is important due to their internal dependency hierarchy:
@@ -70,6 +71,7 @@ impl PullTask {
                 .await?;
             tx.commit().await?;
         }
+        tracing::info!("pull sync complete");
         Ok(())
     }
 
@@ -80,9 +82,8 @@ impl PullTask {
             .filter_map(|res| async move {
                 match res {
                     Ok(id) => Some(id),
-                    Err(_e) => {
-                        // log::warn!("sync failed: {e:?}");
-                        //eprintln!("sync failed: {e:?}");
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sync failed");
                         None
                     }
                 }
