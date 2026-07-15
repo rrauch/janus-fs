@@ -14,7 +14,7 @@ use janus_io::renterd::client::ApiPassword;
 use janus_vfs::vfs::commit::CommitId;
 use janus_vfs::vfs::config::Config;
 use janus_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
-use std::num::ParseIntError;
+use std::num::{NonZeroU32, ParseIntError};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -158,6 +158,9 @@ struct VolumeCreateArgs {
     /// Optional description of new Volume.
     #[arg(long)]
     description: Option<String>,
+    /// Optional Chunk Size.
+    #[arg(long)]
+    chunk_size: Option<ByteSize>,
 }
 
 #[derive(Debug, Args)]
@@ -706,6 +709,13 @@ fn print_config(config: &Config, indent: &str) {
         println!();
     }
     println!();
+    println!("{}{}", indent, "CHUNK SIZE:".bold());
+    println!(
+        "{}{}",
+        indent,
+        ByteSize::b(config.chunk_size().get() as u64)
+    );
+    println!();
     println!("{}{}", indent, "LAST MODIFIED:".bold());
     println!("{}{}", indent, config.last_modified());
     println!();
@@ -748,7 +758,18 @@ async fn create_volume(
         return Ok(());
     }
 
-    let vfs_id = Vfs::create_new(args.description, &remote_storage).await?;
+    let chunk_size = match args.chunk_size {
+        Some(b) => {
+            let b = u32::try_from(b.as_u64())
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| anyhow!("invalid chunk size"))?;
+            Some(b)
+        }
+        None => None,
+    };
+
+    let vfs_id = Vfs::create_new(args.description, chunk_size, &remote_storage).await?;
 
     const INDENT: &str = "    ";
 

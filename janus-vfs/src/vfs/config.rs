@@ -22,6 +22,7 @@ use janus_io::RemoteStorage;
 use janus_io::object::{Object as RemoteObject, ObjectId as RemoteObjectId};
 use janus_io::upload::UploadableObject;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,6 +37,8 @@ pub enum ConfigError {
     InvalidFlatbuffer(#[from] InvalidFlatbuffer),
     #[error("invalid timestamp")]
     InvalidTimestamp,
+    #[error("invalid chunk size")]
+    InvalidChunkSize,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,10 @@ pub struct Config {
 impl Config {
     pub fn vfs_id(&self) -> &VfsId {
         self.inner.get().vfs_id
+    }
+
+    pub fn chunk_size(&self) -> NonZeroU32 {
+        self.inner.get().chunk_size
     }
 
     pub fn description(&self) -> Option<&str> {
@@ -121,6 +128,8 @@ impl Config {
         let inner = Yoke::try_attach_to_cart::<ConfigError, _>(fb, |data| {
             let flat_config = flatbuffers::root::<FlatConfig>(data)?;
             let vfs_id = VfsId::from_byte_ref(&flat_config.vfs_id().0);
+            let chunk_size = NonZeroU32::new(flat_config.chunk_size())
+                .ok_or_else(|| ConfigError::InvalidChunkSize)?;
             let description = flat_config.description();
             let last_modified = Timestamp::from_millis(flat_config.last_modified())
                 .ok_or_else(|| ConfigError::InvalidTimestamp)?;
@@ -131,6 +140,7 @@ impl Config {
 
             Ok(Inner {
                 vfs_id,
+                chunk_size,
                 description,
                 last_modified,
                 heads,
@@ -155,6 +165,7 @@ impl Config {
 #[derive(Yokeable, Clone, Debug)]
 struct Inner<'a> {
     vfs_id: &'a VfsId,
+    chunk_size: NonZeroU32,
     description: Option<&'a str>,
     last_modified: Timestamp,
     heads: Heads<'a>,
@@ -243,6 +254,7 @@ impl From<Config> for ConfigMut {
     fn from(value: Config) -> Self {
         Self {
             vfs_id: value.vfs_id().clone(),
+            chunk_size: value.chunk_size(),
             description: value.description().map(|s| s.to_string()),
             last_modified: value.last_modified().clone(),
             heads: value
@@ -256,15 +268,17 @@ impl From<Config> for ConfigMut {
 
 pub(crate) struct ConfigMut {
     vfs_id: VfsId,
+    chunk_size: NonZeroU32,
     pub description: Option<String>,
     pub last_modified: Timestamp,
     pub heads: HashMap<Head, OwnedEntry>,
 }
 
 impl ConfigMut {
-    pub fn new(vfs_id: VfsId) -> Self {
+    pub fn new(vfs_id: VfsId, chunk_size: NonZeroU32) -> Self {
         Self {
             vfs_id,
+            chunk_size,
             description: None,
             last_modified: Timestamp::now(),
             heads: HashMap::default(),
@@ -317,6 +331,7 @@ impl ConfigMut {
 
         let mut config_builder = FlatConfigBuilder::new(&mut fbb);
         config_builder.add_vfs_id(self.vfs_id.as_flatbuffer());
+        config_builder.add_chunk_size(self.chunk_size.get());
         config_builder.add_last_modified(self.last_modified.to_millis());
         if let Some(description) = description {
             config_builder.add_description(description);
@@ -480,6 +495,14 @@ where
                 }
             })
             .collect())
+    }
+
+    pub(crate) async fn chunk_size(&mut self) -> Result<NonZeroU32, crate::db::Error> {
+        Ok(sqlx::query!("SELECT chunk_size FROM config")
+            .map(|r| NonZeroU32::new(r.chunk_size as u32))
+            .fetch_one(self.conn())
+            .await?
+            .ok_or_else(|| DataError::ConversionError("chunk_size invalid".into()))?)
     }
 }
 
@@ -666,14 +689,16 @@ where
 
         let head_name = head.name();
         let vfs_id = vfs_id.as_slice();
+        let chunk_size = config.chunk_size().get();
 
         if self.is_empty().await? {
             // initial config
             sqlx::query!(
-                "INSERT INTO config (vfs_id, head, last_modified, mode, object_id, data) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO config (vfs_id, head, last_modified, chunk_size, mode, object_id, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 vfs_id,
                 head_name,
                 last_modified,
+                chunk_size,
                 mode,
                 object_id,
                 data,
@@ -982,7 +1007,7 @@ impl Vfs {
 mod tests {
     use crate::vfs::commit::CommitId;
     use crate::vfs::config::{ConfigMut, OwnedEntry};
-    use crate::vfs::{BranchName, Head, TagName, Timestamp, Vfs, VfsId};
+    use crate::vfs::{BranchName, DEFAULT_CHUNK_SIZE, Head, TagName, Timestamp, Vfs, VfsId};
     use janus_io::RemoteStorage;
     use std::str::FromStr;
 
@@ -997,7 +1022,7 @@ mod tests {
         let description2 = "descr2".to_string();
         let commit_id2 = CommitId::zeroed();
 
-        let mut config_mut = ConfigMut::new(vfs_id.clone());
+        let mut config_mut = ConfigMut::new(vfs_id.clone(), DEFAULT_CHUNK_SIZE);
         config_mut.last_modified = last_modified;
         config_mut.description = Some("test config".to_string());
         config_mut.heads.insert(
@@ -1051,7 +1076,7 @@ mod tests {
 
     async fn create_delete_head(head: Head) -> anyhow::Result<()> {
         let remote_storage = RemoteStorage::mock().await;
-        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id = Vfs::create_new(None, None, &remote_storage).await?;
         let config = Vfs::scan(&remote_storage)
             .await?
             .into_iter()

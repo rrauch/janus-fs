@@ -9,8 +9,6 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-pub(crate) const CHUNK_SIZE: usize = 1024 * 64;
-
 pub struct JanusNfs {
     listener: NFSTcpListener<JanusNfsFs>,
 }
@@ -40,7 +38,6 @@ impl JanusNfs {
             .maybe_head(head)
             .maybe_sync_frequency(sync_frequency)
             .read_only(read_only)
-            .max_chunk_size(CHUNK_SIZE)
             .db_file(db_file)
             .build()
             .await?;

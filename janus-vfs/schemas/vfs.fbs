@@ -65,5 +65,6 @@ table Config {
     vfs_id: common.Uuid (required);
     description: string;
     last_modified: int64;
+    chunk_size: uint32;
     heads:[Head];
 }

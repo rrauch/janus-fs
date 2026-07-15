@@ -75,7 +75,7 @@ mod tests {
     #[tokio::test]
     async fn single_vfs() -> anyhow::Result<()> {
         let remote_storage = RemoteStorage::mock().await;
-        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id = Vfs::create_new(None, None, &remote_storage).await?;
 
         let configs = Vfs::scan(&remote_storage).await?;
         assert_eq!(configs.len(), 1);
@@ -89,11 +89,11 @@ mod tests {
     #[tokio::test]
     async fn multi_vfs() -> anyhow::Result<()> {
         let remote_storage = RemoteStorage::mock().await;
-        let vfs_id1 = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id1 = Vfs::create_new(None, None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let vfs_id2 = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id2 = Vfs::create_new(None, None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let vfs_id3 = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id3 = Vfs::create_new(None, None, &remote_storage).await?;
 
         let configs = Vfs::scan(&remote_storage).await?;
         assert_eq!(configs.len(), 3);

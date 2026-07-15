@@ -4,6 +4,7 @@ CREATE TABLE config
                                                    LENGTH(vfs_id) = 16),
     head          TEXT             NOT NULL REFERENCES head (name),
     last_modified TIMESTAMP        NOT NULL,
+    chunk_size    INTEGER          NOT NULL CHECK (chunk_size > 0),
     mode          TEXT             NOT NULL CHECK (mode IN ('S', 'L')),
     object_id     INTEGER REFERENCES object (id),
     data          BLOB,
@@ -27,9 +28,9 @@ CREATE TRIGGER config_prevent_immutable_update
     BEFORE UPDATE OF vfs_id, head
     ON config
     FOR EACH ROW
-    WHEN OLD.vfs_id != NEW.vfs_id OR OLD.head != NEW.head
+    WHEN OLD.vfs_id != NEW.vfs_id OR OLD.head != NEW.head OR OLD.chunk_size != NEW.chunk_size
 BEGIN
-SELECT RAISE(ABORT, 'cannot modify vfs_id or head');
+SELECT RAISE(ABORT, 'cannot modify vfs_id, head or chunk_size');
 END;
 
 

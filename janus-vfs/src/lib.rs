@@ -213,7 +213,7 @@ pub(crate) mod tests {
         let remote_storage = RemoteStorage::mock().await;
 
         // create a new vfs & upload to network
-        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id = Vfs::create_new(None, None, &remote_storage).await?;
 
         // instantiate vfs + initial sync from network
         let vfs = Vfs::builder()

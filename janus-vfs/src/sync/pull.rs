@@ -261,7 +261,7 @@ mod tests {
     use crate::vfs::{BranchName, OwnedName, StorageMode, Timestamp, Vfs, VfsId};
     use chrono::Utc;
     use futures_util::{AsyncWriteExt, TryStreamExt};
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::ops::Deref;
     use std::time::Duration;
 
@@ -346,7 +346,7 @@ mod tests {
         }
         .freeze();
 
-        let mut config = ConfigMut::new(VfsId::generate());
+        let mut config = ConfigMut::new(VfsId::generate(), NonZeroU32::new(1024 * 64).unwrap());
         config.heads.insert(
             BranchName::default().into(),
             OwnedEntry {

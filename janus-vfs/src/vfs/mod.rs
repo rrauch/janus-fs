@@ -33,7 +33,7 @@ use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -43,6 +43,7 @@ use thiserror::Error;
 use twox_hash::XxHash3_64;
 
 pub(crate) const ROOT_INODE_ID: InodeId = InodeId(1);
+const DEFAULT_CHUNK_SIZE: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(1024 * 256) };
 
 #[derive(Debug, Error)]
 pub enum VfsError {
@@ -619,7 +620,6 @@ impl Vfs {
         #[builder(default)] db_page_size: PageSize,
         #[builder(default = 25)] max_db_connections: u8,
         #[builder(default)] cache_settings: CacheSettings,
-        #[builder(default = 64 * 1024)] max_chunk_size: usize,
         #[builder(default = Duration::from_secs(300))] sync_frequency: Duration,
         #[builder(default = Duration::from_secs(10))] initial_sync_delay: Duration,
         #[builder(default = NonZeroUsize::new(10).unwrap())] max_sync_attempts: NonZeroUsize,
@@ -637,8 +637,6 @@ impl Vfs {
         )
         .await?;
 
-        //todo: check that PageSize & max_chunk_size align
-
         let reaper = Reaper::new(db.clone());
         let (syncer, syncer_tx) = Syncer::new(sync_frequency, initial_sync_delay);
 
@@ -649,7 +647,6 @@ impl Vfs {
             head,
             db,
             cache,
-            max_chunk_size,
             dead_fh_reaper: reaper,
             file_write_locks: FileWriteLocks::new(),
             remote_storage,
@@ -692,9 +689,11 @@ impl Vfs {
 
     pub async fn create_new(
         description: Option<String>,
+        max_chunk_size: Option<NonZeroU32>,
         remote_storage: &RemoteStorage,
     ) -> Result<VfsId, VfsError> {
         let vfs_id = VfsId::generate();
+        let max_chunk_size = max_chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
         let root = DirectoryDraft::new_directory_draft(OwnedName::try_from("ROOT")?, vec![]);
         let entity_key = EntityKey::new(root.entity_id().clone(), root.revision().clone());
 
@@ -706,7 +705,7 @@ impl Vfs {
         }
         .freeze();
 
-        let mut config = ConfigMut::new(vfs_id.clone());
+        let mut config = ConfigMut::new(vfs_id.clone(), max_chunk_size);
         config.heads.insert(
             BranchName::default().into(),
             OwnedEntry {
@@ -758,7 +757,6 @@ pub(crate) struct Inner {
     head: Head,
     db: Db,
     cache: Cache,
-    max_chunk_size: usize,
     dead_fh_reaper: Reaper,
     file_write_locks: FileWriteLocks,
     remote_storage: Arc<RemoteStorage>,
@@ -807,8 +805,10 @@ impl Vfs {
     }
 
     #[inline]
-    pub(crate) fn max_chunk_size(&self) -> usize {
-        self.0.max_chunk_size
+    pub(crate) async fn max_chunk_size(&self) -> VfsResult<NonZeroU32> {
+        //todo: caching
+        let mut tx = self.tx().await?;
+        Ok(tx.chunk_size().await?)
     }
 
     #[inline]
@@ -1128,7 +1128,7 @@ pub(crate) mod tests {
             Some(remote_storage) => remote_storage,
             None => RemoteStorage::mock().await,
         };
-        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id = Vfs::create_new(None, None, &remote_storage).await?;
         Ok((
             Vfs::builder()
                 .remote_storage(remote_storage)

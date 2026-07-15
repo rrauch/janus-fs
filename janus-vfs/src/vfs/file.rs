@@ -281,7 +281,7 @@ where
                         vfs: self.clone(),
                         fh_id,
                     },
-                    self.max_chunk_size(),
+                    self.max_chunk_size().await?.get() as usize,
                 ),
                 lock,
                 file,

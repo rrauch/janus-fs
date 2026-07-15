@@ -56,7 +56,7 @@ mod tests {
     #[tokio::test]
     async fn single_delete() -> anyhow::Result<()> {
         let remote_storage = RemoteStorage::mock().await;
-        let vfs_id = Vfs::create_new(None, &remote_storage).await?;
+        let vfs_id = Vfs::create_new(None, None, &remote_storage).await?;
 
         let deleted = Vfs::delete_fs(&vfs_id, &remote_storage).await?;
         assert_eq!(deleted, 3);
@@ -66,11 +66,11 @@ mod tests {
     #[tokio::test]
     async fn delete_all() -> anyhow::Result<()> {
         let remote_storage = RemoteStorage::mock().await;
-        let id1 = Vfs::create_new(None, &remote_storage).await?;
+        let id1 = Vfs::create_new(None, None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let id2 = Vfs::create_new(None, &remote_storage).await?;
+        let id2 = Vfs::create_new(None, None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let id3 = Vfs::create_new(None, &remote_storage).await?;
+        let id3 = Vfs::create_new(None, None, &remote_storage).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         assert_eq!(Vfs::scan(&remote_storage).await?.len(), 3);
