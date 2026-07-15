@@ -17,6 +17,7 @@ use janus_vfs::vfs::{BranchName, Head, TagName, Vfs, VfsId};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Instrument, Level};
@@ -239,6 +240,10 @@ struct NfsArgs {
     /// Serve read-only.
     #[arg(long)]
     read_only: bool,
+
+    /// Automatic sync frequency. In seconds.
+    #[arg(long, short = 'f', env, value_parser = parse_duration_secs)]
+    sync_frequency: Option<Duration>,
 
     /// Host and port to listen on.
     #[arg(long, short = 'l', env, default_value = "localhost:12000")]
@@ -629,6 +634,7 @@ async fn serve_nfs(
         args.volume_id.as_str(),
         head,
         args.read_only,
+        args.sync_frequency,
         data_dir,
         &args.listen_address,
         args.uid,
@@ -1050,4 +1056,8 @@ fn parse_appkey(hex: &str) -> Result<AppKey, anyhow::Error> {
 
 fn parse_octal(src: &str) -> Result<u32, ParseIntError> {
     u32::from_str_radix(src, 8)
+}
+
+fn parse_duration_secs(src: &str) -> Result<Duration, ParseIntError> {
+    u64::from_str(src).map(Duration::from_secs)
 }

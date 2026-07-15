@@ -7,6 +7,7 @@ use janus_vfs::vfs::{Head, Vfs, VfsId};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 pub(crate) const CHUNK_SIZE: usize = 1024 * 64;
 
@@ -20,6 +21,7 @@ impl JanusNfs {
         volume_id: &str,
         head: Option<Head>,
         read_only: bool,
+        sync_frequency: Option<Duration>,
         db_path: &Path,
         listen_address: &str,
         uid: u32,
@@ -36,6 +38,7 @@ impl JanusNfs {
             .remote_storage(remote_storage)
             .vfs_id(vfs_id)
             .maybe_head(head)
+            .maybe_sync_frequency(sync_frequency)
             .read_only(read_only)
             .max_chunk_size(CHUNK_SIZE)
             .db_file(db_file)
