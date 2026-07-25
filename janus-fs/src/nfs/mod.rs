@@ -12,7 +12,7 @@ use nfsserve::nfs::nfsstat3::{
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, fsinfo3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities, vfs_fh};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::SeekFrom;
@@ -126,6 +126,7 @@ impl NFSFileSystem for JanusNfsFs {
     #[instrument(skip(self))]
     async fn read(
         &self,
+        _fh: vfs_fh,
         id: fileid3,
         offset: u64,
         count: u32,
@@ -183,7 +184,13 @@ impl NFSFileSystem for JanusNfsFs {
     }
 
     #[instrument(skip(self, data), fields(count = data.len()))]
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+    async fn write(
+        &self,
+        _fh: vfs_fh,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<fattr3, nfsstat3> {
         let _lock = self.acquire_write_lock(id).await;
 
         let file: File = self
