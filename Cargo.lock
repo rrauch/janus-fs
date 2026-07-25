@@ -1930,6 +1930,7 @@ dependencies = [
  "ct-codecs",
  "foyer-cache",
  "futures-util",
+ "getrandom 0.4.3",
  "humantime",
  "itertools 0.15.0",
  "janus-io",

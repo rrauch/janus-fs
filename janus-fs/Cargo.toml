@@ -17,6 +17,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 colored = "3"
 ct-codecs = { workspace = true }
 futures-util = { workspace = true }
+getrandom = "0.4"
 humantime = "2.3"
 itertools = { workspace = true }
 nfsserve = "0.11"
