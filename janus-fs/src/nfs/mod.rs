@@ -1,9 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, TryStreamExt};
+use futures_util::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, TryStreamExt};
 use janus_vfs::vfs::directory::Directory;
-use janus_vfs::vfs::file::File;
+use janus_vfs::vfs::file::{File, FileHandle, ReadOnly, ReadWrite};
 use janus_vfs::vfs::{Inode, InodeId, Name, Vfs};
 use nfsserve::nfs;
 use nfsserve::nfs::nfsstat3::{
@@ -12,11 +12,13 @@ use nfsserve::nfs::nfsstat3::{
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, fsinfo3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::{DirEntry, NFSFileSystem, OpenMode, ReadDirResult, VFSCapabilities, vfs_fh};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::SeekFrom;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::instrument;
 
@@ -28,7 +30,7 @@ pub(crate) struct JanusNfsFs {
     dir_mode: u32,
     root_id: InodeId,
     fs_id: u64,
-    write_locks: WriteLocks,
+    open_files: Arc<Mutex<OpenFiles>>,
 }
 
 impl JanusNfsFs {
@@ -42,7 +44,7 @@ impl JanusNfsFs {
         let root_id = vfs.root().await?.inode_id();
         let (_, fs_id) = vfs.id().as_u64_pair();
 
-        let write_locks = Arc::new(Mutex::new(HashMap::new()));
+        let open_files = Arc::new(Mutex::new(OpenFiles::new()));
 
         Ok(Self {
             vfs,
@@ -52,46 +54,151 @@ impl JanusNfsFs {
             dir_mode,
             root_id,
             fs_id,
-            write_locks,
+            open_files,
         })
     }
 
-    async fn acquire_write_lock(&self, file_id: fileid3) -> WriteLock {
-        let write_locks = self.write_locks.clone();
-        let semaphore = {
-            let mut lock = write_locks.lock().expect("lock to not be poisoned");
-            if let Some(semaphore) = lock.get(&file_id).and_then(|w| w.upgrade()) {
-                semaphore
+    fn take_open_file(&self, vfs_fh: vfs_fh) -> Option<OpenFile> {
+        let mut lock = self.open_files.lock().unwrap();
+        lock.file_handles
+            .get_mut(&vfs_fh)
+            .map(|e| e.take())
+            .flatten()
+    }
+
+    fn return_open_file(&self, vfs_fh: vfs_fh, open_file: OpenFile) {
+        let mut lock = self.open_files.lock().unwrap();
+        lock.file_handles
+            .get_mut(&vfs_fh)
+            .map(|e| e.replace(open_file));
+    }
+
+    async fn _read(
+        &self,
+        open_file: &mut OpenFile,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), std::io::Error> {
+        // make sure we don't read beyond eof
+        let count = {
+            if offset >= open_file.len() {
+                0
             } else {
-                let semaphore = Arc::new(Semaphore::new(1));
-                lock.insert(file_id, Arc::downgrade(&semaphore));
-                semaphore
+                let available = open_file.len() - offset;
+                min(count, available as u32) as usize
             }
         };
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .expect("semaphore to not be closed");
 
-        WriteLock {
-            write_locks,
-            permit: Some(permit),
+        if count == 0 {
+            tracing::debug!(offset, "read attempt beyond eof detected");
+            return Ok((vec![], true));
+        }
+
+        let _ = open_file.seek(SeekFrom::Start(offset)).await?;
+
+        let mut buf = Vec::with_capacity(count);
+        let mut file_reader = open_file.take(count as u64);
+        let bytes_read = file_reader.read_to_end(&mut buf).await?;
+        if bytes_read != count {
+            tracing::error!(
+                expected = count,
+                actual = bytes_read,
+                "incorrect number of bytes read"
+            );
+            return Err(std::io::Error::other("incorrect number of bytes read"));
+        }
+        let file_reader = file_reader.into_inner();
+        let pos = offset + bytes_read as u64;
+        Ok((buf, pos >= file_reader.len()))
+    }
+
+    async fn _write(
+        &self,
+        fh: &mut FileHandle<ReadWrite>,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<fattr3, std::io::Error> {
+        fh.seek(SeekFrom::Start(offset)).await?;
+        fh.write_all(data).await?;
+
+        let file = fh.fsync().await.map_err(|e| std::io::Error::other(e))?;
+        tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
+
+        Ok(self.to_fattr3(&Inode::from(file)))
+    }
+}
+
+struct WriteLock {
+    open_files: Arc<Mutex<OpenFiles>>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+struct OpenFiles {
+    file_handles: HashMap<vfs_fh, Option<OpenFile>>,
+    write_locks: HashMap<fileid3, Weak<Semaphore>>,
+}
+
+impl OpenFiles {
+    fn new() -> Self {
+        Self {
+            write_locks: HashMap::new(),
+            file_handles: HashMap::new(),
         }
     }
 }
 
-type WriteLocks = Arc<Mutex<HashMap<fileid3, Weak<Semaphore>>>>;
+enum OpenFile {
+    ReadOnly(FileHandle<ReadOnly>),
+    ReadWrite(FileHandle<ReadWrite>, WriteLock),
+}
 
-struct WriteLock {
-    write_locks: WriteLocks,
-    permit: Option<OwnedSemaphorePermit>,
+impl OpenFile {
+    async fn close(self) -> Result<(), std::io::Error> {
+        match self {
+            Self::ReadOnly(_fh) => Ok(()),
+            Self::ReadWrite(mut fh, _write_lock) => fh.close().await,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match &self {
+            Self::ReadOnly(fh) => fh.len(),
+            Self::ReadWrite(fh, _) => fh.len(),
+        }
+    }
+}
+
+impl AsyncRead for OpenFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::ReadWrite(fh, _) => Pin::new(fh).poll_read(cx, buf),
+            Self::ReadOnly(fh) => Pin::new(fh).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncSeek for OpenFile {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<std::io::Result<u64>> {
+        match self.get_mut() {
+            Self::ReadWrite(fh, _) => Pin::new(fh).poll_seek(cx, pos),
+            Self::ReadOnly(fh) => Pin::new(fh).poll_seek(cx, pos),
+        }
+    }
 }
 
 impl Drop for WriteLock {
     fn drop(&mut self) {
         self.permit.take();
-        let mut guard = self.write_locks.lock().expect("lock to not be poisoned");
-        guard.retain(|_, v| v.strong_count() >= 1);
+        let mut guard = self.open_files.lock().expect("lock to not be poisoned");
+        guard.write_locks.retain(|_, v| v.strong_count() >= 1);
     }
 }
 
@@ -123,95 +230,139 @@ impl NFSFileSystem for JanusNfsFs {
         Ok(self.to_fattr3(&self.inode_by_id(id).await?))
     }
 
-    #[instrument(skip(self))]
-    async fn read(
-        &self,
-        id: fileid3,
-        offset: u64,
-        count: u32,
-    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+    async fn open(&self, id: fileid3, mode: OpenMode) -> std::result::Result<vfs_fh, nfsstat3> {
+        let open_files = self.open_files.clone();
+        let (vfs_fh, maybe_semaphore) = {
+            let mut lock = open_files.lock().unwrap();
+            let vfs_fh = loop {
+                let vfs_fh = getrandom::u32().expect("OS RNG failure");
+                if !lock.file_handles.contains_key(&vfs_fh) {
+                    break vfs_fh;
+                }
+            };
+            lock.file_handles.insert(vfs_fh, None);
+
+            let semaphore = match mode {
+                OpenMode::ReadWrite => Some(
+                    if let Some(semaphore) = lock.write_locks.get(&id).and_then(|w| w.upgrade()) {
+                        semaphore
+                    } else {
+                        let semaphore = Arc::new(Semaphore::new(1));
+                        lock.write_locks.insert(id, Arc::downgrade(&semaphore));
+                        semaphore
+                    },
+                ),
+                OpenMode::ReadOnly => None,
+            };
+
+            (vfs_fh, semaphore)
+        };
+
+        let maybe_permit = if let Some(semaphore) = maybe_semaphore {
+            Some(
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore to not be closed"),
+            )
+        } else {
+            None
+        };
+
         let file: File = self
             .inode_by_id(id)
             .await?
             .try_into()
             .map_err(|_| NFS3ERR_ISDIR)?;
 
-        // make sure we don't read beyond eof
-        let count = {
-            if offset >= file.len() {
-                0
-            } else {
-                let available = file.len() - offset;
-                min(count, available as u32) as usize
-            }
-        };
+        let open_file = if let Some(permit) = maybe_permit {
+            let write_lock = WriteLock {
+                open_files: open_files.clone(),
+                permit: Some(permit),
+            };
 
-        if count == 0 {
-            tracing::debug!(offset, "read attempt beyond eof detected");
-            return Ok((vec![], true));
-        }
+            let fh = self.vfs.open_rw(&file).await.map_err(|e| {
+                tracing::error!(error = %e, "open_rw error");
+                NFS3ERR_IO
+            })?;
 
-        let mut file_reader = self.vfs.open(&file).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to call read_file for file {}", id);
-            NFS3ERR_SERVERFAULT
-        })?;
-        let _ = file_reader
-            .seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to seek to offset {} for file {}", offset, id);
+            OpenFile::ReadWrite(fh, write_lock)
+        } else {
+            let file_reader = self.vfs.open(&file).await.map_err(|e| {
+                tracing::error!(error = %e, "failed to call read_file for file {}", id);
                 NFS3ERR_SERVERFAULT
             })?;
 
-        let mut buf = Vec::with_capacity(count);
-        let mut file_reader = file_reader.take(count as u64);
-        let bytes_read = file_reader.read_to_end(&mut buf).await.map_err(|e| {
+            OpenFile::ReadOnly(file_reader)
+        };
+
+        let mut lock = open_files.lock().unwrap();
+        lock.file_handles.insert(vfs_fh, Some(open_file));
+        Ok(vfs_fh)
+    }
+
+    async fn close(&self, fh: vfs_fh) -> std::result::Result<(), nfsstat3> {
+        let open_file = {
+            let mut lock = self.open_files.lock().unwrap();
+            lock.file_handles
+                .remove(&fh)
+                .flatten()
+                .ok_or_else(|| nfsstat3::NFS3ERR_BADHANDLE)?
+        };
+
+        open_file.close().await.map_err(|e| {
             tracing::error!(error = %e, "read error");
             NFS3ERR_IO
         })?;
-        if bytes_read != count {
-            tracing::error!(
-                expected = count,
-                actual = bytes_read,
-                "incorrect number of bytes read"
-            );
-            return Err(NFS3ERR_IO);
-        }
-        let file_reader = file_reader.into_inner();
-        let pos = offset + bytes_read as u64;
-        Ok((buf, pos >= file_reader.len()))
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn read(
+        &self,
+        fh: vfs_fh,
+        _id: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let mut open_file = self
+            .take_open_file(fh)
+            .ok_or_else(|| nfsstat3::NFS3ERR_BADHANDLE)?;
+        let res = self._read(&mut open_file, offset, count).await;
+        self.return_open_file(fh, open_file);
+        res.map_err(|e| {
+            tracing::error!(error = %e, "read error");
+            NFS3ERR_IO
+        })
     }
 
     #[instrument(skip(self, data), fields(count = data.len()))]
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let _lock = self.acquire_write_lock(id).await;
+    async fn write(
+        &self,
+        fh: vfs_fh,
+        _id: fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<fattr3, nfsstat3> {
+        let mut open_file = self
+            .take_open_file(fh)
+            .ok_or_else(|| nfsstat3::NFS3ERR_BADHANDLE)?;
 
-        let file: File = self
-            .inode_by_id(id)
-            .await?
-            .try_into()
-            .map_err(|_| NFS3ERR_ISDIR)?;
+        let writer = match &mut open_file {
+            OpenFile::ReadWrite(writer, _) => writer,
+            OpenFile::ReadOnly(_) => {
+                self.return_open_file(fh, open_file);
+                return Err(nfsstat3::NFS3ERR_ROFS);
+            }
+        };
 
-        let mut fh = self.vfs.open_rw(&file).await.map_err(|e| {
-            tracing::error!(error = %e, "open_rw error");
-            NFS3ERR_IO
-        })?;
-        fh.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-            tracing::error!(error = %e, "seek error");
-            NFS3ERR_IO
-        })?;
-        fh.write_all(data).await.map_err(|e| {
+        let res = self._write(writer, offset, data).await;
+        self.return_open_file(fh, open_file);
+        res.map_err(|e| {
             tracing::error!(error = %e, "write error");
             NFS3ERR_IO
-        })?;
-
-        let file = fh.commit().await.map_err(|e| {
-            tracing::error!(error = %e, "commit error");
-            NFS3ERR_IO
-        })?;
-        tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
-
-        Ok(self.to_fattr3(&Inode::from(file)))
+        })
     }
 
     async fn create(
@@ -398,11 +549,8 @@ impl NFSFileSystem for JanusNfsFs {
         Err(NFS3ERR_NOTSUPP)
     }
 
-    async fn fsinfo(&self, root_fileid: fileid3) -> std::result::Result<fsinfo3, nfsstat3> {
-        if root_fileid != *self.root_id {
-            return Err(nfsstat3::NFS3ERR_BADHANDLE);
-        }
-        let inode = self.inode_by_id(root_fileid).await?;
+    async fn fsinfo(&self, fileid: fileid3) -> std::result::Result<fsinfo3, nfsstat3> {
+        let inode = self.inode_by_id(fileid).await?;
 
         Ok(fsinfo3 {
             obj_attributes: nfs::post_op_attr::attributes(self.to_fattr3(&inode)),
