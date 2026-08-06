@@ -33,4 +33,4 @@ typed-path = "0.12"
 zeroize = "1.9"
 
 [patch.crates-io]
-nfsserve = { git = "https://github.com/rrauch/nfsserve.git", rev = "6705807ae6ecbc0ce63c7ea6ed6d6285d1899682" }
+nfsserve = { git = "https://github.com/rrauch/nfsserve.git", rev = "8c7c3da49641ae99cebaac6969682426160361cb" }
